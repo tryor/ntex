@@ -1,6 +1,6 @@
 [package]
 name = "ntex-service"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "ntex service"
 keywords = ["network", "framework", "async", "futures"]
@@ -9,7 +9,7 @@ repository = "https://github.com/ntex-rs/ntex.git"
 documentation = "https://docs.rs/ntex-service/"
 categories = ["network-programming", "asynchronous"]
 license = "MIT"
-edition = "2018"
+edition = "2021"
 
 [lib]
 name = "ntex_service"

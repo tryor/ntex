@@ -1,5 +1,21 @@
 # Changes
 
+## [0.2.4] - 2023-01-29
+
+* Update buffer api
+
+## [0.2.3] - 2023-01-25
+
+* Fix double buf cleanup
+
+## [0.2.2] - 2023-01-24
+
+* Update ntex-io to 0.2.2
+
+## [0.2.1] - 2023-01-23
+
+* Update filter implementation
+
 ## [0.2.0] - 2023-01-04
 
 * Release

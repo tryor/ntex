@@ -617,7 +617,7 @@ impl Drop for Acquired {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, convert::TryFrom, rc::Rc};
+    use std::{cell::RefCell, rc::Rc};
 
     use super::*;
     use crate::{
@@ -626,7 +626,6 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_basics() {
-        env_logger::init();
         let store = Rc::new(RefCell::new(Vec::new()));
         let store2 = store.clone();
 

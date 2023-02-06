@@ -1,5 +1,13 @@
 # Changes
 
+## [0.6.2] - 2023-01-24
+
+* Update ntex-io, ntex-tls deps
+
+## [0.6.1] - 2023-01-23
+
+* Refactor io subsystem
+
 ## [0.6.0] - 2023-01-04
 
 * Upgrade to ntex-service 1.0

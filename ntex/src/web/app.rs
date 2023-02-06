@@ -595,8 +595,8 @@ mod tests {
     use crate::util::{Bytes, Ready};
     use crate::web::test::{call_service, init_service, read_body, TestRequest};
     use crate::web::{
-        self, middleware::DefaultHeaders, request::WebRequest, DefaultError, HttpRequest,
-        HttpResponse,
+        self, middleware::DefaultHeaders, DefaultError, HttpRequest, HttpResponse,
+        WebRequest,
     };
 
     #[crate::rt_test]
@@ -678,12 +678,18 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_extension() {
-        let srv = init_service(App::new().state(10usize).service(web::resource("/").to(
-            |req: HttpRequest| async move {
-                assert_eq!(*req.app_state::<usize>().unwrap(), 10);
-                HttpResponse::Ok()
-            },
-        )))
+        let srv = init_service(
+            App::new()
+                .state(10usize)
+                .filter(fn_service(move |req: WebRequest<_>| {
+                    assert_eq!(*req.app_state::<usize>().unwrap(), 10);
+                    Ready::Ok(req)
+                }))
+                .service(web::resource("/").to(|req: HttpRequest| async move {
+                    assert_eq!(*req.app_state::<usize>().unwrap(), 10);
+                    HttpResponse::Ok()
+                })),
+        )
         .await;
         let req = TestRequest::default().to_request();
         let resp = srv.call(req).await.unwrap();

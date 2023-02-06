@@ -2,15 +2,16 @@ use std::cell::Cell;
 use std::task::{Context, Poll};
 use std::{fmt, future::Future, hash, io, marker, mem, ops, pin::Pin, ptr, rc::Rc, time};
 
-use ntex_bytes::{BytesVec, PoolId, PoolRef};
+use ntex_bytes::{PoolId, PoolRef};
 use ntex_codec::{Decoder, Encoder};
 use ntex_util::time::{now, Millis};
 use ntex_util::{future::poll_fn, future::Either, task::LocalWaker};
 
-use super::filter::{Base, NullFilter};
-use super::seal::Sealed;
-use super::tasks::{ReadContext, WriteContext};
-use super::{Filter, FilterFactory, Handle, IoStatusUpdate, IoStream, RecvError};
+use crate::buf::Stack;
+use crate::filter::{Base, Filter, Layer, NullFilter};
+use crate::seal::Sealed;
+use crate::tasks::{ReadContext, WriteContext};
+use crate::{FilterLayer, Handle, IoStatusUpdate, IoStream, RecvError};
 
 bitflags::bitflags! {
     pub struct Flags: u16 {
@@ -31,17 +32,19 @@ bitflags::bitflags! {
         const RD_BUF_FULL         = 0b0000_0000_0100_0000;
 
         /// wait write completion
-        const WR_WAIT             = 0b0000_0000_1000_0000;
+        const WR_WAIT             = 0b0000_0001_0000_0000;
         /// write buffer is full
-        const WR_BACKPRESSURE     = 0b0000_0001_0000_0000;
+        const WR_BACKPRESSURE     = 0b0000_0010_0000_0000;
+        /// write task paused
+        const WR_PAUSED           = 0b0000_0100_0000_0000;
 
         /// dispatcher is marked stopped
-        const DSP_STOP            = 0b0000_0010_0000_0000;
+        const DSP_STOP            = 0b0001_0000_0000_0000;
         /// keep-alive timeout occured
-        const DSP_KEEPALIVE       = 0b0000_0100_0000_0000;
+        const DSP_KEEPALIVE       = 0b0010_0000_0000_0000;
 
         /// keep-alive timeout started
-        const KEEPALIVE           = 0b0001_0000_0000_0000;
+        const KEEPALIVE           = 0b0100_0000_0000_0000;
     }
 }
 
@@ -59,8 +62,7 @@ pub(crate) struct IoState {
     pub(super) read_task: LocalWaker,
     pub(super) write_task: LocalWaker,
     pub(super) dispatch_task: LocalWaker,
-    pub(super) read_buf: Cell<Option<BytesVec>>,
-    pub(super) write_buf: Cell<Option<BytesVec>>,
+    pub(super) buffer: Stack,
     pub(super) filter: Cell<&'static dyn Filter>,
     pub(super) handle: Cell<Option<Box<dyn Handle>>>,
     #[allow(clippy::box_collection)]
@@ -69,21 +71,18 @@ pub(crate) struct IoState {
 }
 
 impl IoState {
-    #[inline]
     pub(super) fn insert_flags(&self, f: Flags) {
         let mut flags = self.flags.get();
         flags.insert(f);
         self.flags.set(flags);
     }
 
-    #[inline]
     pub(super) fn remove_flags(&self, f: Flags) {
         let mut flags = self.flags.get();
         flags.remove(f);
         self.flags.set(flags);
     }
 
-    #[inline]
     pub(super) fn notify_keepalive(&self) {
         log::trace!("keep-alive timeout, notify dispatcher");
         let mut flags = self.flags.get();
@@ -95,7 +94,6 @@ impl IoState {
         self.flags.set(flags);
     }
 
-    #[inline]
     pub(super) fn notify_disconnect(&self) {
         if let Some(on_disconnect) = self.on_disconnect.take() {
             for item in on_disconnect.into_iter() {
@@ -104,7 +102,6 @@ impl IoState {
         }
     }
 
-    #[inline]
     pub(super) fn io_stopped(&self, err: Option<io::Error>) {
         if err.is_some() {
             self.error.set(err);
@@ -119,86 +116,17 @@ impl IoState {
         );
     }
 
-    #[inline]
     /// Gracefully shutdown read and write io tasks
-    pub(super) fn init_shutdown(&self, err: Option<io::Error>) {
-        if err.is_some() {
-            self.io_stopped(err);
-        } else if !self
+    pub(super) fn init_shutdown(&self) {
+        if !self
             .flags
             .get()
             .intersects(Flags::IO_STOPPED | Flags::IO_STOPPING | Flags::IO_STOPPING_FILTERS)
         {
             log::trace!("initiate io shutdown {:?}", self.flags.get());
             self.insert_flags(Flags::IO_STOPPING_FILTERS);
-            self.shutdown_filters();
+            self.read_task.wake();
         }
-    }
-
-    #[inline]
-    pub(super) fn shutdown_filters(&self) {
-        if !self
-            .flags
-            .get()
-            .intersects(Flags::IO_STOPPED | Flags::IO_STOPPING)
-        {
-            match self.filter.get().poll_shutdown() {
-                Poll::Ready(Ok(())) => {
-                    self.read_task.wake();
-                    self.write_task.wake();
-                    self.dispatch_task.wake();
-                    self.insert_flags(Flags::IO_STOPPING);
-                }
-                Poll::Ready(Err(err)) => {
-                    self.io_stopped(Some(err));
-                }
-                Poll::Pending => {
-                    let flags = self.flags.get();
-                    // check read buffer, if buffer is not consumed it is unlikely
-                    // that filter will properly complete shutdown
-                    if flags.contains(Flags::RD_PAUSED)
-                        || flags.contains(Flags::RD_BUF_FULL | Flags::RD_READY)
-                    {
-                        self.read_task.wake();
-                        self.write_task.wake();
-                        self.dispatch_task.wake();
-                        self.insert_flags(Flags::IO_STOPPING);
-                    }
-                }
-            }
-        }
-    }
-
-    #[inline]
-    pub(super) fn with_read_buf<Fn, Ret>(&self, release: bool, f: Fn) -> Ret
-    where
-        Fn: FnOnce(&mut Option<BytesVec>) -> Ret,
-    {
-        let filter = self.filter.get();
-        let mut buf = filter.get_read_buf();
-        let result = f(&mut buf);
-
-        if let Some(buf) = buf {
-            if release {
-                // release buffer
-                if buf.is_empty() {
-                    self.pool.get().release_read_buf(buf);
-                    return result;
-                }
-            }
-            filter.release_read_buf(buf);
-        }
-        result
-    }
-
-    #[inline]
-    pub(super) fn with_write_buf<Fn, Ret>(&self, f: Fn) -> Ret
-    where
-        Fn: FnOnce(&mut Option<BytesVec>) -> Ret,
-    {
-        let buf = self.write_buf.as_ptr();
-        let ref_buf = unsafe { buf.as_mut().unwrap() };
-        f(ref_buf)
     }
 }
 
@@ -221,12 +149,7 @@ impl hash::Hash for IoState {
 impl Drop for IoState {
     #[inline]
     fn drop(&mut self) {
-        if let Some(buf) = self.read_buf.take() {
-            self.pool.get().release_read_buf(buf);
-        }
-        if let Some(buf) = self.write_buf.take() {
-            self.pool.get().release_write_buf(buf);
-        }
+        self.buffer.release(self.pool.get());
     }
 }
 
@@ -248,8 +171,7 @@ impl Io {
             dispatch_task: LocalWaker::new(),
             read_task: LocalWaker::new(),
             write_task: LocalWaker::new(),
-            read_buf: Cell::new(None),
-            write_buf: Cell::new(None),
+            buffer: Stack::new(),
             filter: Cell::new(NullFilter::get()),
             handle: Cell::new(None),
             on_disconnect: Cell::new(None),
@@ -277,14 +199,7 @@ impl<F> Io<F> {
     #[inline]
     /// Set memory pool
     pub fn set_memory_pool(&self, pool: PoolRef) {
-        if let Some(mut buf) = self.0 .0.read_buf.take() {
-            pool.move_vec_in(&mut buf);
-            self.0 .0.read_buf.set(Some(buf));
-        }
-        if let Some(mut buf) = self.0 .0.write_buf.take() {
-            pool.move_vec_in(&mut buf);
-            self.0 .0.write_buf.set(Some(buf));
-        }
+        self.0 .0.buffer.set_memory_pool(pool);
         self.0 .0.pool.set(pool);
     }
 
@@ -312,8 +227,7 @@ impl<F> Io<F> {
             dispatch_task: LocalWaker::new(),
             read_task: LocalWaker::new(),
             write_task: LocalWaker::new(),
-            read_buf: Cell::new(None),
-            write_buf: Cell::new(None),
+            buffer: Stack::new(),
             filter: Cell::new(NullFilter::get()),
             handle: Cell::new(None),
             on_disconnect: Cell::new(None),
@@ -342,6 +256,7 @@ impl<F> Io<F> {
 
     #[inline]
     #[doc(hidden)]
+    #[deprecated]
     pub fn remove_keepalive_timer(&self) {
         self.stop_keepalive_timer()
     }
@@ -352,58 +267,43 @@ impl<F> Io<F> {
     }
 }
 
-impl<F: Filter> Io<F> {
+impl<F: FilterLayer, T: Filter> Io<Layer<F, T>> {
     #[inline]
     /// Get referece to a filter
     pub fn filter(&self) -> &F {
-        self.1.filter()
+        &self.1.filter().0
     }
+}
 
+impl<F: Filter> Io<F> {
     #[inline]
     /// Convert current io stream into sealed version
     pub fn seal(mut self) -> Io<Sealed> {
-        // get current filter
-        let filter = unsafe {
-            let filter = self.1.seal();
-            let filter_ref: &'static dyn Filter = {
-                let filter: &dyn Filter = filter.0.as_ref();
-                std::mem::transmute(filter)
-            };
-            self.0 .0.filter.replace(filter_ref);
-            filter
-        };
-
-        Io(self.0.clone(), FilterItem::with_sealed(filter))
-    }
-
-    #[inline]
-    /// Create new filter and replace current one
-    pub fn add_filter<T>(self, factory: T) -> T::Future
-    where
-        T: FilterFactory<F>,
-    {
-        factory.create(self)
+        let (filter, filter_ref) = self.1.seal();
+        self.0 .0.filter.replace(filter_ref);
+        Io(self.0.clone(), filter)
     }
 
     #[inline]
     /// Map current filter with new one
-    pub fn map_filter<T, U, E>(mut self, map: U) -> Result<Io<T>, E>
+    pub fn add_filter<U>(mut self, nf: U) -> Io<Layer<U, F>>
     where
-        T: Filter,
-        U: FnOnce(F) -> Result<T, E>,
+        U: FilterLayer,
     {
-        // replace current filter
-        let filter = unsafe {
-            let filter = Box::new(map(*(self.1.get_filter()))?);
-            let filter_ref: &'static dyn Filter = {
-                let filter: &dyn Filter = filter.as_ref();
-                std::mem::transmute(filter)
-            };
-            self.0 .0.filter.replace(filter_ref);
-            filter
-        };
+        // add layer to buffers
+        if U::BUFFERS {
+            // Safety: .add_layer() only increases internal buffers
+            // there is no api that holds references into buffers storage
+            // all apis first removes buffer from storage and then work with it
+            unsafe { &mut *(Rc::as_ptr(&self.0 .0) as *mut IoState) }
+                .buffer
+                .add_layer();
+        }
 
-        Ok(Io(self.0.clone(), FilterItem::with_filter(filter)))
+        // replace current filter
+        let (filter, filter_ref) = self.1.add_filter(nf);
+        self.0 .0.filter.replace(filter_ref);
+        Io(self.0.clone(), filter)
     }
 }
 
@@ -450,8 +350,10 @@ impl<F> Io<F> {
     #[inline]
     /// Pause read task
     pub fn pause(&self) {
-        self.0 .0.read_task.wake();
-        self.0 .0.insert_flags(Flags::RD_PAUSED);
+        if !self.0.flags().contains(Flags::RD_PAUSED) {
+            self.0 .0.read_task.wake();
+            self.0 .0.insert_flags(Flags::RD_PAUSED);
+        }
     }
 
     #[inline]
@@ -593,25 +495,20 @@ impl<F> Io<F> {
         if flags.contains(Flags::IO_STOPPED) {
             Poll::Ready(self.error().map(Err).unwrap_or(Ok(())))
         } else {
-            let len = self
-                .0
-                 .0
-                .with_write_buf(|buf| buf.as_ref().map(|b| b.len()).unwrap_or(0));
-
+            let inner = &self.0 .0;
+            let len = inner.buffer.write_destination_size();
             if len > 0 {
                 if full {
-                    self.0 .0.insert_flags(Flags::WR_WAIT);
-                    self.0 .0.dispatch_task.register(cx.waker());
+                    inner.insert_flags(Flags::WR_WAIT);
+                    inner.dispatch_task.register(cx.waker());
                     return Poll::Pending;
-                } else if len >= self.0.memory_pool().write_params_high() << 1 {
-                    self.0 .0.insert_flags(Flags::WR_BACKPRESSURE);
-                    self.0 .0.dispatch_task.register(cx.waker());
+                } else if len >= inner.pool.get().write_params_high() << 1 {
+                    inner.insert_flags(Flags::WR_BACKPRESSURE);
+                    inner.dispatch_task.register(cx.waker());
                     return Poll::Pending;
                 }
             }
-            self.0
-                 .0
-                .remove_flags(Flags::WR_WAIT | Flags::WR_BACKPRESSURE);
+            inner.remove_flags(Flags::WR_WAIT | Flags::WR_BACKPRESSURE);
             Poll::Ready(Ok(()))
         }
     }
@@ -629,11 +526,27 @@ impl<F> Io<F> {
             }
         } else {
             if !flags.contains(Flags::IO_STOPPING_FILTERS) {
-                self.0 .0.init_shutdown(None);
+                self.0 .0.init_shutdown();
             }
+
+            self.0 .0.read_task.wake();
+            self.0 .0.write_task.wake();
             self.0 .0.dispatch_task.register(cx.waker());
             Poll::Pending
         }
+    }
+
+    #[inline]
+    /// Pause read task
+    ///
+    /// Returns status updates
+    pub fn poll_read_pause(&self, cx: &mut Context<'_>) -> Poll<IoStatusUpdate> {
+        self.pause();
+        let result = self.poll_status_update(cx);
+        if !result.is_pending() {
+            self.0 .0.dispatch_task.register(cx.waker());
+        }
+        result
     }
 
     #[inline]
@@ -664,6 +577,7 @@ impl<F> Io<F> {
 }
 
 impl<F> AsRef<IoRef> for Io<F> {
+    #[inline]
     fn as_ref(&self) -> &IoRef {
         &self.0
     }
@@ -759,20 +673,6 @@ impl<F> FilterItem<F> {
         slf
     }
 
-    fn with_sealed(f: Sealed) -> Self {
-        let mut slf = Self {
-            data: [0; SEALED_SIZE],
-            _t: marker::PhantomData,
-        };
-
-        unsafe {
-            let ptr = &mut slf.data as *mut _ as *mut Sealed;
-            ptr.write(f);
-            slf.data[KIND_IDX] |= KIND_SEALED;
-        }
-        slf
-    }
-
     /// Get filter, panic if it is not filter
     fn filter(&self) -> &F {
         if self.data[KIND_IDX] & KIND_PTR != 0 {
@@ -786,8 +686,8 @@ impl<F> FilterItem<F> {
         }
     }
 
-    /// Get filter, panic if it is not filter
-    fn get_filter(&mut self) -> Box<F> {
+    /// Get filter, panic if it is not set
+    fn take_filter(&mut self) -> Box<F> {
         if self.data[KIND_IDX] & KIND_PTR != 0 {
             self.data[KIND_IDX] &= KIND_UNMASK;
             let ptr = &mut self.data as *mut _ as *mut *mut F;
@@ -801,7 +701,7 @@ impl<F> FilterItem<F> {
     }
 
     /// Get sealed, panic if it is already sealed
-    fn get_sealed(&mut self) -> Sealed {
+    fn take_sealed(&mut self) -> Sealed {
         if self.data[KIND_IDX] & KIND_SEALED != 0 {
             self.data[KIND_IDX] &= KIND_UNMASK;
             let ptr = &mut self.data as *mut _ as *mut Sealed;
@@ -820,25 +720,54 @@ impl<F> FilterItem<F> {
 
     fn drop_filter(&mut self) {
         if self.data[KIND_IDX] & KIND_PTR != 0 {
-            self.get_filter();
+            self.take_filter();
         } else if self.data[KIND_IDX] & KIND_SEALED != 0 {
-            self.get_sealed();
+            self.take_sealed();
         }
     }
 }
 
 impl<F: Filter> FilterItem<F> {
-    fn seal(&mut self) -> Sealed {
-        if self.data[KIND_IDX] & KIND_PTR != 0 {
-            Sealed(Box::new(*self.get_filter()))
+    fn add_filter<T: FilterLayer>(
+        &mut self,
+        new: T,
+    ) -> (FilterItem<Layer<T, F>>, &'static dyn Filter) {
+        let filter = Box::new(Layer::new(new, *self.take_filter()));
+        let filter_ref: &'static dyn Filter = {
+            let filter: &dyn Filter = filter.as_ref();
+            unsafe { std::mem::transmute(filter) }
+        };
+        (FilterItem::with_filter(filter), filter_ref)
+    }
+
+    fn seal(&mut self) -> (FilterItem<Sealed>, &'static dyn Filter) {
+        let filter = if self.data[KIND_IDX] & KIND_PTR != 0 {
+            Sealed(Box::new(*self.take_filter()))
         } else if self.data[KIND_IDX] & KIND_SEALED != 0 {
-            self.get_sealed()
+            self.take_sealed()
         } else {
             panic!(
                 "Wrong filter item {:?} expected: {:?}",
                 self.data[KIND_IDX], KIND_PTR
             );
+        };
+
+        let filter_ref: &'static dyn Filter = {
+            let filter: &dyn Filter = filter.0.as_ref();
+            unsafe { std::mem::transmute(filter) }
+        };
+
+        let mut slf = FilterItem {
+            data: [0; SEALED_SIZE],
+            _t: marker::PhantomData,
+        };
+
+        unsafe {
+            let ptr = &mut slf.data as *mut _ as *mut Sealed;
+            ptr.write(filter);
+            slf.data[KIND_IDX] |= KIND_SEALED;
         }
+        (slf, filter_ref)
     }
 }
 
@@ -904,5 +833,35 @@ impl Future for OnDisconnect {
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.poll_ready(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ntex_codec::BytesCodec;
+
+    use super::*;
+    use crate::testing::IoTest;
+
+    #[ntex::test]
+    async fn test_recv() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let server = Io::new(server);
+        assert!(server.eq(&server));
+
+        server.0 .0.notify_keepalive();
+        let err = server.recv(&BytesCodec).await.err().unwrap();
+        assert!(format!("{:?}", err).contains("Keep-alive"));
+
+        server.0 .0.insert_flags(Flags::DSP_STOP);
+        let err = server.recv(&BytesCodec).await.err().unwrap();
+        assert!(format!("{:?}", err).contains("Dispatcher stopped"));
+
+        client.write("GET /test HTTP/1");
+        server.0 .0.insert_flags(Flags::WR_BACKPRESSURE);
+        let item = server.recv(&BytesCodec).await.ok().unwrap().unwrap();
+        assert_eq!(item, "GET /test HTTP/1");
     }
 }

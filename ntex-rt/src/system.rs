@@ -1,7 +1,5 @@
 use async_channel::Sender;
-use std::{
-    cell::RefCell, future::Future, io, sync::atomic::AtomicUsize, sync::atomic::Ordering,
-};
+use std::{cell::RefCell, sync::atomic::AtomicUsize, sync::atomic::Ordering};
 
 use super::arbiter::{Arbiter, SystemCommand};
 use super::builder::{Builder, SystemRunner};
@@ -98,25 +96,5 @@ impl System {
     /// System arbiter
     pub fn arbiter(&self) -> &Arbiter {
         &self.arbiter
-    }
-
-    /// This function will start async runtime and will finish once the
-    /// `System::stop()` message get called.
-    /// Function `f` get called within async runtime context.
-    pub fn run<F>(f: F) -> io::Result<()>
-    where
-        F: FnOnce() -> io::Result<()> + 'static,
-    {
-        Builder::new().finish().run(f)
-    }
-
-    /// This function will start async runtime and will finish once the
-    /// provided future completes.
-    pub fn block_on<F, R>(f: F) -> R
-    where
-        F: Future<Output = R> + 'static,
-        R: 'static,
-    {
-        Builder::new().finish().block_on(f)
     }
 }

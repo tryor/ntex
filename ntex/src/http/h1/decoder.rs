@@ -1,4 +1,4 @@
-use std::{cell::Cell, convert::TryFrom, marker::PhantomData, mem, task::Poll};
+use std::{cell::Cell, marker::PhantomData, mem, task::Poll};
 
 use ntex_http::header::{HeaderName, HeaderValue};
 use ntex_http::{header, Method, StatusCode, Uri, Version};
@@ -14,6 +14,7 @@ use super::MAX_BUFFER_SIZE;
 
 const MAX_HEADERS: usize = 96;
 
+#[derive(Debug)]
 /// Incoming messagd decoder
 pub(super) struct MessageDecoder<T: MessageType>(PhantomData<T>);
 

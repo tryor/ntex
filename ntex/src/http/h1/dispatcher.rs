@@ -429,7 +429,7 @@ where
 
     fn unregister_keepalive(&mut self) {
         if self.flags.contains(Flags::KEEPALIVE_REG) {
-            self.io.remove_keepalive_timer();
+            self.io.stop_keepalive_timer();
             self.flags.remove(Flags::KEEPALIVE | Flags::KEEPALIVE_REG);
         }
     }
@@ -474,7 +474,7 @@ where
                     // keep-alive timer
                     if self.flags.contains(Flags::KEEPALIVE_REG) {
                         self.flags.remove(Flags::KEEPALIVE_REG);
-                        self.io.remove_keepalive_timer();
+                        self.io.stop_keepalive_timer();
                     }
 
                     // configure request payload
@@ -646,7 +646,7 @@ where
                 }
             }
             None => {
-                trace!("response payload eof");
+                trace!("response payload eof {:?}", self.flags);
                 if let Err(err) = self.io.encode(Message::Chunk(None), &self.codec) {
                     self.error = Some(DispatchError::Encode(err));
                     Some(State::Stop)
@@ -684,8 +684,7 @@ where
                 // read request payload
                 let mut updated = false;
                 loop {
-                    let res = io.poll_recv(&payload.0, cx);
-                    match res {
+                    match io.poll_recv(&payload.0, cx) {
                         Poll::Ready(Ok(PayloadItem::Chunk(chunk))) => {
                             updated = true;
                             payload.1.feed_data(chunk);
@@ -785,7 +784,7 @@ mod tests {
     use crate::http::{body, Request, ResponseHead, StatusCode};
     use crate::io::{self as nio, Base};
     use crate::service::{boxed, fn_service, IntoService};
-    use crate::util::{lazy, stream_recv, Bytes, BytesMut};
+    use crate::util::{lazy, poll_fn, stream_recv, Bytes, BytesMut};
     use crate::{codec::Decoder, testing::Io, time::sleep, time::Millis, time::Seconds};
 
     const BUFFER_SIZE: usize = 32_768;
@@ -847,7 +846,6 @@ mod tests {
         decoder.decode(buf).unwrap().unwrap()
     }
 
-    #[cfg(feature = "tokio")]
     #[crate::rt_test]
     async fn test_on_request() {
         let (client, server) = Io::create();
@@ -882,13 +880,12 @@ mod tests {
         );
         sleep(Millis(50)).await;
         let _ = lazy(|cx| Pin::new(&mut h1).poll(cx)).await;
-
-        sleep(Millis(50)).await;
-        assert!(lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_ready());
         sleep(Millis(50)).await;
 
         client.local_buffer(|buf| assert_eq!(&buf[..15], b"HTTP/1.0 200 OK"));
         client.close().await;
+
+        assert!(lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_ready());
         assert!(data.get());
     }
 
@@ -906,7 +903,7 @@ mod tests {
         let _ = lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_ready();
         sleep(Millis(50)).await;
 
-        assert!(lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_ready());
+        assert!(poll_fn(|cx| Pin::new(&mut h1).poll(cx)).await.is_ok());
         assert!(h1.inner.io.is_closed());
         sleep(Millis(50)).await;
 
@@ -947,6 +944,7 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_pipeline_with_payload() {
+        env_logger::init();
         let (client, server) = Io::create();
         client.remote_buffer_cap(4096);
         let mut decoder = ClientCodec::default();
@@ -1015,8 +1013,8 @@ mod tests {
     }
 
     #[crate::rt_test]
-    /// /// h1 dispatcher still processes all incoming requests
-    /// /// but it does not write any data to socket
+    /// h1 dispatcher still processes all incoming requests
+    /// but it does not write any data to socket
     async fn test_write_disconnected() {
         let num = Arc::new(AtomicUsize::new(0));
         let num2 = num.clone();
@@ -1039,6 +1037,7 @@ mod tests {
         assert_eq!(num.load(Ordering::Relaxed), 1);
     }
 
+    /// max http message size is 32k (no payload)
     #[crate::rt_test]
     async fn test_read_large_message() {
         let (client, server) = Io::create();
@@ -1232,13 +1231,9 @@ mod tests {
                 Err::<Response<()>, _>(io::Error::new(io::ErrorKind::Other, "error"))
             })
         });
-        sleep(Millis(50)).await;
         // required because io shutdown is async oper
-        let _ = lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_ready();
-        sleep(Millis(50)).await;
+        assert!(poll_fn(|cx| Pin::new(&mut h1).poll(cx)).await.is_ok());
 
-        assert!(lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_ready());
-        sleep(Millis(50)).await;
         assert!(h1.inner.io.is_closed());
         let buf = client.local_buffer(|buf| buf.split());
         assert_eq!(&buf[..28], b"HTTP/1.1 500 Internal Server");

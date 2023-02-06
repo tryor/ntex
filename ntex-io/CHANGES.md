@@ -1,5 +1,45 @@
 # Changes
 
+## [0.2.9] - 2023-01-31
+
+* Register Dispatcher waker when service is not ready
+
+* Add Io::poll_read_pause() method, pauses read task and check io status
+
+## [0.2.8] - 2023-01-30
+
+* Check for nested io operations
+
+## [0.2.7] - 2023-01-29
+
+* Refactor buffer api
+
+## [0.2.6] - 2023-01-27
+
+* Add IoRef::with_rw_buf() helper
+
+## [0.2.5] - 2023-01-27
+
+* Custom panic message for nested buffer borrow
+
+## [0.2.4] - 2023-01-26
+
+* Refactor write task management
+
+## [0.2.3] - 2023-01-25
+
+* Optimize buffers layout
+
+* Release empty buffers
+
+## [0.2.2] - 2023-01-24
+
+* Process write buffer if filter wrote to write buffer during reading
+
+## [0.2.1] - 2023-01-23
+
+* Refactor Io and Filter types
+
 ## [0.2.0] - 2023-01-04
 
 * Release

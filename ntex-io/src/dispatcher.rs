@@ -71,7 +71,7 @@ enum DispatcherError<S, U> {
 
 enum PollService<U: Encoder + Decoder> {
     Item(DispatchItem<U>),
-    ServiceError,
+    Continue,
     Ready,
 }
 
@@ -244,7 +244,7 @@ where
                             }
                         }
                         PollService::Item(item) => item,
-                        PollService::ServiceError => continue,
+                        PollService::Continue => continue,
                     };
 
                     // call service
@@ -269,7 +269,7 @@ where
                             }
                         }
                         PollService::Item(item) => item,
-                        PollService::ServiceError => continue,
+                        PollService::Continue => continue,
                     };
 
                     // call service
@@ -316,18 +316,15 @@ where
                 }
                 // shutdown service
                 DispatcherState::Shutdown => {
-                    let err = slf.error.take();
-
                     return if this.inner.shared.service.poll_shutdown(cx).is_ready() {
                         log::trace!("service shutdown is completed, stop");
 
-                        Poll::Ready(if let Some(err) = err {
+                        Poll::Ready(if let Some(err) = slf.error.take() {
                             Err(err)
                         } else {
                             Ok(())
                         })
                     } else {
-                        slf.error.set(err);
                         Poll::Pending
                     };
                 }
@@ -360,7 +357,7 @@ where
                         }
                         DispatcherError::Service(err) => {
                             self.error.set(Some(err));
-                            PollService::ServiceError
+                            PollService::Continue
                         }
                     }
                 } else {
@@ -370,8 +367,27 @@ where
             // pause io read task
             Poll::Pending => {
                 log::trace!("service is not ready, register dispatch task");
-                io.pause();
-                Poll::Pending
+                match ready!(io.poll_read_pause(cx)) {
+                    IoStatusUpdate::KeepAlive => {
+                        log::trace!("keep-alive error, stopping dispatcher during pause");
+                        self.st.set(DispatcherState::Stop);
+                        Poll::Ready(PollService::Item(DispatchItem::KeepAliveTimeout))
+                    }
+                    IoStatusUpdate::Stop => {
+                        log::trace!("dispatcher is instructed to stop during pause");
+                        self.st.set(DispatcherState::Stop);
+                        Poll::Ready(PollService::Continue)
+                    }
+                    IoStatusUpdate::PeerGone(err) => {
+                        log::trace!(
+                            "peer is gone during pause, stopping dispatcher: {:?}",
+                            err
+                        );
+                        self.st.set(DispatcherState::Stop);
+                        Poll::Ready(PollService::Item(DispatchItem::Disconnect(err)))
+                    }
+                    IoStatusUpdate::WriteBackpressure => Poll::Pending,
+                }
             }
             // handle service readiness error
             Poll::Ready(Err(err)) => {
@@ -379,7 +395,7 @@ where
                 self.st.set(DispatcherState::Stop);
                 self.error.set(Some(err));
                 self.insert_flags(Flags::READY_ERR);
-                Poll::Ready(PollService::ServiceError)
+                Poll::Ready(PollService::Continue)
             }
         }
     }
@@ -410,13 +426,10 @@ mod tests {
 
     use ntex_bytes::{Bytes, PoolId, PoolRef};
     use ntex_codec::BytesCodec;
-    use ntex_util::future::Ready;
-    use ntex_util::time::{sleep, Millis};
-
-    use crate::testing::IoTest;
-    use crate::{io::Flags, Io, IoRef, IoStream};
+    use ntex_util::{future::Ready, time::sleep, time::Millis, time::Seconds};
 
     use super::*;
+    use crate::{io::Flags, testing::IoTest, Io, IoRef, IoStream};
 
     pub(crate) struct State(IoRef);
 
@@ -632,9 +645,7 @@ mod tests {
 
         // close read side
         client.close().await;
-
-        // TODO! fix
-        // assert!(client.is_server_dropped());
+        assert!(client.is_server_dropped());
 
         // service must be checked for readiness only once
         assert_eq!(counter.get(), 1);
@@ -708,6 +719,52 @@ mod tests {
 
         // backpressure disabled
         assert_eq!(&data.lock().unwrap().borrow()[..], &[0, 1, 2]);
+    }
+
+    #[ntex::test]
+    async fn test_disconnect_during_read_backpressure() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(0);
+
+        let (disp, state) = Dispatcher::debug(
+            server,
+            BytesCodec,
+            ntex_util::services::inflight::InFlightService::new(
+                1,
+                ntex_service::fn_service(move |msg: DispatchItem<BytesCodec>| async move {
+                    if let DispatchItem::Item(_) = msg {
+                        sleep(Millis(500)).await;
+                        Ok::<_, ()>(None)
+                    } else {
+                        Ok(None)
+                    }
+                }),
+            ),
+        );
+        let disp = disp.keepalive_timeout(Seconds::ZERO);
+        let pool = PoolId::P10.pool_ref();
+        pool.set_read_params(1024, 512);
+        state.set_memory_pool(pool);
+
+        let (tx, rx) = ntex::channel::oneshot::channel();
+        ntex::rt::spawn(async move {
+            let _ = disp.await;
+            let _ = tx.send(());
+        });
+
+        let bytes = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(1024)
+            .map(char::from)
+            .collect::<String>();
+        client.write(bytes.clone());
+        sleep(Millis(25)).await;
+        client.write(bytes);
+        sleep(Millis(25)).await;
+
+        // close read side
+        state.close();
+        let _ = rx.recv().await;
     }
 
     #[ntex::test]

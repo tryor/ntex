@@ -1,5 +1,5 @@
 use std::{cell::RefCell, io, task::Context, task::Poll};
-use std::{convert::TryFrom, marker::PhantomData, mem, rc::Rc};
+use std::{marker::PhantomData, mem, rc::Rc};
 
 use ntex_h2::{self as h2, frame::StreamId, server};
 
@@ -49,13 +49,11 @@ mod openssl {
     use ntex_tls::openssl::{Acceptor, SslFilter};
     use tls_openssl::ssl::SslAcceptor;
 
-    use crate::io::Filter;
-    use crate::server::SslError;
-    use crate::service::pipeline_factory;
+    use crate::{io::Layer, server::SslError, service::pipeline_factory};
 
     use super::*;
 
-    impl<F, S, B> H2Service<SslFilter<F>, S, B>
+    impl<F, S, B> H2Service<Layer<SslFilter, F>, S, B>
     where
         F: Filter,
         S: ServiceFactory<Request> + 'static,
@@ -90,9 +88,9 @@ mod rustls {
     use tls_rustls::ServerConfig;
 
     use super::*;
-    use crate::{server::SslError, service::pipeline_factory};
+    use crate::{io::Layer, server::SslError, service::pipeline_factory};
 
-    impl<F, S, B> H2Service<TlsFilter<F>, S, B>
+    impl<F, S, B> H2Service<Layer<TlsFilter, F>, S, B>
     where
         F: Filter,
         S: ServiceFactory<Request> + 'static,
@@ -394,7 +392,7 @@ where
                 loop {
                     match poll_fn(|cx| body.poll_next_chunk(cx)).await {
                         None => {
-                            log::debug!("{:?} closing sending payload", msg.id());
+                            log::debug!("{:?} closing payload stream", msg.id());
                             msg.stream().send_payload(Bytes::new(), true).await?;
                             break;
                         }

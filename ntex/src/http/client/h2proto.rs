@@ -1,4 +1,4 @@
-use std::{cell::RefCell, convert::TryFrom, io, rc::Rc};
+use std::{cell::RefCell, io, rc::Rc};
 
 use ntex_h2::{self as h2, client::Client, frame};
 
@@ -206,6 +206,7 @@ struct H2ClientInner {
     streams: RefCell<HashMap<frame::StreamId, StreamInfo>>,
 }
 
+#[derive(Debug)]
 struct StreamInfo {
     tx: Option<oneshot::Sender<Result<(ResponseHead, Payload), SendRequestError>>>,
     stream: Option<h2::Stream>,

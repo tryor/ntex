@@ -1,5 +1,9 @@
 # Changes
 
+## [1.0.1] - 2023-01-24
+
+* Add `FnShutdown` service to provide on_shutdown callback
+
 ## [1.0.0-beta.0] - 2022-12-28
 
 * Rename Transform to Middleware
