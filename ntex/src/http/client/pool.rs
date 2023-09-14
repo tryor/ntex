@@ -6,9 +6,10 @@ use ntex_h2::{self as h2};
 
 use crate::http::uri::{Authority, Scheme, Uri};
 use crate::io::{types::HttpProtocol, IoBoxed};
+use crate::service::{Pipeline, PipelineCall, Service, ServiceCtx};
 use crate::time::{now, Millis};
 use crate::util::{ready, BoxFuture, ByteString, HashMap, HashSet};
-use crate::{channel::pool, rt::spawn, service::Service, task::LocalWaker};
+use crate::{channel::pool, rt::spawn, task::LocalWaker};
 
 use super::connection::{Connection, ConnectionType};
 use super::h2proto::{H2Client, H2PublishService};
@@ -42,8 +43,9 @@ struct AvailableConnection {
 }
 
 /// Connections pool
+#[derive(Debug)]
 pub(super) struct ConnectionPool<T> {
-    connector: Rc<T>,
+    connector: Pipeline<T>,
     inner: Rc<RefCell<Inner>>,
     waiters: Rc<RefCell<Waiters>>,
 }
@@ -60,7 +62,7 @@ where
         limit: usize,
         h2config: h2::Config,
     ) -> Self {
-        let connector = Rc::new(connector);
+        let connector = Pipeline::new(connector);
         let waiters = Rc::new(RefCell::new(Waiters {
             waiters: HashMap::default(),
             pool: pool::new(),
@@ -120,10 +122,8 @@ where
     crate::forward_poll_ready!(connector);
     crate::forward_poll_shutdown!(connector);
 
-    #[inline]
-    fn call(&self, req: Connect) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Connect, _: ServiceCtx<'a, Self>) -> Self::Future<'_> {
         trace!("Get connection for {:?}", req.uri);
-        let connector = self.connector.clone();
         let inner = self.inner.clone();
         let waiters = self.waiters.clone();
 
@@ -151,7 +151,7 @@ where
                     trace!("Connecting to {:?}", req.uri);
                     let uri = req.uri.clone();
                     let (tx, rx) = waiters.borrow_mut().pool.channel();
-                    OpenConnection::spawn(key, tx, uri, inner, connector, req);
+                    OpenConnection::spawn(key, tx, uri, inner, &self.connector, req);
 
                     match rx.await {
                         Err(_) => Err(ConnectError::Disconnected(None)),
@@ -175,6 +175,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub(super) struct Inner {
     conn_lifetime: Duration,
     conn_keep_alive: Duration,
@@ -188,6 +189,7 @@ pub(super) struct Inner {
     waiters: Rc<RefCell<Waiters>>,
 }
 
+#[derive(Debug)]
 struct Waiters {
     waiters: HashMap<Key, VecDeque<(Connect, Waiter)>>,
     pool: pool::Pool<Result<Connection, ConnectError>>,
@@ -308,7 +310,7 @@ impl Inner {
 }
 
 struct ConnectionPoolSupport<T> {
-    connector: Rc<T>,
+    connector: Pipeline<T>,
     inner: Rc<RefCell<Inner>>,
     waiters: Rc<RefCell<Waiters>>,
 }
@@ -369,7 +371,7 @@ where
                             tx,
                             uri,
                             this.inner.clone(),
-                            this.connector.clone(),
+                            &this.connector,
                             connect,
                         );
                     }
@@ -386,12 +388,12 @@ where
 }
 
 pin_project_lite::pin_project! {
-    struct OpenConnection<'f, T: Service<Connect>>
-    where T: 'f
+    struct OpenConnection<T: Service<Connect>>
+    where T: 'static
     {
         key: Key,
         #[pin]
-        fut: T::Future<'f>,
+        fut: PipelineCall<T, Connect>,
         uri: Uri,
         tx: Option<Waiter>,
         guard: Option<OpenGuard>,
@@ -400,7 +402,7 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<'f, T> OpenConnection<'f, T>
+impl<T> OpenConnection<T>
 where
     T: Service<Connect, Response = IoBoxed, Error = ConnectError> + 'static,
 {
@@ -409,18 +411,20 @@ where
         tx: Waiter,
         uri: Uri,
         inner: Rc<RefCell<Inner>>,
-        connector: Rc<T>,
+        pipeline: &Pipeline<T>,
         msg: Connect,
     ) {
+        let fut = pipeline.call_static(msg);
         let disconnect_timeout = inner.borrow().disconnect_timeout;
 
+        #[allow(clippy::redundant_async_block)]
         spawn(async move {
             OpenConnection::<T> {
-                fut: connector.call(msg),
                 tx: Some(tx),
                 key: key.clone(),
                 inner: inner.clone(),
                 guard: Some(OpenGuard::new(key, inner)),
+                fut,
                 uri,
                 disconnect_timeout,
             }
@@ -429,7 +433,7 @@ where
     }
 }
 
-impl<'f, T> Future for OpenConnection<'f, T>
+impl<T> Future for OpenConnection<T>
 where
     T: Service<Connect, Response = IoBoxed, Error = ConnectError>,
 {
@@ -629,19 +633,21 @@ mod tests {
         let store = Rc::new(RefCell::new(Vec::new()));
         let store2 = store.clone();
 
-        let pool = ConnectionPool::new(
-            fn_service(move |req| {
-                let (client, server) = Io::create();
-                store2.borrow_mut().push((req, server));
-                Box::pin(async move { Ok(IoBoxed::from(nio::Io::new(client))) })
-            }),
-            Duration::from_secs(10),
-            Duration::from_secs(10),
-            Millis::ZERO,
-            1,
-            h2::Config::client(),
-        )
-        .clone();
+        let pool = Pipeline::new(
+            ConnectionPool::new(
+                fn_service(move |req| {
+                    let (client, server) = Io::create();
+                    store2.borrow_mut().push((req, server));
+                    Box::pin(async move { Ok(IoBoxed::from(nio::Io::new(client))) })
+                }),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Millis::ZERO,
+                1,
+                h2::Config::client(),
+            )
+            .clone(),
+        );
 
         // uri must contain authority
         let req = Connect {
@@ -662,49 +668,49 @@ mod tests {
         assert_eq!(store.borrow().len(), 1);
         assert!(format!("{:?}", conn).contains("H1Connection"));
         assert_eq!(conn.protocol(), HttpProtocol::Http1);
-        assert_eq!(pool.inner.borrow().acquired, 1);
-        assert!(pool.inner.borrow().connecting.is_empty());
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 1);
+        assert!(pool.get_ref().inner.borrow().connecting.is_empty());
 
         // pool is full, waiting
         let mut fut = pool.call(req.clone());
         assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
-        assert_eq!(pool.waiters.borrow().waiters.len(), 1);
+        assert_eq!(pool.get_ref().waiters.borrow().waiters.len(), 1);
 
         // release connection and push it to next waiter
         conn.release(false);
-        assert_eq!(pool.inner.borrow().acquired, 0);
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 0);
         let _conn = fut.await.unwrap();
         assert_eq!(store.borrow().len(), 1);
-        assert!(pool.waiters.borrow().waiters.is_empty());
+        assert!(pool.get_ref().waiters.borrow().waiters.is_empty());
         drop(_conn);
 
         // close connnection
         let conn = pool.call(req.clone()).await.unwrap();
         assert_eq!(store.borrow().len(), 2);
-        assert_eq!(pool.inner.borrow().acquired, 1);
-        assert!(pool.inner.borrow().connecting.is_empty());
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 1);
+        assert!(pool.get_ref().inner.borrow().connecting.is_empty());
         let mut fut = pool.call(req.clone());
         assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
-        assert_eq!(pool.waiters.borrow().waiters.len(), 1);
+        assert_eq!(pool.get_ref().waiters.borrow().waiters.len(), 1);
 
         // release and close
         conn.release(true);
-        assert_eq!(pool.inner.borrow().acquired, 0);
-        assert!(pool.inner.borrow().connecting.is_empty());
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 0);
+        assert!(pool.get_ref().inner.borrow().connecting.is_empty());
 
         let conn = fut.await.unwrap();
         assert_eq!(store.borrow().len(), 3);
-        assert!(pool.waiters.borrow().waiters.is_empty());
-        assert!(pool.inner.borrow().connecting.is_empty());
-        assert_eq!(pool.inner.borrow().acquired, 1);
+        assert!(pool.get_ref().waiters.borrow().waiters.is_empty());
+        assert!(pool.get_ref().inner.borrow().connecting.is_empty());
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 1);
 
         // drop waiter, no interest in connection
         let mut fut = pool.call(req.clone());
         assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
         drop(fut);
         sleep(Millis(50)).await;
-        pool.inner.borrow_mut().check_availibility();
-        assert!(pool.waiters.borrow().waiters.is_empty());
+        pool.get_ref().inner.borrow_mut().check_availibility();
+        assert!(pool.get_ref().waiters.borrow().waiters.is_empty());
 
         // different uri
         let req = Connect {
@@ -713,19 +719,19 @@ mod tests {
         };
         let mut fut = pool.call(req.clone());
         assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
-        assert_eq!(pool.waiters.borrow().waiters.len(), 1);
+        assert_eq!(pool.get_ref().waiters.borrow().waiters.len(), 1);
         conn.release(false);
-        assert_eq!(pool.inner.borrow().acquired, 0);
-        assert_eq!(pool.inner.borrow().available.len(), 1);
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 0);
+        assert_eq!(pool.get_ref().inner.borrow().available.len(), 1);
 
         let conn = fut.await.unwrap();
         assert_eq!(store.borrow().len(), 4);
-        assert!(pool.waiters.borrow().waiters.is_empty());
-        assert!(pool.inner.borrow().connecting.is_empty());
-        assert_eq!(pool.inner.borrow().acquired, 1);
+        assert!(pool.get_ref().waiters.borrow().waiters.is_empty());
+        assert!(pool.get_ref().inner.borrow().connecting.is_empty());
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 1);
         conn.release(false);
-        assert_eq!(pool.inner.borrow().acquired, 0);
-        assert_eq!(pool.inner.borrow().available.len(), 2);
+        assert_eq!(pool.get_ref().inner.borrow().acquired, 0);
+        assert_eq!(pool.get_ref().inner.borrow().available.len(), 2);
 
         assert!(lazy(|cx| pool.poll_ready(cx)).await.is_ready());
         assert!(lazy(|cx| pool.poll_shutdown(cx)).await.is_ready());

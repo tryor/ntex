@@ -1,9 +1,7 @@
-use std::cell::Cell;
-use std::future::{ready, Ready};
-use std::marker::PhantomData;
 use std::task::{Context, Poll};
+use std::{cell::Cell, fmt, future::ready, future::Ready, marker::PhantomData};
 
-use crate::Service;
+use crate::{Service, ServiceCtx};
 
 #[inline]
 /// Create `FnShutdown` for function that can act as a `on_shutdown` callback.
@@ -43,6 +41,14 @@ where
     }
 }
 
+impl<Req, Err, F> fmt::Debug for FnShutdown<Req, Err, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FnShutdown")
+            .field("fn", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<Req, Err, F> Service<Req> for FnShutdown<Req, Err, F>
 where
     F: FnOnce(),
@@ -60,7 +66,7 @@ where
     }
 
     #[inline]
-    fn call(&self, req: Req) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Req, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         ready(Ok(req))
     }
 }
@@ -70,7 +76,7 @@ mod tests {
     use ntex_util::future::lazy;
     use std::{rc::Rc, task::Poll};
 
-    use crate::{fn_service, pipeline};
+    use crate::{chain, fn_service, Pipeline};
 
     use super::*;
 
@@ -83,7 +89,7 @@ mod tests {
             is_called2.set(true);
         });
 
-        let pipe = pipeline(srv).and_then(on_shutdown).clone();
+        let pipe = Pipeline::new(chain(srv).and_then(on_shutdown).clone());
 
         let res = pipe.call(()).await;
         assert_eq!(lazy(|cx| pipe.poll_ready(cx)).await, Poll::Ready(Ok(())));
@@ -91,5 +97,7 @@ mod tests {
         assert_eq!(res.unwrap(), "pipe");
         assert_eq!(lazy(|cx| pipe.poll_shutdown(cx)).await, Poll::Ready(()));
         assert!(is_called.get());
+
+        format!("{:?}", pipe);
     }
 }

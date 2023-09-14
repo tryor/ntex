@@ -12,8 +12,9 @@ use crate::Servername;
 
 use super::{PeerCert, PeerCertChain};
 
+#[derive(Debug)]
 /// An implementation of SSL streams
-pub struct TlsServerFilter {
+pub(crate) struct TlsServerFilter {
     inner: IoInner,
     session: RefCell<ServerConnection>,
 }
@@ -53,7 +54,7 @@ impl FilterLayer for TlsServerFilter {
                 None
             }
         } else if id == any::TypeId::of::<Servername>() {
-            if let Some(name) = self.session.borrow().sni_hostname() {
+            if let Some(name) = self.session.borrow().server_name() {
                 Some(Box::new(Servername(name.to_string())))
             } else {
                 None

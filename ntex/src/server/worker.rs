@@ -5,7 +5,7 @@ use async_channel::{unbounded, Receiver, Sender};
 use async_oneshot as oneshot;
 
 use crate::rt::{spawn, Arbiter};
-use crate::service::Service;
+use crate::service::Pipeline;
 use crate::time::{sleep, Millis, Sleep};
 use crate::util::{
     join_all, ready, select, stream_recv, BoxFuture, Either, Stream as FutStream,
@@ -138,12 +138,12 @@ pub(super) struct Worker {
 struct WorkerService {
     factory: usize,
     status: WorkerServiceStatus,
-    service: BoxedServerService,
+    service: Pipeline<BoxedServerService>,
 }
 
 impl WorkerService {
     fn created(&mut self, service: BoxedServerService) {
-        self.service = service;
+        self.service = Pipeline::new(service);
         self.status = WorkerServiceStatus::Unavailable;
     }
 }
@@ -239,7 +239,7 @@ impl Worker {
                         assert_eq!(token.0, wrk.services.len());
                         wrk.services.push(WorkerService {
                             factory,
-                            service,
+                            service: service.into(),
                             status: WorkerServiceStatus::Unavailable,
                         });
                     }
@@ -255,9 +255,11 @@ impl Worker {
             self.services.iter_mut().for_each(|srv| {
                 if srv.status == WorkerServiceStatus::Available {
                     srv.status = WorkerServiceStatus::Stopped;
-                    let svc = srv.service.clone();
+                    let fut = srv
+                        .service
+                        .call_static((None, ServerMessage::ForceShutdown));
                     spawn(async move {
-                        let _ = svc.call((None, ServerMessage::ForceShutdown)).await;
+                        let _ = fut.await;
                     });
                 }
             });
@@ -267,9 +269,11 @@ impl Worker {
                 if srv.status == WorkerServiceStatus::Available {
                     srv.status = WorkerServiceStatus::Stopping;
 
-                    let svc = srv.service.clone();
+                    let fut = srv
+                        .service
+                        .call_static((None, ServerMessage::Shutdown(timeout)));
                     spawn(async move {
-                        let _ = svc.call((None, ServerMessage::Shutdown(timeout))).await;
+                        let _ = fut.await;
                     });
                 }
             });
@@ -490,9 +494,12 @@ impl Future for Worker {
                                 self.factories[srv.factory].name(msg.token)
                             );
                         }
-                        let _ = srv
+                        let fut = srv
                             .service
-                            .call((Some(guard), ServerMessage::Connect(msg.io)));
+                            .call_static((Some(guard), ServerMessage::Connect(msg.io)));
+                        spawn(async move {
+                            let _ = fut.await;
+                        });
                     } else {
                         return Poll::Ready(());
                     }
@@ -509,7 +516,7 @@ mod tests {
     use super::*;
     use crate::io::Io;
     use crate::server::service::Factory;
-    use crate::service::{Service, ServiceFactory};
+    use crate::service::{Service, ServiceCtx, ServiceFactory};
     use crate::util::{lazy, Ready};
 
     #[derive(Clone, Copy, Debug)]
@@ -569,7 +576,7 @@ mod tests {
             }
         }
 
-        fn call(&self, _: Io) -> Self::Future<'_> {
+        fn call<'a>(&'a self, _: Io, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
             Ready::Ok(())
         }
     }

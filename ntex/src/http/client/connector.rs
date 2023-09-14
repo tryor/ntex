@@ -1,9 +1,9 @@
-use std::{rc::Rc, task::Context, task::Poll, time::Duration};
+use std::{fmt, task::Context, task::Poll, time::Duration};
 
 use ntex_h2::{self as h2};
 
 use crate::connect::{Connect as TcpConnect, Connector as TcpConnector};
-use crate::service::{apply_fn, boxed, Service};
+use crate::service::{apply_fn, boxed, Service, ServiceCall, ServiceCtx};
 use crate::time::{Millis, Seconds};
 use crate::util::{timeout::TimeoutError, timeout::TimeoutService, Either, Ready};
 use crate::{http::Uri, io::IoBoxed};
@@ -18,6 +18,7 @@ use crate::connect::rustls::ClientConfig;
 
 type BoxedConnector = boxed::BoxService<TcpConnect<Uri>, IoBoxed, ConnectError>;
 
+#[derive(Debug)]
 /// Manages http client network connectivity.
 ///
 /// The `Connector` type uses a builder-like combinator pattern for service
@@ -53,6 +54,7 @@ impl Connector {
         let conn = Connector {
             connector: boxed::service(
                 TcpConnector::new()
+                    .chain()
                     .map(IoBoxed::from)
                     .map_err(ConnectError::from),
             ),
@@ -192,8 +194,12 @@ impl Connector {
         T: Service<TcpConnect<Uri>, Error = crate::connect::ConnectError> + 'static,
         IoBoxed: From<T::Response>,
     {
-        self.connector =
-            boxed::service(connector.map(IoBoxed::from).map_err(ConnectError::from));
+        self.connector = boxed::service(
+            connector
+                .chain()
+                .map(IoBoxed::from)
+                .map_err(ConnectError::from),
+        );
         self
     }
 
@@ -204,7 +210,10 @@ impl Connector {
         IoBoxed: From<T::Response>,
     {
         self.ssl_connector = Some(boxed::service(
-            connector.map(IoBoxed::from).map_err(ConnectError::from),
+            connector
+                .chain()
+                .map(IoBoxed::from)
+                .map_err(ConnectError::from),
         ));
         self
     }
@@ -214,7 +223,8 @@ impl Connector {
     /// its combinator chain.
     pub fn finish(
         self,
-    ) -> impl Service<Connect, Response = Connection, Error = ConnectError> + Clone {
+    ) -> impl Service<Connect, Response = Connection, Error = ConnectError> + fmt::Debug
+    {
         let tcp_service = connector(self.connector, self.timeout, self.disconnect_timeout);
 
         let ssl_pool = if let Some(ssl_connector) = self.ssl_connector {
@@ -231,7 +241,7 @@ impl Connector {
             None
         };
 
-        Rc::new(InnerConnector {
+        InnerConnector {
             tcp_pool: ConnectionPool::new(
                 tcp_service,
                 self.conn_lifetime,
@@ -241,7 +251,7 @@ impl Connector {
                 self.h2config.clone(),
             ),
             ssl_pool,
-        })
+        }
     }
 }
 
@@ -249,7 +259,7 @@ fn connector(
     connector: BoxedConnector,
     timeout: Millis,
     disconnect_timeout: Millis,
-) -> impl Service<Connect, Response = IoBoxed, Error = ConnectError> {
+) -> impl Service<Connect, Response = IoBoxed, Error = ConnectError> + fmt::Debug {
     TimeoutService::new(
         timeout,
         apply_fn(connector, |msg: Connect, srv| {
@@ -257,6 +267,7 @@ fn connector(
                 async move { srv.call(TcpConnect::new(msg.uri).set_addr(msg.addr)).await },
             )
         })
+        .chain()
         .map(move |io: IoBoxed| {
             io.set_disconnect_timeout(disconnect_timeout);
             io
@@ -269,6 +280,7 @@ fn connector(
     })
 }
 
+#[derive(Debug)]
 struct InnerConnector<T> {
     tcp_pool: ConnectionPool<T>,
     ssl_pool: Option<ConnectionPool<T>>,
@@ -281,7 +293,7 @@ where
     type Response = <ConnectionPool<T> as Service<Connect>>::Response;
     type Error = ConnectError;
     type Future<'f> = Either<
-        <ConnectionPool<T> as Service<Connect>>::Future<'f>,
+        ServiceCall<'f, ConnectionPool<T>, Connect>,
         Ready<Self::Response, Self::Error>,
     >;
 
@@ -315,16 +327,16 @@ where
         }
     }
 
-    fn call(&self, req: Connect) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Connect, ctx: ServiceCtx<'a, Self>) -> Self::Future<'_> {
         match req.uri.scheme_str() {
             Some("https") | Some("wss") => {
                 if let Some(ref conn) = self.ssl_pool {
-                    Either::Left(conn.call(req))
+                    Either::Left(ctx.call(conn, req))
                 } else {
                     Either::Right(Ready::Err(ConnectError::SslIsNotSupported))
                 }
             }
-            _ => Either::Left(self.tcp_pool.call(req)),
+            _ => Either::Left(ctx.call(&self.tcp_pool, req)),
         }
     }
 }

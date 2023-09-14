@@ -1,6 +1,6 @@
-use std::{future::ready, future::Future, future::Ready, marker::PhantomData};
+use std::{fmt, future::ready, future::Future, future::Ready, marker::PhantomData};
 
-use crate::{IntoService, IntoServiceFactory, Service, ServiceFactory};
+use crate::{IntoService, IntoServiceFactory, Service, ServiceCtx, ServiceFactory};
 
 #[inline]
 /// Create `ServiceFactory` for function that can act as a `Service`
@@ -40,7 +40,7 @@ where
 ///     });
 ///
 ///     // construct new service
-///     let srv = factory.create(&()).await?;
+///     let srv = factory.pipeline(&()).await?;
 ///
 ///     // now we can use `div` service
 ///     let result = srv.call((10, 20)).await?;
@@ -81,7 +81,7 @@ where
 ///     });
 ///
 ///     // construct new service with config argument
-///     let srv = factory.create(&10).await?;
+///     let srv = factory.pipeline(&10).await?;
 ///
 ///     let result = srv.call(10).await?;
 ///     assert_eq!(result, 100);
@@ -118,6 +118,14 @@ where
     }
 }
 
+impl<F, Req> fmt::Debug for FnService<F, Req> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FnService")
+            .field("f", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<F, Fut, Req, Res, Err> Service<Req> for FnService<F, Req>
 where
     F: Fn(Req) -> Fut,
@@ -128,7 +136,7 @@ where
     type Future<'f> = Fut where Self: 'f, Req: 'f;
 
     #[inline]
-    fn call(&self, req: Req) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Req, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         (self.f)(req)
     }
 }
@@ -180,6 +188,18 @@ where
     }
 }
 
+impl<F, Fut, Req, Res, Err, Cfg> fmt::Debug for FnServiceFactory<F, Fut, Req, Res, Err, Cfg>
+where
+    F: Fn(Req) -> Fut,
+    Fut: Future<Output = Result<Res, Err>>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FnServiceFactory")
+            .field("f", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<F, Fut, Req, Res, Err> Service<Req> for FnServiceFactory<F, Fut, Req, Res, Err, ()>
 where
     F: Fn(Req) -> Fut,
@@ -190,7 +210,7 @@ where
     type Future<'f> = Fut where Self: 'f;
 
     #[inline]
-    fn call(&self, req: Req) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Req, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         (self.f)(req)
     }
 }
@@ -252,6 +272,19 @@ where
             f: self.f.clone(),
             _t: PhantomData,
         }
+    }
+}
+
+impl<F, Fut, Cfg, Srv, Req, Err> fmt::Debug for FnServiceConfig<F, Fut, Cfg, Srv, Req, Err>
+where
+    F: Fn(Cfg) -> Fut,
+    Fut: Future<Output = Result<Srv, Err>>,
+    Srv: Service<Req>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FnServiceConfig")
+            .field("f", &std::any::type_name::<F>())
+            .finish()
     }
 }
 
@@ -328,6 +361,19 @@ where
     }
 }
 
+impl<F, S, R, Req, E> fmt::Debug for FnServiceNoConfig<F, S, R, Req, E>
+where
+    F: Fn() -> R,
+    R: Future<Output = Result<S, E>>,
+    S: Service<Req>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FnServiceNoConfig")
+            .field("f", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<F, S, R, Req, E, C> IntoServiceFactory<FnServiceNoConfig<F, S, R, Req, E>, Req, C>
     for F
 where
@@ -348,34 +394,39 @@ mod tests {
     use std::task::Poll;
 
     use super::*;
-    use crate::{Service, ServiceFactory};
+    use crate::{Pipeline, ServiceFactory};
 
     #[ntex::test]
     async fn test_fn_service() {
         let new_srv = fn_service(|()| async { Ok::<_, ()>("srv") }).clone();
+        format!("{:?}", new_srv);
 
-        let srv = new_srv.create(()).await.unwrap();
+        let srv = Pipeline::new(new_srv.create(()).await.unwrap());
         let res = srv.call(()).await;
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "srv");
+        format!("{:?}", srv);
 
-        let srv2 = new_srv.clone();
+        let srv2 = Pipeline::new(new_srv.clone());
         let res = srv2.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "srv");
+        format!("{:?}", srv2);
 
         assert_eq!(lazy(|cx| srv2.poll_shutdown(cx)).await, Poll::Ready(()));
     }
 
     #[ntex::test]
     async fn test_fn_service_service() {
-        let srv = fn_service(|()| async { Ok::<_, ()>("srv") })
-            .clone()
-            .create(&())
-            .await
-            .unwrap()
-            .clone();
+        let srv = Pipeline::new(
+            fn_service(|()| async { Ok::<_, ()>("srv") })
+                .clone()
+                .create(&())
+                .await
+                .unwrap()
+                .clone(),
+        );
 
         let res = srv.call(()).await;
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
@@ -396,7 +447,7 @@ mod tests {
         })
         .clone();
 
-        let srv = new_srv.create(&1).await.unwrap();
+        let srv = Pipeline::new(new_srv.create(&1).await.unwrap());
         let res = srv.call(()).await;
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
         assert!(res.is_ok());

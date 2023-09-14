@@ -1,4 +1,4 @@
-use std::{future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
+use std::{fmt, future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
 
 use super::ServiceFactory;
 
@@ -38,6 +38,18 @@ where
     }
 }
 
+impl<A, R, C, F, E> fmt::Debug for MapInitErr<A, R, C, F, E>
+where
+    A: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MapInitErr")
+            .field("service", &self.a)
+            .field("map", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<A, R, C, F, E> ServiceFactory<R, C> for MapInitErr<A, R, C, F, E>
 where
     A: ServiceFactory<R, C>,
@@ -60,6 +72,7 @@ where
 }
 
 pin_project_lite::pin_project! {
+    #[must_use = "futures do nothing unless polled"]
     pub struct MapInitErrFuture<'f, A, R, C, F, E>
     where
         A: ServiceFactory<R, C>,
@@ -88,11 +101,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{fn_factory_with_config, into_service, pipeline_factory, ServiceFactory};
+    use crate::{chain_factory, fn_factory_with_config, into_service, ServiceFactory};
 
     #[ntex::test]
     async fn map_init_err() {
-        let factory = pipeline_factory(fn_factory_with_config(|err: &bool| {
+        let factory = chain_factory(fn_factory_with_config(|err: &bool| {
             let err = *err;
             async move {
                 if err {
@@ -107,5 +120,26 @@ mod tests {
 
         assert!(factory.create(&true).await.is_err());
         assert!(factory.create(&false).await.is_ok());
+        format!("{:?}", factory);
+    }
+
+    #[ntex::test]
+    async fn map_init_err2() {
+        let factory = fn_factory_with_config(|err: &bool| {
+            let err = *err;
+            async move {
+                if err {
+                    Err(())
+                } else {
+                    Ok(into_service(|i: usize| async move { Ok::<_, ()>(i * 2) }))
+                }
+            }
+        })
+        .map_init_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "err"))
+        .clone();
+
+        assert!(factory.create(&true).await.is_err());
+        assert!(factory.create(&false).await.is_ok());
+        format!("{:?}", factory);
     }
 }

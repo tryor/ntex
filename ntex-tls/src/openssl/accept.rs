@@ -2,7 +2,7 @@ use std::task::{Context, Poll};
 use std::{error::Error, future::Future, marker::PhantomData, pin::Pin};
 
 use ntex_io::{Filter, FilterFactory, Io, Layer};
-use ntex_service::{Service, ServiceFactory};
+use ntex_service::{Service, ServiceCtx, ServiceFactory};
 use ntex_util::{future::Ready, time::Millis};
 use tls_openssl::ssl::SslAcceptor;
 
@@ -11,6 +11,7 @@ use crate::MAX_SSL_ACCEPT_COUNTER;
 
 use super::{SslAcceptor as IoSslAcceptor, SslFilter};
 
+#[derive(Debug)]
 /// Support `TLS` server connections via openssl package
 ///
 /// `openssl` feature enables `Acceptor` type
@@ -71,6 +72,7 @@ impl<F: Filter, C: 'static> ServiceFactory<Io<F>, C> for Acceptor<F> {
     }
 }
 
+#[derive(Debug)]
 /// Support `TLS` server connections via openssl package
 ///
 /// `openssl` feature enables `Acceptor` type
@@ -95,7 +97,7 @@ impl<F: Filter> Service<Io<F>> for AcceptorService<F> {
     }
 
     #[inline]
-    fn call(&self, req: Io<F>) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         AcceptorServiceResponse {
             _guard: self.conns.get(),
             fut: self.acceptor.clone().create(req),

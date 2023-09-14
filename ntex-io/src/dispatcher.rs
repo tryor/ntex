@@ -3,7 +3,7 @@ use std::{cell::Cell, future, pin::Pin, rc::Rc, task::Context, task::Poll, time}
 
 use ntex_bytes::Pool;
 use ntex_codec::{Decoder, Encoder};
-use ntex_service::{IntoService, Service};
+use ntex_service::{IntoService, Pipeline, Service};
 use ntex_util::time::Seconds;
 use ntex_util::{future::Either, ready, spawn};
 
@@ -44,14 +44,14 @@ where
     pool: Pool,
 }
 
-pub struct DispatcherShared<S, U>
+pub(crate) struct DispatcherShared<S, U>
 where
     S: Service<DispatchItem<U>, Response = Option<Response<U>>>,
     U: Encoder + Decoder,
 {
     io: IoBoxed,
     codec: U,
-    service: S,
+    service: Pipeline<S>,
     error: Cell<Option<DispatcherError<S::Error, <U as Encoder>::Error>>>,
     inflight: Cell<usize>,
 }
@@ -64,6 +64,7 @@ enum DispatcherState {
     Shutdown,
 }
 
+#[derive(Debug)]
 enum DispatcherError<S, U> {
     Encoder(U),
     Service(S),
@@ -107,7 +108,7 @@ where
             codec,
             error: Cell::new(None),
             inflight: Cell::new(0),
-            service: service.into_service(),
+            service: Pipeline::new(service.into_service()),
         });
 
         Dispatcher {
@@ -340,7 +341,7 @@ where
 {
     fn poll_service(
         &self,
-        srv: &S,
+        srv: &Pipeline<S>,
         cx: &mut Context<'_>,
         io: &IoBoxed,
     ) -> Poll<PollService<U>> {
@@ -426,6 +427,7 @@ mod tests {
 
     use ntex_bytes::{Bytes, PoolId, PoolRef};
     use ntex_codec::BytesCodec;
+    use ntex_service::ServiceCtx;
     use ntex_util::{future::Ready, time::sleep, time::Millis, time::Seconds};
 
     use super::*;
@@ -475,7 +477,7 @@ mod tests {
                 io: state.into(),
                 error: Cell::new(None),
                 inflight: Cell::new(0),
-                service: service.into_service(),
+                service: Pipeline::new(service.into_service()),
             });
 
             (
@@ -621,7 +623,11 @@ mod tests {
                 Poll::Ready(Err(()))
             }
 
-            fn call(&self, _: DispatchItem<BytesCodec>) -> Self::Future<'_> {
+            fn call<'a>(
+                &'a self,
+                _: DispatchItem<BytesCodec>,
+                _: ServiceCtx<'a, Self>,
+            ) -> Self::Future<'a> {
                 Ready::Ok(None)
             }
         }

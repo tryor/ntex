@@ -187,7 +187,7 @@ pub trait BufMut {
                 let d = self.chunk_mut();
                 l = cmp::min(s.len(), d.len());
 
-                ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, l);
+                ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr(), l);
             }
 
             src.advance(l);
@@ -228,11 +228,7 @@ pub trait BufMut {
                 let dst = self.chunk_mut();
                 cnt = cmp::min(dst.len(), src.len() - off);
 
-                ptr::copy_nonoverlapping(
-                    src[off..].as_ptr(),
-                    dst.as_mut_ptr() as *mut u8,
-                    cnt,
-                );
+                ptr::copy_nonoverlapping(src[off..].as_ptr(), dst.as_mut_ptr(), cnt);
 
                 off += cnt;
             }
@@ -970,6 +966,7 @@ impl BufMut for &mut [u8] {
 fn _assert_trait_object(_b: &dyn BufMut) {}
 
 #[cfg(test)]
+#[allow(unused_allocation, warnings)]
 mod tests {
     use super::*;
     use crate::{BytesMut, BytesVec};

@@ -57,7 +57,7 @@ impl HttpMessage for ClientResponse {
 }
 
 impl ClientResponse {
-    /// Create new Request instance
+    /// Create new client response instance
     pub(crate) fn new(head: ResponseHead, payload: Payload) -> Self {
         ClientResponse { head, payload }
     }
@@ -69,6 +69,11 @@ impl ClientResponse {
     #[inline]
     pub(crate) fn head(&self) -> &ResponseHead {
         &self.head
+    }
+
+    #[inline]
+    pub(crate) fn head_mut(&mut self) -> &mut ResponseHead {
+        &mut self.head
     }
 
     /// Read the Request Version.
@@ -90,9 +95,15 @@ impl ClientResponse {
     }
 
     #[inline]
-    /// Returns request's headers.
+    /// Returns response's headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.head().headers
+    }
+
+    #[inline]
+    /// Returns mutable response's headers.
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.head_mut().headers
     }
 
     /// Set a body and return previous body value
@@ -155,6 +166,7 @@ impl fmt::Debug for ClientResponse {
     }
 }
 
+#[derive(Debug)]
 /// Future that resolves to a complete http message body.
 pub struct MessageBody {
     length: Option<usize>,
@@ -233,6 +245,7 @@ impl Future for MessageBody {
     }
 }
 
+#[derive(Debug)]
 /// Response's payload json parser, it resolves to a deserialized `T` value.
 ///
 /// Returns error:
@@ -331,6 +344,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct ReadBody {
     stream: Payload,
     buf: BytesMut,
@@ -371,7 +385,7 @@ impl Future for ReadBody {
                         Poll::Ready(Err(PayloadError::Incomplete(Some(
                             std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
-                                "Operation timed our",
+                                "Operation timed out",
                             ),
                         ))))
                     } else {

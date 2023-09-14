@@ -3,9 +3,10 @@ use std::{cell::RefCell, fmt, rc::Rc};
 use crate::http::Response;
 use crate::router::{IntoPattern, ResourceDef};
 use crate::service::boxed::{self, BoxService, BoxServiceFactory};
-use crate::service::{dev::AndThen, pipeline, pipeline_factory, Pipeline, PipelineFactory};
+use crate::service::dev::{AndThen, ServiceChain, ServiceChainFactory};
+use crate::service::{chain_factory, ServiceCtx};
 use crate::service::{
-    Identity, IntoServiceFactory, Middleware, Service, ServiceFactory, Stack,
+    Identity, IntoServiceFactory, Middleware, Service, ServiceCall, ServiceFactory, Stack,
 };
 use crate::util::{BoxFuture, Either, Extensions, Ready};
 
@@ -21,7 +22,10 @@ type HttpService<Err: ErrorRenderer> =
     BoxService<WebRequest<Err>, WebResponse, Err::Container>;
 type HttpNewService<Err: ErrorRenderer> =
     BoxServiceFactory<(), WebRequest<Err>, WebResponse, Err::Container, ()>;
-type ResourcePipeline<F, Err> = Pipeline<WebRequest<Err>, AndThen<F, ResourceRouter<Err>>>;
+type ResourcePipeline<F, Err> =
+    ServiceChain<AndThen<F, ResourceRouter<Err>>, WebRequest<Err>>;
+type BoxResponse<'a, Err: ErrorRenderer> =
+    ServiceCall<'a, HttpService<Err>, WebRequest<Err>>;
 
 /// *Resource* is an entry in resources table which corresponds to requested URL.
 ///
@@ -47,7 +51,7 @@ type ResourcePipeline<F, Err> = Pipeline<WebRequest<Err>, AndThen<F, ResourceRou
 /// Default behavior could be overriden with `default_resource()` method.
 pub struct Resource<Err: ErrorRenderer, M = Identity, T = Filter<Err>> {
     middleware: M,
-    filter: PipelineFactory<WebRequest<Err>, T>,
+    filter: ServiceChainFactory<T, WebRequest<Err>>,
     rdef: Vec<String>,
     name: Option<String>,
     routes: Vec<Route<Err>>,
@@ -64,7 +68,7 @@ impl<Err: ErrorRenderer> Resource<Err> {
             name: None,
             state: None,
             middleware: Identity,
-            filter: pipeline_factory(Filter::new()),
+            filter: chain_factory(Filter::new()),
             guards: Vec::new(),
             default: Rc::new(RefCell::new(None)),
         }
@@ -298,7 +302,7 @@ where
     {
         // create and configure default resource
         self.default = Rc::new(RefCell::new(Some(Rc::new(boxed::factory(
-            f.into_factory()
+            f.chain()
                 .map_init_err(|e| log::error!("Cannot construct default service: {:?}", e)),
         )))));
 
@@ -362,7 +366,7 @@ where
 
 impl<Err, M, F>
     IntoServiceFactory<
-        ResourceServiceFactory<Err, M, PipelineFactory<WebRequest<Err>, F>>,
+        ResourceServiceFactory<Err, M, ServiceChainFactory<F, WebRequest<Err>>>,
         WebRequest<Err>,
     > for Resource<Err, M, F>
 where
@@ -378,7 +382,7 @@ where
 {
     fn into_factory(
         self,
-    ) -> ResourceServiceFactory<Err, M, PipelineFactory<WebRequest<Err>, F>> {
+    ) -> ResourceServiceFactory<Err, M, ServiceChainFactory<F, WebRequest<Err>>> {
         let router_factory = ResourceRouterFactory {
             state: None,
             routes: self.routes,
@@ -422,7 +426,7 @@ where
         Box::pin(async move {
             let filter = self.filter.create(()).await?;
             let routing = self.routing.create(()).await?;
-            Ok(self.middleware.create(pipeline(filter).and_then(routing)))
+            Ok(self.middleware.create(filter.chain().and_then(routing)))
         })
     }
 }
@@ -456,6 +460,9 @@ impl<Err: ErrorRenderer> ServiceFactory<WebRequest<Err>> for ResourceRouterFacto
     }
 }
 
+type BoxResourceRouterResponse<'a, Err: ErrorRenderer> =
+    ServiceCall<'a, RouteService<Err>, WebRequest<Err>>;
+
 pub struct ResourceRouter<Err: ErrorRenderer> {
     state: Option<AppState>,
     routes: Vec<RouteService<Err>>,
@@ -466,26 +473,30 @@ impl<Err: ErrorRenderer> Service<WebRequest<Err>> for ResourceRouter<Err> {
     type Response = WebResponse;
     type Error = Err::Container;
     type Future<'f> = Either<
-        Ready<WebResponse, Err::Container>,
-        BoxFuture<'f, Result<WebResponse, Err::Container>>,
+        BoxResourceRouterResponse<'f, Err>,
+        Either<Ready<WebResponse, Err::Container>, BoxResponse<'f, Err>>,
     >;
 
-    fn call(&self, mut req: WebRequest<Err>) -> Self::Future<'_> {
+    fn call<'a>(
+        &'a self,
+        mut req: WebRequest<Err>,
+        ctx: ServiceCtx<'a, Self>,
+    ) -> Self::Future<'a> {
         for route in self.routes.iter() {
             if route.check(&mut req) {
                 if let Some(ref state) = self.state {
                     req.set_state_container(state.clone());
                 }
-                return Either::Right(route.call(req));
+                return Either::Left(ctx.call(route, req));
             }
         }
         if let Some(ref default) = self.default {
-            Either::Right(default.call(req))
+            Either::Right(Either::Right(ctx.call(default, req)))
         } else {
-            Either::Left(Ready::Ok(WebResponse::new(
+            Either::Right(Either::Left(Ready::Ok(WebResponse::new(
                 Response::MethodNotAllowed().finish(),
                 req.into_parts().0,
-            )))
+            ))))
         }
     }
 }

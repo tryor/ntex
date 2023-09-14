@@ -1,9 +1,9 @@
 use std::task::{Context, Poll};
-use std::{collections::VecDeque, future::Future, io, net::SocketAddr, pin::Pin};
+use std::{collections::VecDeque, fmt, future::Future, io, net::SocketAddr, pin::Pin};
 
 use ntex_bytes::{PoolId, PoolRef};
 use ntex_io::{types, Io};
-use ntex_service::{Service, ServiceFactory};
+use ntex_service::{Service, ServiceCtx, ServiceFactory};
 use ntex_util::future::{BoxFuture, Either, Ready};
 
 use crate::{net::tcp_connect_in, Address, Connect, ConnectError, Resolver};
@@ -39,7 +39,7 @@ impl<T: Address> Connector<T> {
         Connect<T>: From<U>,
     {
         ConnectServiceResponse {
-            state: ConnectState::Resolve(self.resolver.call(message.into())),
+            state: ConnectState::Resolve(Box::pin(self.resolver.lookup(message.into()))),
             pool: self.pool,
         }
         .await
@@ -58,6 +58,15 @@ impl<T> Clone for Connector<T> {
             resolver: self.resolver.clone(),
             pool: self.pool,
         }
+    }
+}
+
+impl<T> fmt::Debug for Connector<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connector")
+            .field("resolver", &self.resolver)
+            .field("memory_pool", &self.pool)
+            .finish()
     }
 }
 
@@ -80,13 +89,13 @@ impl<T: Address> Service<Connect<T>> for Connector<T> {
     type Future<'f> = ConnectServiceResponse<'f, T>;
 
     #[inline]
-    fn call(&self, req: Connect<T>) -> Self::Future<'_> {
-        ConnectServiceResponse::new(self.resolver.call(req))
+    fn call<'a>(&'a self, req: Connect<T>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
+        ConnectServiceResponse::new(Box::pin(self.resolver.lookup(req)))
     }
 }
 
 enum ConnectState<'f, T: Address> {
-    Resolve(<Resolver<T> as Service<Connect<T>>>::Future<'f>),
+    Resolve(BoxFuture<'f, Result<Connect<T>, ConnectError>>),
     Connect(TcpConnectorResponse<T>),
 }
 
@@ -97,11 +106,19 @@ pub struct ConnectServiceResponse<'f, T: Address> {
 }
 
 impl<'f, T: Address> ConnectServiceResponse<'f, T> {
-    pub(super) fn new(fut: <Resolver<T> as Service<Connect<T>>>::Future<'f>) -> Self {
+    pub(super) fn new(fut: BoxFuture<'f, Result<Connect<T>, ConnectError>>) -> Self {
         Self {
             state: ConnectState::Resolve(fut),
             pool: PoolId::P0.pool_ref(),
         }
+    }
+}
+
+impl<'f, T: Address> fmt::Debug for ConnectServiceResponse<'f, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectServiceResponse")
+            .field("pool", &self.pool)
+            .finish()
     }
 }
 
@@ -158,8 +175,9 @@ impl<T: Address> TcpConnectorResponse<T> {
         pool: PoolRef,
     ) -> TcpConnectorResponse<T> {
         trace!(
-            "TCP connector - connecting to {:?} port:{}",
+            "TCP connector - connecting to {:?} addr:{:?} port:{}",
             req.host(),
+            addr,
             port
         );
 

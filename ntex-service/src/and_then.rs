@@ -1,7 +1,8 @@
 use std::{future::Future, pin::Pin, task::Context, task::Poll};
 
-use super::{Service, ServiceFactory};
+use super::{Service, ServiceCall, ServiceCtx, ServiceFactory};
 
+#[derive(Clone, Debug)]
 /// Service for the `and_then` combinator, chaining a computation onto the end
 /// of another service which completes successfully.
 ///
@@ -15,19 +16,6 @@ impl<A, B> AndThen<A, B> {
     /// Create new `AndThen` combinator
     pub(crate) fn new(svc1: A, svc2: B) -> Self {
         Self { svc1, svc2 }
-    }
-}
-
-impl<A, B> Clone for AndThen<A, B>
-where
-    A: Clone,
-    B: Clone,
-{
-    fn clone(&self) -> Self {
-        AndThen {
-            svc1: self.svc1.clone(),
-            svc2: self.svc2.clone(),
-        }
     }
 }
 
@@ -59,17 +47,19 @@ where
     }
 
     #[inline]
-    fn call(&self, req: Req) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Req, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         AndThenServiceResponse {
             slf: self,
             state: State::A {
-                fut: self.svc1.call(req),
+                fut: ctx.call(&self.svc1, req),
+                ctx: Some(ctx),
             },
         }
     }
 }
 
 pin_project_lite::pin_project! {
+    #[must_use = "futures do nothing unless polled"]
     pub struct AndThenServiceResponse<'f, A, B, Req>
     where
         A: Service<Req>,
@@ -91,8 +81,8 @@ pin_project_lite::pin_project! {
         B: Service<A::Response, Error = A::Error>,
         B: 'f,
     {
-        A { #[pin] fut: A::Future<'f> },
-        B { #[pin] fut: B::Future<'f> },
+        A { #[pin] fut: ServiceCall<'f, A, Req>, ctx: Option<ServiceCtx<'f, AndThen<A, B>>> },
+        B { #[pin] fut: ServiceCall<'f, B, A::Response> },
         Empty,
     }
 }
@@ -108,9 +98,9 @@ where
         let mut this = self.as_mut().project();
 
         match this.state.as_mut().project() {
-            StateProject::A { fut } => match fut.poll(cx)? {
+            StateProject::A { fut, ctx } => match fut.poll(cx)? {
                 Poll::Ready(res) => {
-                    let fut = this.slf.svc2.call(res);
+                    let fut = ctx.take().unwrap().call(&this.slf.svc2, res);
                     this.state.set(State::B { fut });
                     self.poll(cx)
                 }
@@ -127,6 +117,7 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
 /// `.and_then()` service factory combinator
 pub struct AndThenFactory<A, B> {
     svc1: A,
@@ -164,20 +155,8 @@ where
     }
 }
 
-impl<A, B> Clone for AndThenFactory<A, B>
-where
-    A: Clone,
-    B: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            svc1: self.svc1.clone(),
-            svc2: self.svc2.clone(),
-        }
-    }
-}
-
 pin_project_lite::pin_project! {
+    #[must_use = "futures do nothing unless polled"]
     pub struct AndThenFactoryResponse<'f, A, B, Req, Cfg>
     where
         A: ServiceFactory<Req, Cfg>,
@@ -231,7 +210,7 @@ where
 mod tests {
     use std::{cell::Cell, rc::Rc, task::Context, task::Poll};
 
-    use crate::{fn_factory, pipeline, pipeline_factory, Service, ServiceFactory};
+    use crate::{chain, chain_factory, fn_factory, Service, ServiceCtx};
     use ntex_util::future::{lazy, Ready};
 
     #[derive(Clone)]
@@ -247,7 +226,11 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&self, req: &'static str) -> Self::Future<'_> {
+        fn call<'a>(
+            &'a self,
+            req: &'static str,
+            _: ServiceCtx<'a, Self>,
+        ) -> Self::Future<'a> {
             Ready::Ok(req)
         }
     }
@@ -265,7 +248,11 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&self, req: &'static str) -> Self::Future<'_> {
+        fn call<'a>(
+            &'a self,
+            req: &'static str,
+            _: ServiceCtx<'a, Self>,
+        ) -> Self::Future<'a> {
             Ready::Ok((req, "srv2"))
         }
     }
@@ -273,9 +260,18 @@ mod tests {
     #[ntex::test]
     async fn test_poll_ready() {
         let cnt = Rc::new(Cell::new(0));
-        let srv = pipeline(Srv1(cnt.clone()))
-            .and_then(Srv2(cnt.clone()))
-            .clone();
+        let srv = chain(Srv1(cnt.clone())).and_then(Srv2(cnt.clone())).clone();
+        let res = lazy(|cx| srv.poll_ready(cx)).await;
+        assert_eq!(res, Poll::Ready(Ok(())));
+        assert_eq!(cnt.get(), 2);
+        let res = lazy(|cx| srv.poll_shutdown(cx)).await;
+        assert_eq!(res, Poll::Ready(()));
+    }
+
+    #[ntex::test]
+    async fn test_poll_ready2() {
+        let cnt = Rc::new(Cell::new(0));
+        let srv = Box::new(chain(Srv1(cnt.clone())).and_then(Srv2(cnt.clone())));
         let res = lazy(|cx| srv.poll_ready(cx)).await;
         assert_eq!(res, Poll::Ready(Ok(())));
         assert_eq!(cnt.get(), 2);
@@ -286,7 +282,7 @@ mod tests {
     #[ntex::test]
     async fn test_call() {
         let cnt = Rc::new(Cell::new(0));
-        let srv = pipeline(Srv1(cnt.clone())).and_then(Srv2(cnt));
+        let srv = chain(Srv1(cnt.clone())).and_then(Srv2(cnt)).pipeline();
         let res = srv.call("srv1").await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("srv1", "srv2"));
@@ -296,13 +292,13 @@ mod tests {
     async fn test_factory() {
         let cnt = Rc::new(Cell::new(0));
         let cnt2 = cnt.clone();
-        let new_srv = pipeline_factory(fn_factory(move || {
+        let new_srv = chain_factory(fn_factory(move || {
             Ready::from(Ok::<_, ()>(Srv1(cnt2.clone())))
         }))
         .and_then(move || Ready::from(Ok(Srv2(cnt.clone()))))
         .clone();
 
-        let srv = new_srv.create(&()).await.unwrap();
+        let srv = new_srv.pipeline(&()).await.unwrap();
         let res = srv.call("srv1").await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("srv1", "srv2"));

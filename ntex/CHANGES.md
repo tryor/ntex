@@ -1,5 +1,53 @@
 # Changes
 
+## [0.7.4] - 2023-09-11
+
+* Add missing fmt::Debug impls
+
+## [0.7.3] - 2023-08-10
+
+* Update ntex-service
+
+## [0.7.1] - 2023-06-23
+
+* `PipelineCall` is static
+
+## [0.7.0] - 2023-06-22
+
+* Release v0.7.0
+
+## [0.7.0-beta.2] - 2023-06-21
+
+* Remove unsafe from h1 dispatcher
+
+## [0.7.0-beta.1] - 2023-06-19
+
+* Rename Ctx to ServiceCtx
+
+## [0.7.0-beta.0] - 2023-06-16
+
+* Migrate to ntex-service 1.2
+
+## [0.6.7] - 2023-04-14
+
+* Remove Rc<Service> usage, update service and util deps
+
+## [0.6.6] - 2023-04-11
+
+* http: Better http2 config handling
+
+## [0.6.5] - 2023-03-15
+
+* web: Proper handling responses from ws web handler
+
+## [0.6.4] - 2023-03-11
+
+* http: Add `ClientResponse::headers_mut()` method
+
+* http: Don't stop h1 dispatcher on upgrade handler with await #178
+
+* web: `AppConfig` can be created with custom parameters via `new()`
+
 ## [0.6.2] - 2023-01-24
 
 * Update ntex-io, ntex-tls deps

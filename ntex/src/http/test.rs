@@ -15,6 +15,7 @@ use super::header::{self, HeaderMap, HeaderName, HeaderValue};
 use super::payload::Payload;
 use super::{Method, Request, Uri, Version};
 
+#[derive(Debug)]
 /// Test `Request` builder
 ///
 /// ```rust,no_run
@@ -39,6 +40,7 @@ use super::{Method, Request, Uri, Version};
 /// ```
 pub struct TestRequest(Option<Inner>);
 
+#[derive(Debug)]
 struct Inner {
     version: Version,
     method: Method,
@@ -115,7 +117,7 @@ impl TestRequest {
 
     #[cfg(feature = "cookie")]
     /// Set cookie for this request
-    pub fn cookie<'a>(&mut self, cookie: Cookie<'a>) -> &mut Self {
+    pub fn cookie(&mut self, cookie: Cookie<'_>) -> &mut Self {
         parts(&mut self.0).cookies.add(cookie.into_owned());
         self
     }
@@ -276,6 +278,7 @@ where
     }
 }
 
+#[derive(Debug)]
 /// Test server controller
 pub struct TestServer {
     addr: net::SocketAddr,

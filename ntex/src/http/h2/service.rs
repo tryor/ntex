@@ -10,7 +10,7 @@ use crate::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use crate::http::message::{CurrentIo, ResponseHead};
 use crate::http::{DateService, Method, Request, Response, StatusCode, Uri, Version};
 use crate::io::{types, Filter, Io, IoBoxed, IoRef};
-use crate::service::{IntoServiceFactory, Service, ServiceFactory};
+use crate::service::{IntoServiceFactory, Service, ServiceCtx, ServiceFactory};
 use crate::util::{poll_fn, BoxFuture, Bytes, BytesMut, Either, HashMap, Ready};
 
 use super::payload::{Payload, PayloadSender};
@@ -19,7 +19,6 @@ use super::payload::{Payload, PayloadSender};
 pub struct H2Service<F, S, B> {
     srv: S,
     cfg: ServiceConfig,
-    h2config: h2::Config,
     _t: PhantomData<(F, B)>,
 }
 
@@ -38,7 +37,6 @@ where
         H2Service {
             cfg,
             srv: service.into_factory(),
-            h2config: h2::Config::server(),
             _t: PhantomData,
         }
     }
@@ -49,7 +47,7 @@ mod openssl {
     use ntex_tls::openssl::{Acceptor, SslFilter};
     use tls_openssl::ssl::SslAcceptor;
 
-    use crate::{io::Layer, server::SslError, service::pipeline_factory};
+    use crate::{io::Layer, server::SslError};
 
     use super::*;
 
@@ -71,13 +69,12 @@ mod openssl {
             Error = SslError<DispatchError>,
             InitError = S::InitError,
         > {
-            pipeline_factory(
-                Acceptor::new(acceptor)
-                    .timeout(self.cfg.0.ssl_handshake_timeout)
-                    .map_err(SslError::Ssl)
-                    .map_init_err(|_| panic!()),
-            )
-            .and_then(self.map_err(SslError::Service))
+            Acceptor::new(acceptor)
+                .timeout(self.cfg.0.ssl_handshake_timeout)
+                .chain()
+                .map_err(SslError::Ssl)
+                .map_init_err(|_| panic!())
+                .and_then(self.chain().map_err(SslError::Service))
         }
     }
 }
@@ -88,7 +85,7 @@ mod rustls {
     use tls_rustls::ServerConfig;
 
     use super::*;
-    use crate::{io::Layer, server::SslError, service::pipeline_factory};
+    use crate::{io::Layer, server::SslError};
 
     impl<F, S, B> H2Service<Layer<TlsFilter, F>, S, B>
     where
@@ -111,13 +108,12 @@ mod rustls {
             let protos = vec!["h2".to_string().into()];
             config.alpn_protocols = protos;
 
-            pipeline_factory(
-                Acceptor::from(config)
-                    .timeout(self.cfg.0.ssl_handshake_timeout)
-                    .map_err(|e| SslError::Ssl(Box::new(e)))
-                    .map_init_err(|_| panic!()),
-            )
-            .and_then(self.map_err(SslError::Service))
+            Acceptor::from(config)
+                .timeout(self.cfg.0.ssl_handshake_timeout)
+                .chain()
+                .map_err(|e| SslError::Ssl(Box::new(e)))
+                .map_init_err(|_| panic!())
+                .and_then(self.chain().map_err(SslError::Service))
         }
     }
 }
@@ -139,7 +135,6 @@ where
     fn create(&self, _: ()) -> Self::Future<'_> {
         let fut = self.srv.create(());
         let cfg = self.cfg.clone();
-        let h2config = self.h2config.clone();
 
         Box::pin(async move {
             let service = fut.await?;
@@ -147,7 +142,6 @@ where
 
             Ok(H2ServiceHandler {
                 config,
-                h2config,
                 _t: PhantomData,
             })
         })
@@ -157,7 +151,6 @@ where
 /// `Service` implementation for http/2 transport
 pub struct H2ServiceHandler<F, S: Service<Request>, B> {
     config: Rc<DispatcherConfig<S, (), ()>>,
-    h2config: h2::Config,
     _t: PhantomData<(F, B)>,
 }
 
@@ -186,24 +179,19 @@ where
         self.config.service.poll_shutdown(cx)
     }
 
-    fn call(&self, io: Io<F>) -> Self::Future<'_> {
+    fn call<'a>(&'a self, io: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'_> {
         log::trace!(
             "New http2 connection, peer address {:?}",
             io.query::<types::PeerAddr>().get()
         );
 
-        Box::pin(handle(
-            io.into(),
-            self.config.clone(),
-            self.h2config.clone(),
-        ))
+        Box::pin(handle(io.into(), self.config.clone()))
     }
 }
 
 pub(in crate::http) async fn handle<S, B, X, U>(
     io: IoBoxed,
     config: Rc<DispatcherConfig<S, X, U>>,
-    h2config: h2::Config,
 ) -> Result<(), DispatchError>
 where
     S: Service<Request> + 'static,
@@ -218,7 +206,7 @@ where
 
     let _ = server::handle_one(
         io,
-        h2config,
+        config.h2config.clone(),
         ControlService::new(),
         PublishService::new(ioref, config),
     )
@@ -240,7 +228,11 @@ impl Service<h2::ControlMessage<H2Error>> for ControlService {
     type Error = ();
     type Future<'f> = Ready<Self::Response, Self::Error>;
 
-    fn call(&self, msg: h2::ControlMessage<H2Error>) -> Self::Future<'_> {
+    fn call<'a>(
+        &'a self,
+        msg: h2::ControlMessage<H2Error>,
+        _: ServiceCtx<'a, Self>,
+    ) -> Self::Future<'a> {
         log::trace!("Control message: {:?}", msg);
         Ready::Ok::<_, ()>(msg.ack())
     }
@@ -286,7 +278,11 @@ where
         Ready<Self::Response, Self::Error>,
     >;
 
-    fn call(&self, mut msg: h2::Message) -> Self::Future<'_> {
+    fn call<'a>(
+        &'a self,
+        mut msg: h2::Message,
+        _: ServiceCtx<'a, Self>,
+    ) -> Self::Future<'a> {
         let (io, pseudo, headers, eof, payload) = match msg.kind().take() {
             h2::MessageKind::Headers {
                 pseudo,

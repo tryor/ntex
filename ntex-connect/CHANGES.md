@@ -1,5 +1,17 @@
 # Changes
 
+## [0.3.1] - 2023-09-11
+
+* Add missing fmt::Debug impls
+
+## [0.3.0] - 2023-06-22
+
+* Release v0.3.0
+
+## [0.3.0-beta.0] - 2023-06-16
+
+* Migrate to ntex-service 1.2
+
 ## [0.2.1] - 2023-01-23
 
 * Use new Io object

@@ -1,7 +1,7 @@
 use std::task::{Context, Poll};
-use std::{cell::Cell, convert::Infallible, marker, time::Duration, time::Instant};
+use std::{cell::Cell, convert::Infallible, fmt, marker, time::Duration, time::Instant};
 
-use ntex_service::{Service, ServiceFactory};
+use ntex_service::{Service, ServiceCtx, ServiceFactory};
 
 use crate::future::Ready;
 use crate::time::{now, sleep, Millis, Sleep};
@@ -42,6 +42,15 @@ where
             ka: self.ka,
             _t: marker::PhantomData,
         }
+    }
+}
+
+impl<R, E, F> fmt::Debug for KeepAlive<R, E, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeepAlive")
+            .field("ka", &self.ka)
+            .field("f", &std::any::type_name::<F>())
+            .finish()
     }
 }
 
@@ -86,6 +95,16 @@ where
     }
 }
 
+impl<R, E, F> fmt::Debug for KeepAliveService<R, E, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeepAliveService")
+            .field("dur", &self.dur)
+            .field("expire", &self.expire)
+            .field("f", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<R, E, F> Service<R> for KeepAliveService<R, E, F>
 where
     F: Fn() -> E,
@@ -113,7 +132,7 @@ where
         }
     }
 
-    fn call(&self, req: R) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: R, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         self.expire.set(now());
         Ready::Ok(req)
     }
@@ -121,7 +140,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ntex_service::{Service, ServiceFactory};
+    use ntex_service::ServiceFactory;
 
     use super::*;
     use crate::future::lazy;
@@ -134,7 +153,7 @@ mod tests {
         let factory = KeepAlive::new(Millis(100), || TestErr);
         let _ = factory.clone();
 
-        let service = factory.create(&()).await.unwrap();
+        let service = factory.pipeline(&()).await.unwrap();
 
         assert_eq!(service.call(1usize).await, Ok(1usize));
         assert!(lazy(|cx| service.poll_ready(cx)).await.is_ready());

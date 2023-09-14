@@ -34,7 +34,7 @@ pub enum ConnectError {
     /// SSL error
     #[cfg(feature = "openssl")]
     #[error("{0}")]
-    SslError(#[from] SslError),
+    SslError(std::rc::Rc<SslError>),
 
     /// SSL Handshake error
     #[cfg(feature = "openssl")]
@@ -50,7 +50,7 @@ pub enum ConnectError {
     NoRecords,
 
     /// Connecting took too long
-    #[error("Timeout out while establishing connection")]
+    #[error("Timeout while establishing connection")]
     Timeout,
 
     /// Connector has been disconnected
@@ -60,6 +60,43 @@ pub enum ConnectError {
     /// Unresolved host name
     #[error("Connector received `Connect` method with unresolved host")]
     Unresolved,
+}
+
+impl Clone for ConnectError {
+    fn clone(&self) -> Self {
+        match self {
+            ConnectError::SslIsNotSupported => ConnectError::SslIsNotSupported,
+            #[cfg(feature = "openssl")]
+            ConnectError::SslError(e) => ConnectError::SslError(e.clone()),
+            #[cfg(feature = "openssl")]
+            ConnectError::SslHandshakeError(e) => {
+                ConnectError::SslHandshakeError(e.clone())
+            }
+            ConnectError::Resolver(e) => {
+                ConnectError::Resolver(io::Error::new(e.kind(), format!("{}", e)))
+            }
+            ConnectError::NoRecords => ConnectError::NoRecords,
+            ConnectError::Timeout => ConnectError::Timeout,
+            ConnectError::Disconnected(e) => {
+                if let Some(e) = e {
+                    ConnectError::Disconnected(Some(io::Error::new(
+                        e.kind(),
+                        format!("{}", e),
+                    )))
+                } else {
+                    ConnectError::Disconnected(None)
+                }
+            }
+            ConnectError::Unresolved => ConnectError::Unresolved,
+        }
+    }
+}
+
+#[cfg(feature = "openssl")]
+impl From<SslError> for ConnectError {
+    fn from(err: SslError) -> Self {
+        ConnectError::SslError(std::rc::Rc::new(err))
+    }
 }
 
 impl From<crate::connect::ConnectError> for ConnectError {
@@ -115,7 +152,7 @@ pub enum SendRequestError {
     #[error("Http2 error {0}")]
     H2(#[from] ntex_h2::OperationError),
     /// Response took too long
-    #[error("Timeout out while waiting for response")]
+    #[error("Timeout while waiting for response")]
     Timeout,
     /// Tunnels are not supported for http2 connection
     #[error("Tunnels are not supported for http2 connection")]

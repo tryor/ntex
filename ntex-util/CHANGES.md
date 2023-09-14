@@ -1,5 +1,37 @@
 # Changes
 
+## [0.3.2] - 2023-09-11
+
+* Add missing fmt::Debug impls
+
+## [0.3.1] - 2023-06-24
+
+* Changed `BufferService` to maintain order
+
+* Buffer error type changed to indicate cancellation
+
+## [0.3.0] - 2023-06-22
+
+* Release v0.3.0
+
+## [0.3.0-beta.0] - 2023-06-16
+
+* Upgrade to ntex-service 1.2
+
+* Remove unneeded SharedService
+
+## [0.2.3] - 2023-06-04
+
+* Refactor timer driver
+
+## [0.2.2] - 2023-04-20
+
+* Add OneRequest service, service that allows to handle one request at time
+
+## [0.2.1] - 2023-04-14
+
+* Add SharedService, a service that can be checked for readiness by multiple tasks
+
 ## [0.2.0] - 2023-01-04
 
 * Release

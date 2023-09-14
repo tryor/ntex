@@ -4,12 +4,13 @@ use std::{future::Future, io, marker::PhantomData, pin::Pin, sync::Arc};
 use tls_rust::ServerConfig;
 
 use ntex_io::{Filter, FilterFactory, Io, Layer};
-use ntex_service::{Service, ServiceFactory};
+use ntex_service::{Service, ServiceCtx, ServiceFactory};
 use ntex_util::{future::Ready, time::Millis};
 
 use super::{TlsAcceptor, TlsFilter};
 use crate::{counter::Counter, counter::CounterGuard, MAX_SSL_ACCEPT_COUNTER};
 
+#[derive(Debug)]
 /// Support `SSL` connections via rustls package
 ///
 /// `rust-tls` feature enables `RustlsAcceptor` type
@@ -71,6 +72,7 @@ impl<F: Filter, C: 'static> ServiceFactory<Io<F>, C> for Acceptor<F> {
     }
 }
 
+#[derive(Debug)]
 /// RusTLS based `Acceptor` service
 pub struct AcceptorService<F> {
     acceptor: TlsAcceptor,
@@ -93,7 +95,7 @@ impl<F: Filter> Service<Io<F>> for AcceptorService<F> {
     }
 
     #[inline]
-    fn call(&self, req: Io<F>) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         AcceptorServiceFut {
             _guard: self.conns.get(),
             fut: self.acceptor.clone().create(req),

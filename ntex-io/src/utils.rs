@@ -1,6 +1,6 @@
-use std::marker::PhantomData;
+use std::{fmt, marker::PhantomData};
 
-use ntex_service::{fn_service, pipeline_factory, Service, ServiceFactory};
+use ntex_service::{chain_factory, fn_service, Service, ServiceCtx, ServiceFactory};
 use ntex_util::future::Ready;
 
 use crate::{Filter, FilterFactory, Io, IoBoxed, Layer};
@@ -20,10 +20,9 @@ where
     S: ServiceFactory<IoBoxed, C>,
     C: Clone,
 {
-    pipeline_factory(
-        fn_service(|io: Io<F>| Ready::Ok(IoBoxed::from(io))).map_init_err(|_| panic!()),
-    )
-    .and_then(srv)
+    chain_factory(fn_service(|io: Io<F>| Ready::Ok(IoBoxed::from(io))))
+        .map_init_err(|_| panic!())
+        .and_then(srv)
 }
 
 /// Create filter factory service
@@ -40,6 +39,14 @@ where
 pub struct FilterServiceFactory<T, F> {
     filter: T,
     _t: PhantomData<F>,
+}
+
+impl<T: FilterFactory<F> + fmt::Debug, F> fmt::Debug for FilterServiceFactory<T, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilterServiceFactory")
+            .field("filter_factory", &self.filter)
+            .finish()
+    }
 }
 
 impl<T, F> ServiceFactory<Io<F>> for FilterServiceFactory<T, F>
@@ -66,6 +73,14 @@ pub struct FilterService<T, F> {
     _t: PhantomData<F>,
 }
 
+impl<T: FilterFactory<F> + fmt::Debug, F> fmt::Debug for FilterService<T, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilterService")
+            .field("filter_factory", &self.filter)
+            .finish()
+    }
+}
+
 impl<T, F> Service<Io<F>> for FilterService<T, F>
 where
     T: FilterFactory<F> + Clone,
@@ -75,7 +90,7 @@ where
     type Future<'f> = T::Future where T: 'f, F: 'f;
 
     #[inline]
-    fn call(&self, req: Io<F>) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         self.filter.clone().create(req)
     }
 }
@@ -106,7 +121,7 @@ mod tests {
                 .unwrap();
             Ok::<_, ()>(())
         }))
-        .create(())
+        .pipeline(())
         .await
         .unwrap();
         let _ = svc.call(Io::new(server)).await;
@@ -115,6 +130,7 @@ mod tests {
         assert_eq!(buf, b"RES".as_ref());
     }
 
+    #[derive(Debug)]
     pub(crate) struct TestFilter;
 
     impl FilterLayer for TestFilter {
@@ -143,7 +159,7 @@ mod tests {
     #[ntex::test]
     async fn test_utils_filter() {
         let (_, server) = IoTest::create();
-        let svc = pipeline_factory(
+        let svc = chain_factory(
             filter::<_, crate::filter::Base>(TestFilterFactory)
                 .map_err(|_| ())
                 .map_init_err(|_| ()),
@@ -152,7 +168,7 @@ mod tests {
             let _ = io.recv(&BytesCodec).await;
             Ok::<_, ()>(())
         })))
-        .create(())
+        .pipeline(())
         .await
         .unwrap();
         let _ = svc.call(Io::new(server)).await;

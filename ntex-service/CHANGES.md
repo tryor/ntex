@@ -1,5 +1,63 @@
 # Changes
 
+## [1.2.6] - 2023-09-11
+
+* Add fmt::Debug impls
+
+## [1.2.5] - 2023-08-14
+
+* Use Pipeline<T> instead of ApplyService<T>
+
+## [1.2.4] - 2023-08-12
+
+* Forward readiness check for Apply service
+
+* Add .apply_fn() for chain and chanin factory
+
+## [1.2.3] - 2023-08-10
+
+* Check readiness for pipeline calls
+
+## [1.2.2] - 2023-06-24
+
+* Added `ServiceCall::advance_to_call`
+
+## [1.2.1] - 2023-06-23
+
+* Make `PipelineCall` static
+
+## [1.2.0] - 2023-06-22
+
+* Rename Container to Pipeline
+
+* Link apply_fn service readiness with parent
+
+## [1.2.0-beta.3] - 2023-06-21
+
+* Add custom ContainerCall future
+
+* Allow to turn ContainerCall to static
+
+## [1.2.0-beta.2] - 2023-06-19
+
+* Remove Deref for Container<T>
+
+## [1.2.0-beta.1] - 2023-06-19
+
+* Rename Ctx to ServiceCtx
+
+## [1.2.0-beta.0] - 2023-06-16
+
+* Enforce service readiness during call
+
+* Introduce service sharable readiness
+
+* Remove boxed rc service
+
+## [1.0.2] - 2023-04-14
+
+* Remove Rc<S> where S: Service as it brakes readiness check validity
+
 ## [1.0.1] - 2023-01-24
 
 * Add `FnShutdown` service to provide on_shutdown callback

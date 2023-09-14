@@ -47,7 +47,7 @@ use crate::time::Millis;
 
 use self::connect::{Connect as HttpConnect, ConnectorWrapper};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Connect {
     pub uri: Uri,
     pub addr: Option<std::net::SocketAddr>,
@@ -70,10 +70,11 @@ pub struct Connect {
 ///      println!("Response: {:?}", res);
 /// }
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Client(Rc<ClientConfig>);
 
-pub(self) struct ClientConfig {
+#[derive(Debug)]
+struct ClientConfig {
     pub(self) connector: Box<dyn HttpConnect>,
     pub(self) headers: HeaderMap,
     pub(self) timeout: Millis,
@@ -82,7 +83,7 @@ pub(self) struct ClientConfig {
 impl Default for Client {
     fn default() -> Self {
         Client(Rc::new(ClientConfig {
-            connector: Box::new(ConnectorWrapper(Connector::default().finish())),
+            connector: Box::new(ConnectorWrapper(Connector::default().finish().into())),
             headers: HeaderMap::new(),
             timeout: Millis(5_000),
         }))

@@ -2,7 +2,7 @@ use std::task::{Context, Poll};
 use std::{cell, error, fmt, future, marker, pin::Pin, rc::Rc};
 
 use crate::io::{types, Filter, Io};
-use crate::service::{IntoServiceFactory, Service, ServiceFactory};
+use crate::service::{IntoServiceFactory, Service, ServiceCtx, ServiceFactory};
 use crate::time::{Millis, Seconds};
 use crate::util::BoxFuture;
 
@@ -146,7 +146,7 @@ mod openssl {
     use tls_openssl::ssl::SslAcceptor;
 
     use super::*;
-    use crate::{io::Layer, server::SslError, service::pipeline_factory};
+    use crate::{io::Layer, server::SslError};
 
     impl<F, S, B, X, U> HttpService<Layer<SslFilter, F>, S, B, X, U>
     where
@@ -174,13 +174,12 @@ mod openssl {
             Error = SslError<DispatchError>,
             InitError = (),
         > {
-            pipeline_factory(
-                Acceptor::new(acceptor)
-                    .timeout(self.cfg.0.ssl_handshake_timeout)
-                    .map_err(SslError::Ssl)
-                    .map_init_err(|_| panic!()),
-            )
-            .and_then(self.map_err(SslError::Service))
+            Acceptor::new(acceptor)
+                .timeout(self.cfg.0.ssl_handshake_timeout)
+                .chain()
+                .map_err(SslError::Ssl)
+                .map_init_err(|_| panic!())
+                .and_then(self.chain().map_err(SslError::Service))
         }
     }
 }
@@ -191,7 +190,7 @@ mod rustls {
     use tls_rustls::ServerConfig;
 
     use super::*;
-    use crate::{io::Layer, server::SslError, service::pipeline_factory};
+    use crate::{io::Layer, server::SslError};
 
     impl<F, S, B, X, U> HttpService<Layer<TlsFilter, F>, S, B, X, U>
     where
@@ -222,13 +221,12 @@ mod rustls {
             let protos = vec!["h2".to_string().into(), "http/1.1".to_string().into()];
             config.alpn_protocols = protos;
 
-            pipeline_factory(
-                Acceptor::from(config)
-                    .timeout(self.cfg.0.ssl_handshake_timeout)
-                    .map_err(|e| SslError::Ssl(Box::new(e)))
-                    .map_init_err(|_| panic!()),
-            )
-            .and_then(self.map_err(SslError::Service))
+            Acceptor::from(config)
+                .timeout(self.cfg.0.ssl_handshake_timeout)
+                .chain()
+                .map_err(|e| SslError::Ssl(Box::new(e)))
+                .map_init_err(|_| panic!())
+                .and_then(self.chain().map_err(SslError::Service))
         }
     }
 }
@@ -279,11 +277,9 @@ where
                 None
             };
 
-            let h2config = cfg.0.h2config.clone();
             let config = DispatcherConfig::new(cfg, service, expect, upgrade, on_request);
 
             Ok(HttpServiceHandler {
-                h2config,
                 config: Rc::new(config),
                 _t: marker::PhantomData,
             })
@@ -294,7 +290,6 @@ where
 /// `Service` implementation for http transport
 pub struct HttpServiceHandler<F, S, B, X, U> {
     config: Rc<DispatcherConfig<S, X, U>>,
-    h2config: ntex_h2::Config,
     _t: marker::PhantomData<(F, B)>,
 }
 
@@ -371,7 +366,7 @@ where
         }
     }
 
-    fn call(&self, io: Io<F>) -> Self::Future<'_> {
+    fn call<'a>(&'a self, io: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         log::trace!(
             "New http connection, peer address {:?}",
             io.query::<types::PeerAddr>().get()
@@ -380,11 +375,7 @@ where
         if io.query::<types::HttpProtocol>().get() == Some(types::HttpProtocol::Http2) {
             HttpServiceHandlerResponse {
                 state: ResponseState::H2 {
-                    fut: Box::pin(h2::handle(
-                        io.into(),
-                        self.config.clone(),
-                        self.h2config.clone(),
-                    )),
+                    fut: Box::pin(h2::handle(io.into(), self.config.clone())),
                 },
             }
         } else {

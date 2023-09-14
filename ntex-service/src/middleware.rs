@@ -1,4 +1,4 @@
-use std::{future::Future, marker, pin::Pin, rc::Rc, task::Context, task::Poll};
+use std::{fmt, future::Future, marker, pin::Pin, rc::Rc, task::Context, task::Poll};
 
 use crate::{IntoServiceFactory, Service, ServiceFactory};
 
@@ -113,6 +113,19 @@ impl<T, S, C> Clone for ApplyMiddleware<T, S, C> {
     }
 }
 
+impl<T, S, C> fmt::Debug for ApplyMiddleware<T, S, C>
+where
+    T: fmt::Debug,
+    S: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplyMiddleware")
+            .field("service", &self.0 .1)
+            .field("middleware", &self.0 .0)
+            .finish()
+    }
+}
+
 impl<T, S, R, C> ServiceFactory<R, C> for ApplyMiddleware<T, S, C>
 where
     S: ServiceFactory<R, C>,
@@ -136,6 +149,7 @@ where
 }
 
 pin_project_lite::pin_project! {
+    #[must_use = "futures do nothing unless polled"]
     pub struct ApplyMiddlewareFuture<'f, T, S, R, C>
     where
         S: ServiceFactory<R, C>,
@@ -213,9 +227,9 @@ mod tests {
     use std::marker;
 
     use super::*;
-    use crate::{fn_service, Service, ServiceFactory};
+    use crate::{fn_service, Pipeline, Service, ServiceCall, ServiceCtx, ServiceFactory};
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     struct Tr<R>(marker::PhantomData<R>);
 
     impl<S, R> Middleware<S> for Tr<R> {
@@ -226,20 +240,20 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     struct Srv<S, R>(S, marker::PhantomData<R>);
 
     impl<S: Service<R>, R> Service<R> for Srv<S, R> {
         type Response = S::Response;
         type Error = S::Error;
-        type Future<'f> = S::Future<'f> where Self: 'f, R: 'f;
+        type Future<'f> = ServiceCall<'f, S, R> where Self: 'f, R: 'f;
 
         fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.0.poll_ready(cx)
         }
 
-        fn call(&self, req: R) -> Self::Future<'_> {
-            self.0.call(req)
+        fn call<'a>(&'a self, req: R, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
+            ctx.call(&self.0, req)
         }
     }
 
@@ -251,10 +265,11 @@ mod tests {
         )
         .clone();
 
-        let srv = factory.create(&()).await.unwrap().clone();
+        let srv = Pipeline::new(factory.create(&()).await.unwrap().clone());
         let res = srv.call(10).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 20);
+        format!("{:?} {:?}", factory, srv);
 
         let res = lazy(|cx| srv.poll_ready(cx)).await;
         assert_eq!(res, Poll::Ready(Ok(())));
@@ -263,14 +278,15 @@ mod tests {
         assert_eq!(res, Poll::Ready(()));
 
         let factory =
-            crate::pipeline_factory(fn_service(|i: usize| Ready::<_, ()>::Ok(i * 2)))
+            crate::chain_factory(fn_service(|i: usize| Ready::<_, ()>::Ok(i * 2)))
                 .apply(Rc::new(Tr(marker::PhantomData).clone()))
                 .clone();
 
-        let srv = factory.create(&()).await.unwrap().clone();
+        let srv = Pipeline::new(factory.create(&()).await.unwrap().clone());
         let res = srv.call(10).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 20);
+        format!("{:?} {:?}", factory, srv);
 
         let res = lazy(|cx| srv.poll_ready(cx)).await;
         assert_eq!(res, Poll::Ready(Ok(())));

@@ -1,6 +1,6 @@
-use std::{future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
+use std::{fmt, future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
 
-use super::{Service, ServiceFactory};
+use super::{Service, ServiceCall, ServiceCtx, ServiceFactory};
 
 /// Service for the `map` combinator, changing the type of a service's response.
 ///
@@ -41,6 +41,18 @@ where
     }
 }
 
+impl<A, F, Req, Res> fmt::Debug for Map<A, F, Req, Res>
+where
+    A: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Map")
+            .field("service", &self.service)
+            .field("map", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<A, F, Req, Res> Service<Req> for Map<A, F, Req, Res>
 where
     A: Service<Req>,
@@ -54,15 +66,16 @@ where
     crate::forward_poll_shutdown!(service);
 
     #[inline]
-    fn call(&self, req: Req) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Req, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
         MapFuture {
-            fut: self.service.call(req),
+            fut: ctx.call(&self.service, req),
             slf: self,
         }
     }
 }
 
 pin_project_lite::pin_project! {
+    #[must_use = "futures do nothing unless polled"]
     pub struct MapFuture<'f, A, F, Req, Res>
     where
         A: Service<Req>,
@@ -72,7 +85,7 @@ pin_project_lite::pin_project! {
     {
         slf: &'f Map<A, F, Req, Res>,
         #[pin]
-        fut: A::Future<'f>,
+        fut: ServiceCall<'f, A, Req>,
     }
 }
 
@@ -132,6 +145,18 @@ where
     }
 }
 
+impl<A, F, Req, Res, Cfg> fmt::Debug for MapFactory<A, F, Req, Res, Cfg>
+where
+    A: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MapFactory")
+            .field("factory", &self.a)
+            .field("map", &std::any::type_name::<F>())
+            .finish()
+    }
+}
+
 impl<A, F, Req, Res, Cfg> ServiceFactory<Req, Cfg> for MapFactory<A, F, Req, Res, Cfg>
 where
     A: ServiceFactory<Req, Cfg>,
@@ -154,6 +179,7 @@ where
 }
 
 pin_project_lite::pin_project! {
+    #[must_use = "futures do nothing unless polled"]
     pub struct MapFactoryFuture<'f, A, F, Req, Res, Cfg>
     where
         A: ServiceFactory<Req, Cfg>,
@@ -190,9 +216,9 @@ mod tests {
     use ntex_util::future::{lazy, Ready};
 
     use super::*;
-    use crate::{fn_factory, Service, ServiceFactory};
+    use crate::{fn_factory, Pipeline, Service, ServiceCtx, ServiceFactory};
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     struct Srv;
 
     impl Service<()> for Srv {
@@ -204,14 +230,14 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&self, _: ()) -> Self::Future<'_> {
+        fn call<'a>(&'a self, _: (), _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
             Ready::Ok(())
         }
     }
 
     #[ntex::test]
     async fn test_service() {
-        let srv = Srv.map(|_| "ok").clone();
+        let srv = Pipeline::new(Srv.map(|_| "ok").clone());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "ok");
@@ -221,11 +247,13 @@ mod tests {
 
         let res = lazy(|cx| srv.poll_shutdown(cx)).await;
         assert_eq!(res, Poll::Ready(()));
+
+        format!("{:?}", srv);
     }
 
     #[ntex::test]
     async fn test_pipeline() {
-        let srv = crate::pipeline(Srv).map(|_| "ok").clone();
+        let srv = Pipeline::new(crate::chain(Srv).map(|_| "ok").clone());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "ok");
@@ -242,20 +270,24 @@ mod tests {
         let new_srv = fn_factory(|| async { Ok::<_, ()>(Srv) })
             .map(|_| "ok")
             .clone();
-        let srv = new_srv.create(&()).await.unwrap();
+        let srv = Pipeline::new(new_srv.create(&()).await.unwrap());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("ok"));
+
+        format!("{:?}", new_srv);
     }
 
     #[ntex::test]
     async fn test_pipeline_factory() {
-        let new_srv = crate::pipeline_factory(fn_factory(|| async { Ok::<_, ()>(Srv) }))
+        let new_srv = crate::chain_factory(fn_factory(|| async { Ok::<_, ()>(Srv) }))
             .map(|_| "ok")
             .clone();
-        let srv = new_srv.create(&()).await.unwrap();
+        let srv = Pipeline::new(new_srv.create(&()).await.unwrap());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("ok"));
+
+        format!("{:?}", new_srv);
     }
 }

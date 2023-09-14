@@ -1,87 +1,75 @@
-//! Service that limits number of in-flight async requests.
-use std::{future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
+//! Service that limits number of in-flight async requests to 1.
+use std::{cell::Cell, future::Future, pin::Pin, task::Context, task::Poll};
 
 use ntex_service::{IntoService, Middleware, Service, ServiceCall, ServiceCtx};
 
-use super::counter::{Counter, CounterGuard};
+use crate::task::LocalWaker;
 
-/// InFlight - service factory for service that can limit number of in-flight
-/// async requests.
-///
-/// Default number of in-flight requests is 15
-#[derive(Copy, Clone, Debug)]
-pub struct InFlight {
-    max_inflight: usize,
-}
+/// OneRequest - service factory for service that can limit number of in-flight
+/// async requests to 1.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct OneRequest;
 
-impl InFlight {
-    pub fn new(max: usize) -> Self {
-        Self { max_inflight: max }
-    }
-}
-
-impl Default for InFlight {
-    fn default() -> Self {
-        Self::new(15)
-    }
-}
-
-impl<S> Middleware<S> for InFlight {
-    type Service = InFlightService<S>;
+impl<S> Middleware<S> for OneRequest {
+    type Service = OneRequestService<S>;
 
     fn create(&self, service: S) -> Self::Service {
-        InFlightService {
+        OneRequestService {
             service,
-            count: Counter::new(self.max_inflight),
+            ready: Cell::new(true),
+            waker: LocalWaker::new(),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct InFlightService<S> {
-    count: Counter,
+#[derive(Clone, Debug)]
+pub struct OneRequestService<S> {
+    waker: LocalWaker,
     service: S,
+    ready: Cell<bool>,
 }
 
-impl<S> InFlightService<S> {
-    pub fn new<U, R>(max: usize, service: U) -> Self
+impl<S> OneRequestService<S> {
+    pub fn new<U, R>(service: U) -> Self
     where
         S: Service<R>,
         U: IntoService<S, R>,
     {
         Self {
-            count: Counter::new(max),
             service: service.into_service(),
+            ready: Cell::new(true),
+            waker: LocalWaker::new(),
         }
     }
 }
 
-impl<T, R> Service<R> for InFlightService<T>
+impl<T, R> Service<R> for OneRequestService<T>
 where
     T: Service<R>,
 {
     type Response = T::Response;
     type Error = T::Error;
-    type Future<'f> = InFlightServiceResponse<'f, T, R> where Self: 'f, R: 'f;
+    type Future<'f> = OneRequestServiceResponse<'f, T, R> where Self: 'f, R: 'f;
 
     #[inline]
     fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.waker.register(cx.waker());
         if self.service.poll_ready(cx)?.is_pending() {
             Poll::Pending
-        } else if !self.count.available(cx) {
-            log::trace!("InFlight limit exceeded");
-            Poll::Pending
-        } else {
+        } else if self.ready.get() {
             Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
         }
     }
 
     #[inline]
     fn call<'a>(&'a self, req: R, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-        InFlightServiceResponse {
+        self.ready.set(false);
+
+        OneRequestServiceResponse {
             fut: ctx.call(&self.service, req),
-            _guard: self.count.get(),
-            _t: PhantomData,
+            service: self,
         }
     }
 
@@ -90,21 +78,25 @@ where
 
 pin_project_lite::pin_project! {
     #[doc(hidden)]
-    pub struct InFlightServiceResponse<'f, T: Service<R>, R>
+    pub struct OneRequestServiceResponse<'f, T: Service<R>, R>
     where T: 'f, R: 'f
     {
         #[pin]
         fut: ServiceCall<'f, T, R>,
-        _guard: CounterGuard,
-        _t: PhantomData<R>
+        service: &'f OneRequestService<T>,
     }
 }
 
-impl<'f, T: Service<R>, R> Future for InFlightServiceResponse<'f, T, R> {
+impl<'f, T: Service<R>, R> Future for OneRequestServiceResponse<'f, T, R> {
     type Output = Result<T::Response, T::Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.project().fut.poll(cx)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = self.as_mut().project().fut.poll(cx);
+        if result.is_ready() {
+            self.service.ready.set(true);
+            self.service.waker.wake();
+        }
+        result
     }
 }
 
@@ -132,10 +124,10 @@ mod tests {
     }
 
     #[ntex_macros::rt_test2]
-    async fn test_service() {
+    async fn test_oneshot() {
         let (tx, rx) = oneshot::channel();
 
-        let srv = Pipeline::new(InFlightService::new(1, SleepService(rx)));
+        let srv = Pipeline::new(OneRequestService::new(SleepService(rx)));
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
 
         let srv2 = srv.clone();
@@ -153,16 +145,12 @@ mod tests {
 
     #[ntex_macros::rt_test2]
     async fn test_middleware() {
-        assert_eq!(InFlight::default().max_inflight, 15);
-        assert_eq!(
-            format!("{:?}", InFlight::new(1)),
-            "InFlight { max_inflight: 1 }"
-        );
+        assert_eq!(format!("{:?}", OneRequest), "OneRequest");
 
         let (tx, rx) = oneshot::channel();
         let rx = RefCell::new(Some(rx));
         let srv = apply(
-            InFlight::new(1),
+            OneRequest,
             fn_factory(move || {
                 let rx = rx.borrow_mut().take().unwrap();
                 async move { Ok::<_, ()>(SleepService(rx)) }

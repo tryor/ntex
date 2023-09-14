@@ -9,7 +9,7 @@
 #![warn(
     rust_2018_idioms,
     unreachable_pub,
-    // missing_debug_implementations,
+    missing_debug_implementations,
     // missing_docs,
 )]
 #![allow(
@@ -38,12 +38,11 @@ pub mod web;
 pub mod ws;
 
 pub use self::service::{
-    fn_service, into_service, pipeline, pipeline_factory, IntoService, IntoServiceFactory,
-    Middleware, Service, ServiceFactory,
+    chain, chain_factory, fn_service, into_service, IntoService, IntoServiceFactory,
+    Middleware, Pipeline, Service, ServiceCall, ServiceCtx, ServiceFactory,
 };
 
-pub use ntex_util::channel;
-pub use ntex_util::task;
+pub use ntex_util::{channel, task};
 
 pub mod codec {
     //! Utilities for encoding and decoding frames.

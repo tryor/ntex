@@ -1,5 +1,33 @@
 # Changes
 
+## [0.3.3] - 2023-09-11
+
+* Add missing fmt::Debug impls
+
+## [0.3.2] - 2023-08-10
+
+* Replace `PipelineCall` with `ServiceCall<'static, S, R>`
+
+## [0.3.1] - 2023-06-23
+
+* `PipelineCall` is static
+
+## [0.3.0] - 2023-06-22
+
+* Release v0.3.0
+
+## [0.3.0-beta.3] - 2023-06-21
+
+* Use static ContainerCall for dispatcher
+
+## [0.3.0-beta.0] - 2023-06-16
+
+* Migrate to ntex-service 1.2
+
+## [0.2.10] - 2023-05-10
+
+* ReadBuf::set_dst()/WriteBuf::set_dst() extend existing buffer if exists
+
 ## [0.2.9] - 2023-01-31
 
 * Register Dispatcher waker when service is not ready

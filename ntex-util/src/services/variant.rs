@@ -1,7 +1,7 @@
 //! Contains `Variant` service and related types and functions.
-use std::{future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
+use std::{fmt, future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
 
-use ntex_service::{IntoServiceFactory, Service, ServiceFactory};
+use ntex_service::{IntoServiceFactory, Service, ServiceCall, ServiceCtx, ServiceFactory};
 
 /// Construct `Variant` service factory.
 ///
@@ -46,6 +46,17 @@ where
     }
 }
 
+impl<A, AR, AC> fmt::Debug for Variant<A, AR, AC>
+where
+    A: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Variant")
+            .field("V1", &self.factory)
+            .finish()
+    }
+}
+
 macro_rules! variant_impl_and ({$fac1_type:ident, $fac2_type:ident, $name:ident, $r_name:ident, $m_name:ident, ($($T:ident),+), ($($R:ident),+)} => {
 
     #[allow(non_snake_case)]
@@ -73,7 +84,7 @@ macro_rules! variant_impl_and ({$fac1_type:ident, $fac2_type:ident, $name:ident,
 
 macro_rules! variant_impl ({$mod_name:ident, $enum_type:ident, $srv_type:ident, $fac_type:ident, $(($n:tt, $T:ident, $R:ident)),+} => {
 
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, missing_debug_implementations)]
     pub enum $enum_type<V1R, $($R),+> {
         V1(V1R),
         $($T($R),)+
@@ -96,6 +107,15 @@ macro_rules! variant_impl ({$mod_name:ident, $enum_type:ident, $srv_type:ident, 
         }
     }
 
+    impl<V1: fmt::Debug, $($T: fmt::Debug,)+ V1R, $($R,)+> fmt::Debug for $srv_type<V1, $($T,)+ V1R, $($R,)+> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct(stringify!($srv_type))
+                .field("V1", &self.V1)
+                $(.field(stringify!($T), &self.$T))+
+                .finish()
+        }
+    }
+
     impl<V1, $($T,)+ V1R, $($R,)+> Service<$enum_type<V1R, $($R,)+>> for $srv_type<V1, $($T,)+ V1R, $($R,)+>
     where
         V1: Service<V1R>,
@@ -103,7 +123,8 @@ macro_rules! variant_impl ({$mod_name:ident, $enum_type:ident, $srv_type:ident, 
     {
         type Response = V1::Response;
         type Error = V1::Error;
-        type Future<'f> = $mod_name::ServiceResponse<V1::Future<'f>, $($T::Future<'f>),+> where Self: 'f, V1: 'f;
+        type Future<'f> = $mod_name::ServiceResponse<
+            ServiceCall<'f, V1, V1R>, $(ServiceCall<'f, $T, $R>),+> where Self: 'f, V1: 'f;
 
         fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             let mut ready = self.V1.poll_ready(cx)?.is_ready();
@@ -127,10 +148,11 @@ macro_rules! variant_impl ({$mod_name:ident, $enum_type:ident, $srv_type:ident, 
             }
         }
 
-        fn call(&self, req: $enum_type<V1R, $($R,)+>) -> Self::Future<'_> {
+        fn call<'a>(&'a self, req: $enum_type<V1R, $($R,)+>, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a>
+        {
             match req {
-                $enum_type::V1(req) => $mod_name::ServiceResponse::V1 { fut: self.V1.call(req) },
-                $($enum_type::$T(req) => $mod_name::ServiceResponse::$T { fut: self.$T.call(req) },)+
+                $enum_type::V1(req) => $mod_name::ServiceResponse::V1 { fut: ctx.call(&self.V1, req) },
+                $($enum_type::$T(req) => $mod_name::ServiceResponse::$T { fut: ctx.call(&self.$T, req) },)+
             }
         }
     }
@@ -149,6 +171,15 @@ macro_rules! variant_impl ({$mod_name:ident, $enum_type:ident, $srv_type:ident, 
                 V1: self.V1.clone(),
                 $($T: self.$T.clone(),)+
             }
+        }
+    }
+
+    impl<V1: fmt::Debug, V1C, $($T: fmt::Debug,)+ V1R, $($R,)+> fmt::Debug for $fac_type<V1, V1C, $($T,)+ V1R, $($R,)+> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct(stringify!(fac_type))
+                .field("V1", &self.V1)
+                $(.field(stringify!($T), &self.$T))+
+                .finish()
         }
     }
 
@@ -319,7 +350,7 @@ mod tests {
             Poll::Ready(())
         }
 
-        fn call(&self, _: ()) -> Self::Future<'_> {
+        fn call<'a>(&'a self, _: (), _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
             Ready::<_, ()>::Ok(1)
         }
     }
@@ -340,7 +371,7 @@ mod tests {
             Poll::Ready(())
         }
 
-        fn call(&self, _: ()) -> Self::Future<'_> {
+        fn call<'a>(&'a self, _: (), _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
             Ready::<_, ()>::Ok(2)
         }
     }
@@ -352,7 +383,7 @@ mod tests {
             .clone()
             .v3(fn_factory(|| async { Ok::<_, ()>(Srv2) }))
             .clone();
-        let service = factory.create(&()).await.unwrap().clone();
+        let service = factory.pipeline(&()).await.unwrap().clone();
 
         assert!(lazy(|cx| service.poll_ready(cx)).await.is_ready());
         assert!(lazy(|cx| service.poll_shutdown(cx)).await.is_ready());

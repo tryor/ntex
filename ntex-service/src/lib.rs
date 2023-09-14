@@ -1,7 +1,10 @@
 //! See [`Service`] docs for information on this crate's foundational trait.
-
-#![deny(rust_2018_idioms, warnings)]
-#![allow(clippy::type_complexity)]
+#![deny(
+    rust_2018_idioms,
+    warnings,
+    unreachable_pub,
+    missing_debug_implementations
+)]
 
 use std::future::Future;
 use std::rc::Rc;
@@ -10,6 +13,8 @@ use std::task::{self, Context, Poll};
 mod and_then;
 mod apply;
 pub mod boxed;
+mod chain;
+mod ctx;
 mod fn_service;
 mod fn_shutdown;
 mod macros;
@@ -22,11 +27,13 @@ mod pipeline;
 mod then;
 
 pub use self::apply::{apply_fn, apply_fn_factory};
+pub use self::chain::{chain, chain_factory};
+pub use self::ctx::{ServiceCall, ServiceCallToCall, ServiceCtx};
 pub use self::fn_service::{fn_factory, fn_factory_with_config, fn_service};
 pub use self::fn_shutdown::fn_shutdown;
 pub use self::map_config::{map_config, unit_config};
 pub use self::middleware::{apply, Identity, Middleware, Stack};
-pub use self::pipeline::{pipeline, pipeline_factory, Pipeline, PipelineFactory};
+pub use self::pipeline::{Pipeline, PipelineCall};
 
 #[allow(unused_variables)]
 /// An asynchronous function of `Request` to a `Response`.
@@ -57,9 +64,8 @@ pub use self::pipeline::{pipeline, pipeline_factory, Pipeline, PipelineFactory};
 /// # use std::convert::Infallible;
 /// # use std::future::Future;
 /// # use std::pin::Pin;
-/// # use std::task::{Context, Poll};
 /// #
-/// # use ntex_service::Service;
+/// # use ntex_service::{Service, ServiceCtx};
 ///
 /// struct MyService;
 ///
@@ -68,7 +74,7 @@ pub use self::pipeline::{pipeline, pipeline_factory, Pipeline, PipelineFactory};
 ///     type Error = Infallible;
 ///     type Future<'f> = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 ///
-///     fn call(&self, req: u8) -> Self::Future<'_> {
+///     fn call<'a>(&'a self, req: u8, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
 ///         Box::pin(std::future::ready(Ok(req as u64)))
 ///     }
 /// }
@@ -80,6 +86,10 @@ pub use self::pipeline::{pipeline, pipeline_factory, Pipeline, PipelineFactory};
 /// ```rust,ignore
 /// async fn my_service(req: u8) -> Result<u64, Infallible>;
 /// ```
+///
+/// Service cannot be called directly, it must be wrapped to an instance of [`Container`] or
+/// by using `ctx` argument of the call method in case of chanined services.
+///
 pub trait Service<Req> {
     /// Responses given by the service.
     type Response;
@@ -96,12 +106,10 @@ pub trait Service<Req> {
     /// Process the request and return the response asynchronously.
     ///
     /// This function is expected to be callable off-task. As such, implementations of `call`
-    /// should take care to not call `poll_ready`. If the  service is at capacity and the request
-    /// is unable to be handled, the returned `Future` should resolve to an error.
-    ///
-    /// Invoking `call` without first invoking `poll_ready` is permitted. Implementations must be
-    /// resilient to this fact.
-    fn call(&self, req: Req) -> Self::Future<'_>;
+    /// should take care to not call `poll_ready`. Caller of the service verifies readiness,
+    /// Only way to make a `call` is to use `ctx` argument, it enforces readiness before calling
+    /// service.
+    fn call<'a>(&'a self, req: Req, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a>;
 
     #[inline]
     /// Returns `Ready` when the service is able to process requests.
@@ -116,7 +124,8 @@ pub trait Service<Req> {
     /// # Notes
     ///
     /// 1. `.poll_ready()` might be called on different task from actual service call.
-    /// 1. In case of chained services, `.poll_ready()` is called for all services at once.
+    /// 2. In case of chained services, `.poll_ready()` is called for all services at once.
+    /// 3. Every `.call()` in chained services enforces readiness.
     fn poll_ready(&self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
@@ -138,12 +147,12 @@ pub trait Service<Req> {
     ///
     /// Note that this function consumes the receiving service and returns a wrapped version of it,
     /// similar to the existing `map` methods in the standard library.
-    fn map<F, Res>(self, f: F) -> crate::dev::Map<Self, F, Req, Res>
+    fn map<F, Res>(self, f: F) -> dev::ServiceChain<dev::Map<Self, F, Req, Res>, Req>
     where
         Self: Sized,
         F: Fn(Self::Response) -> Res,
     {
-        crate::dev::Map::new(self, f)
+        chain(dev::Map::new(self, f))
     }
 
     #[inline]
@@ -154,12 +163,21 @@ pub trait Service<Req> {
     /// error type.
     ///
     /// Note that this function consumes the receiving service and returns a wrapped version of it.
-    fn map_err<F, E>(self, f: F) -> crate::dev::MapErr<Self, Req, F, E>
+    fn map_err<F, E>(self, f: F) -> dev::ServiceChain<dev::MapErr<Self, F, E>, Req>
     where
         Self: Sized,
         F: Fn(Self::Error) -> E,
     {
-        crate::dev::MapErr::new(self, f)
+        chain(dev::MapErr::new(self, f))
+    }
+
+    #[inline]
+    /// Convert `Self` to a `ServiceChain`
+    fn chain(self) -> dev::ServiceChain<Self, Req>
+    where
+        Self: Sized,
+    {
+        chain(self)
     }
 }
 
@@ -196,25 +214,39 @@ pub trait ServiceFactory<Req, Cfg = ()> {
     /// Create and return a new service value asynchronously.
     fn create(&self, cfg: Cfg) -> Self::Future<'_>;
 
+    /// Create and return a new service value asynchronously and wrap into a container
+    fn pipeline(&self, cfg: Cfg) -> dev::CreatePipeline<'_, Self, Req, Cfg>
+    where
+        Self: Sized,
+    {
+        dev::CreatePipeline::new(self.create(cfg))
+    }
+
     #[inline]
     /// Map this service's output to a different type, returning a new service
     /// of the resulting type.
-    fn map<F, Res>(self, f: F) -> crate::map::MapFactory<Self, F, Req, Res, Cfg>
+    fn map<F, Res>(
+        self,
+        f: F,
+    ) -> dev::ServiceChainFactory<dev::MapFactory<Self, F, Req, Res, Cfg>, Req, Cfg>
     where
         Self: Sized,
         F: Fn(Self::Response) -> Res + Clone,
     {
-        crate::map::MapFactory::new(self, f)
+        chain_factory(dev::MapFactory::new(self, f))
     }
 
     #[inline]
     /// Map this service's error to a different error, returning a new service.
-    fn map_err<F, E>(self, f: F) -> crate::map_err::MapErrFactory<Self, Req, Cfg, F, E>
+    fn map_err<F, E>(
+        self,
+        f: F,
+    ) -> dev::ServiceChainFactory<dev::MapErrFactory<Self, Req, Cfg, F, E>, Req, Cfg>
     where
         Self: Sized,
         F: Fn(Self::Error) -> E + Clone,
     {
-        crate::map_err::MapErrFactory::new(self, f)
+        chain_factory(dev::MapErrFactory::new(self, f))
     }
 
     #[inline]
@@ -222,18 +254,18 @@ pub trait ServiceFactory<Req, Cfg = ()> {
     fn map_init_err<F, E>(
         self,
         f: F,
-    ) -> crate::map_init_err::MapInitErr<Self, Req, Cfg, F, E>
+    ) -> dev::ServiceChainFactory<dev::MapInitErr<Self, Req, Cfg, F, E>, Req, Cfg>
     where
         Self: Sized,
         F: Fn(Self::InitError) -> E + Clone,
     {
-        crate::map_init_err::MapInitErr::new(self, f)
+        chain_factory(dev::MapInitErr::new(self, f))
     }
 }
 
 impl<'a, S, Req> Service<Req> for &'a S
 where
-    S: Service<Req> + ?Sized,
+    S: Service<Req>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -250,14 +282,14 @@ where
     }
 
     #[inline]
-    fn call(&self, request: Req) -> S::Future<'_> {
-        (**self).call(request)
+    fn call<'s>(&'s self, request: Req, ctx: ServiceCtx<'s, Self>) -> S::Future<'s> {
+        ctx.call_nowait(&**self, request)
     }
 }
 
 impl<S, Req> Service<Req> for Box<S>
 where
-    S: Service<Req> + ?Sized,
+    S: Service<Req>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -274,30 +306,8 @@ where
     }
 
     #[inline]
-    fn call(&self, request: Req) -> S::Future<'_> {
-        (**self).call(request)
-    }
-}
-
-impl<S, Req> Service<Req> for Rc<S>
-where
-    S: Service<Req> + ?Sized,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future<'f> = S::Future<'f> where S: 'f, Req: 'f;
-
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        (**self).poll_ready(cx)
-    }
-
-    #[inline]
-    fn poll_shutdown(&self, cx: &mut Context<'_>) -> Poll<()> {
-        (**self).poll_shutdown(cx)
-    }
-
-    fn call(&self, request: Req) -> S::Future<'_> {
-        (**self).call(request)
+    fn call<'a>(&'a self, request: Req, ctx: ServiceCtx<'a, Self>) -> S::Future<'a> {
+        ctx.call_nowait(&**self, request)
     }
 }
 
@@ -323,6 +333,15 @@ where
 {
     /// Convert to a `Service`
     fn into_service(self) -> Svc;
+
+    #[inline]
+    /// Convert `Self` to a `ServiceChain`
+    fn into_chain(self) -> dev::ServiceChain<Svc, Req>
+    where
+        Self: Sized,
+    {
+        chain(self)
+    }
 }
 
 /// Trait for types that can be converted to a `ServiceFactory`
@@ -332,12 +351,22 @@ where
 {
     /// Convert `Self` to a `ServiceFactory`
     fn into_factory(self) -> T;
+
+    #[inline]
+    /// Convert `Self` to a `ServiceChainFactory`
+    fn chain(self) -> dev::ServiceChainFactory<T, Req, Cfg>
+    where
+        Self: Sized,
+    {
+        chain_factory(self)
+    }
 }
 
 impl<Svc, Req> IntoService<Svc, Req> for Svc
 where
     Svc: Service<Req>,
 {
+    #[inline]
     fn into_service(self) -> Svc {
         self
     }
@@ -347,6 +376,7 @@ impl<T, Req, Cfg> IntoServiceFactory<T, Req, Cfg> for T
 where
     T: ServiceFactory<Req, Cfg>,
 {
+    #[inline]
     fn into_factory(self) -> T {
         self
     }
@@ -364,6 +394,7 @@ where
 pub mod dev {
     pub use crate::and_then::{AndThen, AndThenFactory};
     pub use crate::apply::{Apply, ApplyFactory};
+    pub use crate::chain::{ServiceChain, ServiceChainFactory};
     pub use crate::fn_service::{
         FnService, FnServiceConfig, FnServiceFactory, FnServiceNoConfig,
     };
@@ -373,5 +404,9 @@ pub mod dev {
     pub use crate::map_err::{MapErr, MapErrFactory};
     pub use crate::map_init_err::MapInitErr;
     pub use crate::middleware::ApplyMiddleware;
+    pub use crate::pipeline::CreatePipeline;
     pub use crate::then::{Then, ThenFactory};
+
+    #[doc(hidden)]
+    pub type ApplyService<T> = crate::Pipeline<T>;
 }

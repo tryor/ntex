@@ -1,8 +1,9 @@
 use std::io;
 
-use crate::http::request::Request;
-use crate::{service::Service, service::ServiceFactory, util::Ready};
+use crate::service::{Service, ServiceCtx, ServiceFactory};
+use crate::{http::request::Request, util::Ready};
 
+#[derive(Copy, Clone, Debug)]
 pub struct ExpectHandler;
 
 impl ServiceFactory<Request> for ExpectHandler {
@@ -24,7 +25,7 @@ impl Service<Request> for ExpectHandler {
     type Future<'f> = Ready<Self::Response, Self::Error>;
 
     #[inline]
-    fn call(&self, req: Request) -> Self::Future<'_> {
+    fn call<'a>(&'a self, req: Request, _: ServiceCtx<'a, Self>) -> Self::Future<'_> {
         Ready::Ok(req)
     }
 }

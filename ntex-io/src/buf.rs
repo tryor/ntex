@@ -1,12 +1,29 @@
-use std::cell::Cell;
+use std::{cell::Cell, fmt};
 
 use ntex_bytes::{BytesVec, PoolRef};
 use ntex_util::future::Either;
 
 use crate::IoRef;
 
-type Buffer = (Cell<Option<BytesVec>>, Cell<Option<BytesVec>>);
+#[derive(Default)]
+pub(crate) struct Buffer(Cell<Option<BytesVec>>, Cell<Option<BytesVec>>);
 
+impl fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let b0 = self.0.take();
+        let b1 = self.1.take();
+        let res = f
+            .debug_struct("Buffer")
+            .field("0", &b0)
+            .field("1", &b1)
+            .finish();
+        self.0.set(b0);
+        self.1.set(b1);
+        res
+    }
+}
+
+#[derive(Debug)]
 pub struct Stack {
     len: usize,
     buffers: Either<[Buffer; 3], Vec<Buffer>>,
@@ -25,29 +42,32 @@ impl Stack {
             Either::Left(b) => {
                 // move to vec
                 if self.len == 3 {
-                    let mut vec = vec![(Cell::new(None), Cell::new(None))];
+                    let mut vec = vec![Buffer(Cell::new(None), Cell::new(None))];
                     for item in b.iter_mut().take(self.len) {
-                        vec.push((Cell::new(item.0.take()), Cell::new(item.1.take())));
+                        vec.push(Buffer(
+                            Cell::new(item.0.take()),
+                            Cell::new(item.1.take()),
+                        ));
                     }
                     self.len += 1;
                     self.buffers = Either::Right(vec);
                 } else {
                     let mut idx = self.len;
                     while idx > 0 {
-                        let item = (
+                        let item = Buffer(
                             Cell::new(b[idx - 1].0.take()),
                             Cell::new(b[idx - 1].1.take()),
                         );
                         b[idx] = item;
                         idx -= 1;
                     }
-                    b[0] = (Cell::new(None), Cell::new(None));
+                    b[0] = Buffer(Cell::new(None), Cell::new(None));
                     self.len += 1;
                 }
             }
             Either::Right(vec) => {
                 self.len += 1;
-                vec.insert(0, (Cell::new(None), Cell::new(None)));
+                vec.insert(0, Buffer(Cell::new(None), Cell::new(None)));
             }
         }
     }
@@ -65,8 +85,8 @@ impl Stack {
         if self.len > next {
             f(&buffers[idx], &buffers[next])
         } else {
-            let curr = (Cell::new(buffers[idx].0.take()), Cell::new(None));
-            let next = (Cell::new(None), Cell::new(buffers[idx].1.take()));
+            let curr = Buffer(Cell::new(buffers[idx].0.take()), Cell::new(None));
+            let next = Buffer(Cell::new(None), Cell::new(buffers[idx].1.take()));
 
             let result = f(&curr, &next);
             buffers[idx].0.set(curr.0.take());
@@ -265,7 +285,7 @@ impl Stack {
     }
 }
 
-// #[derive(Debug)]
+#[derive(Debug)]
 pub struct ReadBuf<'a> {
     pub(crate) io: &'a IoRef,
     pub(crate) curr: &'a Buffer,
@@ -349,11 +369,12 @@ impl<'a> ReadBuf<'a> {
     #[inline]
     /// Set source read buffer
     pub fn set_src(&self, src: Option<BytesVec>) {
-        if let Some(buf) = self.next.0.take() {
-            self.io.memory_pool().release_read_buf(buf);
-        }
         if let Some(src) = src {
             if src.is_empty() {
+                self.io.memory_pool().release_read_buf(src);
+            } else if let Some(mut buf) = self.next.0.take() {
+                buf.extend_from_slice(&src);
+                self.next.0.set(Some(buf));
                 self.io.memory_pool().release_read_buf(src);
             } else {
                 self.next.0.set(Some(src));
@@ -373,11 +394,12 @@ impl<'a> ReadBuf<'a> {
     #[inline]
     /// Set destination read buffer
     pub fn set_dst(&self, dst: Option<BytesVec>) {
-        if let Some(buf) = self.curr.0.take() {
-            self.io.memory_pool().release_read_buf(buf);
-        }
         if let Some(dst) = dst {
             if dst.is_empty() {
+                self.io.memory_pool().release_read_buf(dst);
+            } else if let Some(mut buf) = self.curr.0.take() {
+                buf.extend_from_slice(&dst);
+                self.curr.0.set(Some(buf));
                 self.io.memory_pool().release_read_buf(dst);
             } else {
                 self.curr.0.set(Some(dst));
@@ -402,7 +424,7 @@ impl<'a> ReadBuf<'a> {
     }
 }
 
-// #[derive(Debug)]
+#[derive(Debug)]
 pub struct WriteBuf<'a> {
     pub(crate) io: &'a IoRef,
     pub(crate) curr: &'a Buffer,
@@ -481,14 +503,15 @@ impl<'a> WriteBuf<'a> {
     #[inline]
     /// Set source write buffer
     pub fn set_src(&self, src: Option<BytesVec>) {
-        if let Some(buf) = self.curr.1.take() {
-            self.io.memory_pool().release_write_buf(buf);
-        }
-        if let Some(buf) = src {
-            if buf.is_empty() {
-                self.io.memory_pool().release_write_buf(buf);
-            } else {
+        if let Some(src) = src {
+            if src.is_empty() {
+                self.io.memory_pool().release_write_buf(src);
+            } else if let Some(mut buf) = self.curr.1.take() {
+                buf.extend_from_slice(&src);
                 self.curr.1.set(Some(buf));
+                self.io.memory_pool().release_write_buf(src);
+            } else {
+                self.curr.1.set(Some(src));
             }
         }
     }
@@ -505,15 +528,19 @@ impl<'a> WriteBuf<'a> {
     #[inline]
     /// Set destination write buffer
     pub fn set_dst(&self, dst: Option<BytesVec>) {
-        if let Some(buf) = self.next.1.take() {
-            self.io.memory_pool().release_write_buf(buf);
-        }
         if let Some(dst) = dst {
             if dst.is_empty() {
                 self.io.memory_pool().release_write_buf(dst);
             } else {
-                self.need_write.set(self.need_write.get() | !dst.is_empty());
-                self.next.1.set(Some(dst));
+                self.need_write.set(true);
+
+                if let Some(mut buf) = self.next.1.take() {
+                    buf.extend_from_slice(&dst);
+                    self.next.1.set(Some(buf));
+                    self.io.memory_pool().release_write_buf(dst);
+                } else {
+                    self.next.1.set(Some(dst));
+                }
             }
         }
     }

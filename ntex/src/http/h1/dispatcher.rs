@@ -1,15 +1,16 @@
 //! Framed transport dispatcher
 use std::task::{Context, Poll};
-use std::{cell::RefCell, error::Error, future::Future, io, marker, mem, pin::Pin, rc::Rc};
+use std::{cell::RefCell, error::Error, future::Future, io, marker, pin::Pin, rc::Rc};
 
-use crate::io::{Filter, Io, IoBoxed, IoStatusUpdate, RecvError};
-use crate::{service::Service, util::ready, util::BoxFuture, util::Bytes};
+use crate::io::{Filter, Io, IoBoxed, IoRef, IoStatusUpdate, RecvError};
+use crate::service::{Pipeline, PipelineCall, Service};
+use crate::util::{ready, Bytes};
 
 use crate::http;
 use crate::http::body::{BodySize, MessageBody, ResponseBody};
-use crate::http::config::DispatcherConfig;
+use crate::http::config::{DispatcherConfig, OnRequest};
 use crate::http::error::{DispatchError, ParseError, PayloadError, ResponseError};
-use crate::http::message::CurrentIo;
+use crate::http::message::{ConnectionType, CurrentIo};
 use crate::http::request::Request;
 use crate::http::response::Response;
 
@@ -46,7 +47,7 @@ pin_project_lite::pin_project! {
     }
 }
 
-#[derive(thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 enum State<B> {
     #[error("State::Call")]
     Call,
@@ -58,6 +59,11 @@ enum State<B> {
     ReadPayload,
     #[error("State::SendPayload")]
     SendPayload { body: ResponseBody<B> },
+    #[error("State::SendPayloadAndStop")]
+    SendPayloadAndStop {
+        body: ResponseBody<B>,
+        boxed_io: Option<Box<(IoBoxed, Codec)>>,
+    },
     #[error("State::Upgrade")]
     Upgrade(Option<Request>),
     #[error("State::StopIo")]
@@ -72,10 +78,10 @@ pin_project_lite::pin_project! {
     where S: 'static, X: 'static
     {
         None,
-        Service { #[pin] fut: S::Future<'static> },
-        ServiceUpgrade { #[pin] fut: S::Future<'static> },
-        Expect { #[pin] fut: X::Future<'static> },
-        Filter { fut: BoxFuture<'static, Result<Request, Response>> }
+        Service { #[pin] fut: PipelineCall<S, Request> },
+        ServiceUpgrade { #[pin] fut: PipelineCall<S, Request>  },
+        Expect { #[pin] fut: PipelineCall<X, Request> },
+        Filter { fut: PipelineCall<OnRequest, (Request, IoRef)> }
     }
 }
 
@@ -184,48 +190,46 @@ where
                         // so we have to send response and disconnect. request payload
                         // handling should be handled by service
                         CallStateProject::ServiceUpgrade { fut } => {
-                            if let Poll::Ready(result) = fut.poll(cx) {
-                                match result {
-                                    Ok(res) => {
-                                        let (msg, body) = res.into().into_parts();
-                                        let item = if let Some(item) = msg.head().take_io()
-                                        {
-                                            item
-                                        } else {
-                                            log::trace!(
-                                                "Handler service consumed io, exit"
-                                            );
-                                            return Poll::Ready(Ok(()));
-                                        };
+                            match ready!(fut.poll(cx)) {
+                                Ok(res) => {
+                                    let (msg, body) = res.into().into_parts();
+                                    let io = if let Some(item) = msg.head().take_io() {
+                                        item
+                                    } else {
+                                        log::trace!("Handler service consumed io, stop");
+                                        return Poll::Ready(Ok(()));
+                                    };
 
-                                        let _ = item.0.encode(
-                                            Message::Item((msg, body.size())),
-                                            &item.1,
-                                        );
+                                    io.1.set_ctype(ConnectionType::Close);
+                                    io.1.unset_streaming();
+                                    let result = io
+                                        .0
+                                        .encode(Message::Item((msg, body.size())), &io.1);
+                                    if result.is_ok() {
                                         match body.size() {
-                                            BodySize::None | BodySize::Empty => {}
+                                            BodySize::None | BodySize::Empty => {
+                                                *this.st = State::StopIo(io)
+                                            }
                                             _ => {
-                                                log::error!("Stream responses are not supported for upgrade requests");
+                                                *this.st = State::SendPayloadAndStop {
+                                                    body,
+                                                    boxed_io: Some(io),
+                                                }
                                             }
                                         }
-                                        *this.st = State::StopIo(item);
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Cannot handle error for upgrade handler: {:?}",
-                                            e
-                                        );
-                                        return Poll::Ready(Ok(()));
+                                    } else {
+                                        *this.st = State::StopIo(io);
                                     }
                                 }
-                                None
-                            } else if this.inner.poll_io_closed(cx) {
-                                // check if io is closed
-                                *this.st = State::Stop;
-                                None
-                            } else {
-                                return Poll::Pending;
+                                Err(e) => {
+                                    log::error!(
+                                        "Cannot handle error for upgrade handler: {:?}",
+                                        e
+                                    );
+                                    return Poll::Ready(Ok(()));
+                                }
                             }
+                            None
                         }
                         // handle EXPECT call
                         // expect service call must resolve before
@@ -250,20 +254,9 @@ where
                                     this = self.as_mut().project();
                                     continue;
                                 } else if this.inner.flags.contains(Flags::UPGRADE_HND) {
-                                    // Handle upgrade requests
-                                    let fut = this.inner.config.service.call(req);
-                                    let st = Some(CallState::ServiceUpgrade {
-                                        fut: unsafe { mem::transmute_copy(&fut) },
-                                    });
-                                    mem::forget(fut);
-                                    st
+                                    Some(this.inner.service_upgrade(req))
                                 } else {
-                                    let fut = this.inner.config.service.call(req);
-                                    let st = Some(CallState::Service {
-                                        fut: unsafe { mem::transmute_copy(&fut) },
-                                    });
-                                    mem::forget(fut);
-                                    st
+                                    Some(this.inner.service_call(req))
                                 }
                             }
                             Err(e) => {
@@ -279,30 +272,12 @@ where
                                         .codec
                                         .set_ctype(req.head().connection_type());
                                     if req.head().expect() {
-                                        // Handle normal requests with EXPECT: 100-Continue` header
-                                        let fut = this.inner.config.expect.call(req);
-                                        let st = Some(CallState::Expect {
-                                            fut: unsafe { mem::transmute_copy(&fut) },
-                                        });
-                                        mem::forget(fut);
-                                        st
+                                        Some(this.inner.service_expect(req))
                                     } else if this.inner.flags.contains(Flags::UPGRADE_HND)
                                     {
-                                        // Handle upgrade requests
-                                        let fut = this.inner.config.service.call(req);
-                                        let st = Some(CallState::ServiceUpgrade {
-                                            fut: unsafe { mem::transmute_copy(&fut) },
-                                        });
-                                        mem::forget(fut);
-                                        st
+                                        Some(this.inner.service_upgrade(req))
                                     } else {
-                                        // Handle normal requests
-                                        let fut = this.inner.config.service.call(req);
-                                        let st = Some(CallState::Service {
-                                            fut: unsafe { mem::transmute_copy(&fut) },
-                                        });
-                                        mem::forget(fut);
-                                        st
+                                        Some(this.inner.service_call(req))
                                     }
                                 }
                                 Err(res) => {
@@ -350,6 +325,51 @@ where
                                 *this.st = st;
                                 break;
                             }
+                        }
+                    }
+                }
+                // send response body
+                State::SendPayloadAndStop {
+                    ref mut body,
+                    ref mut boxed_io,
+                } => {
+                    let io = boxed_io.as_ref().unwrap();
+
+                    if io.0.is_closed() {
+                        *this.st = State::Stop;
+                    } else {
+                        if let Poll::Ready(Err(err)) =
+                            _poll_request_payload(&io.0, &mut this.inner.payload, cx)
+                        {
+                            this.inner.error = Some(err);
+                        }
+                        loop {
+                            let _ = ready!(io.0.poll_flush(cx, false));
+                            let item = ready!(body.poll_next_chunk(cx));
+                            match item {
+                                Some(Ok(item)) => {
+                                    trace!("got response chunk: {:?}", item.len());
+                                    if let Err(e) =
+                                        io.0.encode(Message::Chunk(Some(item)), &io.1)
+                                    {
+                                        trace!("Cannot encode chunk: {:?}", e);
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                None => {
+                                    trace!("response payload eof {:?}", this.inner.flags);
+                                    if let Err(e) = io.0.encode(Message::Chunk(None), &io.1)
+                                    {
+                                        trace!("Cannot encode payload eof: {:?}", e);
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    trace!("error during response body poll: {:?}", e);
+                                }
+                            }
+                            *this.st = State::StopIo(boxed_io.take().unwrap());
+                            break;
                         }
                     }
                 }
@@ -456,6 +476,40 @@ where
         }
     }
 
+    fn service_call(&self, req: Request) -> CallState<S, X> {
+        // Handle normal requests
+        CallState::Service {
+            fut: self.config.service.call_nowait(req),
+        }
+    }
+
+    fn service_filter(&self, req: Request, f: &Pipeline<OnRequest>) -> CallState<S, X> {
+        // Handle filter fut
+        CallState::Filter {
+            fut: f.call_nowait((req, self.io.get_ref())),
+        }
+    }
+
+    fn service_expect(&self, req: Request) -> CallState<S, X> {
+        // Handle normal requests with EXPECT: 100-Continue` header
+        CallState::Expect {
+            fut: self.config.expect.call_nowait(req),
+        }
+    }
+
+    fn service_upgrade(&mut self, mut req: Request) -> CallState<S, X> {
+        // Move io into request
+        let io: IoBoxed = self.io.take().into();
+        req.head_mut().io = CurrentIo::Io(Rc::new((
+            io.get_ref(),
+            RefCell::new(Some(Box::new((io, self.codec.clone())))),
+        )));
+        // Handle upgrade requests
+        CallState::ServiceUpgrade {
+            fut: self.config.service.call_nowait(req),
+        }
+    }
+
     fn read_request(
         &mut self,
         cx: &mut Context<'_>,
@@ -506,46 +560,17 @@ where
                     } else {
                         if req.upgrade() {
                             self.flags.insert(Flags::UPGRADE_HND);
-                            let io: IoBoxed = self.io.take().into();
-                            req.head_mut().io = CurrentIo::Io(Rc::new((
-                                io.get_ref(),
-                                RefCell::new(Some(Box::new((io, self.codec.clone())))),
-                            )));
                         } else {
                             req.head_mut().io = CurrentIo::Ref(self.io.get_ref());
                         }
                         call_state.set(if let Some(ref f) = self.config.on_request {
-                            // Handle filter fut
-                            let fut = f.call((req, self.io.get_ref()));
-                            let st = CallState::Filter {
-                                fut: unsafe { mem::transmute_copy(&fut) },
-                            };
-                            mem::forget(fut);
-                            st
+                            self.service_filter(req, f)
                         } else if req.head().expect() {
-                            // Handle normal requests with EXPECT: 100-Continue` header
-                            let fut = self.config.expect.call(req);
-                            let st = CallState::Expect {
-                                fut: unsafe { mem::transmute_copy(&fut) },
-                            };
-                            mem::forget(fut);
-                            st
+                            self.service_expect(req)
                         } else if self.flags.contains(Flags::UPGRADE_HND) {
-                            // Handle upgrade requests
-                            let fut = self.config.service.call(req);
-                            let st = CallState::ServiceUpgrade {
-                                fut: unsafe { mem::transmute_copy(&fut) },
-                            };
-                            mem::forget(fut);
-                            st
+                            self.service_upgrade(req)
                         } else {
-                            // Handle normal requests
-                            let fut = self.config.service.call(req);
-                            let st = CallState::Service {
-                                fut: unsafe { mem::transmute_copy(&fut) },
-                            };
-                            mem::forget(fut);
-                            st
+                            self.service_call(req)
                         });
                         Poll::Ready(State::Call)
                     }
@@ -671,89 +696,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), DispatchError>> {
-        // check if payload data is required
-        let payload = if let Some(ref mut payload) = self.payload {
-            payload
-        } else {
-            return Poll::Ready(Ok(()));
-        };
-        match payload.1.poll_data_required(cx) {
-            PayloadStatus::Read => {
-                let io = &self.io;
-
-                // read request payload
-                let mut updated = false;
-                loop {
-                    match io.poll_recv(&payload.0, cx) {
-                        Poll::Ready(Ok(PayloadItem::Chunk(chunk))) => {
-                            updated = true;
-                            payload.1.feed_data(chunk);
-                        }
-                        Poll::Ready(Ok(PayloadItem::Eof)) => {
-                            updated = true;
-                            payload.1.feed_eof();
-                            self.payload = None;
-                            break;
-                        }
-                        Poll::Ready(Err(err)) => {
-                            let err = match err {
-                                RecvError::WriteBackpressure => {
-                                    if io.poll_flush(cx, false)?.is_pending() {
-                                        break;
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                RecvError::KeepAlive => {
-                                    payload.1.set_error(PayloadError::EncodingCorrupted);
-                                    self.payload = None;
-                                    io::Error::new(io::ErrorKind::Other, "Keep-alive")
-                                        .into()
-                                }
-                                RecvError::Stop => {
-                                    payload.1.set_error(PayloadError::EncodingCorrupted);
-                                    self.payload = None;
-                                    io::Error::new(
-                                        io::ErrorKind::Other,
-                                        "Dispatcher stopped",
-                                    )
-                                    .into()
-                                }
-                                RecvError::PeerGone(err) => {
-                                    payload.1.set_error(PayloadError::EncodingCorrupted);
-                                    self.payload = None;
-                                    if let Some(err) = err {
-                                        DispatchError::PeerGone(Some(err))
-                                    } else {
-                                        ParseError::Incomplete.into()
-                                    }
-                                }
-                                RecvError::Decoder(e) => {
-                                    payload.1.set_error(PayloadError::EncodingCorrupted);
-                                    self.payload = None;
-                                    DispatchError::Parse(e)
-                                }
-                            };
-                            return Poll::Ready(Err(err));
-                        }
-                        Poll::Pending => break,
-                    }
-                }
-                if updated {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            PayloadStatus::Pause => Poll::Pending,
-            PayloadStatus::Dropped => {
-                // service call is not interested in payload
-                // wait until future completes and then close
-                // connection
-                self.payload = None;
-                Poll::Ready(Err(DispatchError::PayloadIsNotConsumed))
-            }
-        }
+        _poll_request_payload(&self.io, &mut self.payload, cx)
     }
 
     /// check for io changes, could close while waiting for service call
@@ -766,6 +709,91 @@ where
                 | IoStatusUpdate::PeerGone(_),
             ) => true,
             Poll::Ready(IoStatusUpdate::WriteBackpressure) => false,
+        }
+    }
+}
+
+/// Process request's payload
+fn _poll_request_payload<F>(
+    io: &Io<F>,
+    slf_payload: &mut Option<(PayloadDecoder, PayloadSender)>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<(), DispatchError>> {
+    // check if payload data is required
+    let payload = if let Some(ref mut payload) = slf_payload {
+        payload
+    } else {
+        return Poll::Ready(Ok(()));
+    };
+    match payload.1.poll_data_required(cx) {
+        PayloadStatus::Read => {
+            // read request payload
+            let mut updated = false;
+            loop {
+                match io.poll_recv(&payload.0, cx) {
+                    Poll::Ready(Ok(PayloadItem::Chunk(chunk))) => {
+                        updated = true;
+                        payload.1.feed_data(chunk);
+                    }
+                    Poll::Ready(Ok(PayloadItem::Eof)) => {
+                        updated = true;
+                        payload.1.feed_eof();
+                        *slf_payload = None;
+                        break;
+                    }
+                    Poll::Ready(Err(err)) => {
+                        let err = match err {
+                            RecvError::WriteBackpressure => {
+                                if io.poll_flush(cx, false)?.is_pending() {
+                                    break;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            RecvError::KeepAlive => {
+                                payload.1.set_error(PayloadError::EncodingCorrupted);
+                                *slf_payload = None;
+                                io::Error::new(io::ErrorKind::Other, "Keep-alive").into()
+                            }
+                            RecvError::Stop => {
+                                payload.1.set_error(PayloadError::EncodingCorrupted);
+                                *slf_payload = None;
+                                io::Error::new(io::ErrorKind::Other, "Dispatcher stopped")
+                                    .into()
+                            }
+                            RecvError::PeerGone(err) => {
+                                payload.1.set_error(PayloadError::EncodingCorrupted);
+                                *slf_payload = None;
+                                if let Some(err) = err {
+                                    DispatchError::PeerGone(Some(err))
+                                } else {
+                                    ParseError::Incomplete.into()
+                                }
+                            }
+                            RecvError::Decoder(e) => {
+                                payload.1.set_error(PayloadError::EncodingCorrupted);
+                                *slf_payload = None;
+                                DispatchError::Parse(e)
+                            }
+                        };
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => break,
+                }
+            }
+            if updated {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+        PayloadStatus::Pause => Poll::Pending,
+        PayloadStatus::Dropped => {
+            // service call is not interested in payload
+            // wait until future completes and then close
+            // connection
+            *slf_payload = None;
+            Poll::Ready(Err(DispatchError::PayloadIsNotConsumed))
         }
     }
 }
