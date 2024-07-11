@@ -1,30 +1,29 @@
-use std::task::{Context, Poll};
-use std::{future::Future, io, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{io, sync::Arc};
 
 use tls_rust::ServerConfig;
 
-use ntex_io::{Filter, FilterFactory, Io, Layer};
+use ntex_io::{Filter, Io, Layer};
 use ntex_service::{Service, ServiceCtx, ServiceFactory};
-use ntex_util::{future::Ready, time::Millis};
+use ntex_util::time::Millis;
 
-use super::{TlsAcceptor, TlsFilter};
-use crate::{counter::Counter, counter::CounterGuard, MAX_SSL_ACCEPT_COUNTER};
+use super::TlsServerFilter;
+use crate::{counter::Counter, MAX_SSL_ACCEPT_COUNTER};
 
 #[derive(Debug)]
 /// Support `SSL` connections via rustls package
 ///
 /// `rust-tls` feature enables `RustlsAcceptor` type
-pub struct Acceptor<F> {
-    inner: TlsAcceptor,
-    _t: PhantomData<F>,
+pub struct TlsAcceptor {
+    config: Arc<ServerConfig>,
+    timeout: Millis,
 }
 
-impl<F> Acceptor<F> {
+impl TlsAcceptor {
     /// Create rustls based `Acceptor` service factory
     pub fn new(config: Arc<ServerConfig>) -> Self {
-        Acceptor {
-            inner: TlsAcceptor::new(config),
-            _t: PhantomData,
+        Self {
+            config,
+            timeout: Millis(5_000),
         }
     }
 
@@ -32,41 +31,38 @@ impl<F> Acceptor<F> {
     ///
     /// Default is set to 5 seconds.
     pub fn timeout<U: Into<Millis>>(mut self, timeout: U) -> Self {
-        self.inner.timeout(timeout.into());
+        self.timeout = timeout.into();
         self
     }
 }
 
-impl<F> From<ServerConfig> for Acceptor<F> {
+impl From<ServerConfig> for TlsAcceptor {
     fn from(cfg: ServerConfig) -> Self {
         Self::new(Arc::new(cfg))
     }
 }
 
-impl<F> Clone for Acceptor<F> {
+impl Clone for TlsAcceptor {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            _t: PhantomData,
+            config: self.config.clone(),
+            timeout: self.timeout,
         }
     }
 }
 
-impl<F: Filter, C: 'static> ServiceFactory<Io<F>, C> for Acceptor<F> {
-    type Response = Io<Layer<TlsFilter, F>>;
+impl<F: Filter, C> ServiceFactory<Io<F>, C> for TlsAcceptor {
+    type Response = Io<Layer<TlsServerFilter, F>>;
     type Error = io::Error;
-    type Service = AcceptorService<F>;
-
+    type Service = TlsAcceptorService;
     type InitError = ();
-    type Future<'f> = Ready<Self::Service, Self::InitError> where Self: 'f, C: 'f;
 
-    #[inline]
-    fn create(&self, _: C) -> Self::Future<'_> {
+    async fn create(&self, _: C) -> Result<Self::Service, Self::InitError> {
         MAX_SSL_ACCEPT_COUNTER.with(|conns| {
-            Ready::Ok(AcceptorService {
-                acceptor: self.inner.clone(),
+            Ok(TlsAcceptorService {
+                config: self.config.clone(),
+                timeout: self.timeout,
                 conns: conns.clone(),
-                io: PhantomData,
             })
         })
     }
@@ -74,50 +70,27 @@ impl<F: Filter, C: 'static> ServiceFactory<Io<F>, C> for Acceptor<F> {
 
 #[derive(Debug)]
 /// RusTLS based `Acceptor` service
-pub struct AcceptorService<F> {
-    acceptor: TlsAcceptor,
-    io: PhantomData<F>,
+pub struct TlsAcceptorService {
+    config: Arc<ServerConfig>,
+    timeout: Millis,
     conns: Counter,
 }
 
-impl<F: Filter> Service<Io<F>> for AcceptorService<F> {
-    type Response = Io<Layer<TlsFilter, F>>;
+impl<F: Filter> Service<Io<F>> for TlsAcceptorService {
+    type Response = Io<Layer<TlsServerFilter, F>>;
     type Error = io::Error;
-    type Future<'f> = AcceptorServiceFut<F>;
 
-    #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.conns.available(cx) {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+    async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        self.conns.available().await;
+        Ok(())
     }
 
-    #[inline]
-    fn call<'a>(&'a self, req: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-        AcceptorServiceFut {
-            _guard: self.conns.get(),
-            fut: self.acceptor.clone().create(req),
-        }
-    }
-}
-
-pin_project_lite::pin_project! {
-    pub struct AcceptorServiceFut<F>
-    where
-        F: Filter,
-    {
-        #[pin]
-        fut: <TlsAcceptor as FilterFactory<F>>::Future,
-        _guard: CounterGuard,
-    }
-}
-
-impl<F: Filter> Future for AcceptorServiceFut<F> {
-    type Output = Result<Io<Layer<TlsFilter, F>>, io::Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.project().fut.poll(cx)
+    async fn call(
+        &self,
+        io: Io<F>,
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        let _guard = self.conns.get();
+        super::TlsServerFilter::create(io, self.config.clone(), self.timeout).await
     }
 }

@@ -1,628 +1,361 @@
-//! Framed transport dispatcher
-use std::task::{Context, Poll};
-use std::{cell::RefCell, error::Error, future::Future, io, marker, pin::Pin, rc::Rc};
+//! HTTP/1 protocol dispatcher
+use std::{error, future, io, marker, pin::Pin, rc::Rc, task::Context, task::Poll};
 
-use crate::io::{Filter, Io, IoBoxed, IoRef, IoStatusUpdate, RecvError};
-use crate::service::{Pipeline, PipelineCall, Service};
-use crate::util::{ready, Bytes};
+use crate::io::{Decoded, Filter, Io, IoBoxed, IoStatusUpdate, RecvError};
+use crate::service::{PipelineCall, Service};
+use crate::time::Seconds;
+use crate::util::{ready, Either};
 
-use crate::http;
 use crate::http::body::{BodySize, MessageBody, ResponseBody};
-use crate::http::config::{DispatcherConfig, OnRequest};
-use crate::http::error::{DispatchError, ParseError, PayloadError, ResponseError};
+use crate::http::error::{PayloadError, ResponseError};
 use crate::http::message::{ConnectionType, CurrentIo};
-use crate::http::request::Request;
-use crate::http::response::Response;
+use crate::http::{self, config::DispatcherConfig, request::Request, response::Response};
 
+use super::control::{Control, ControlAck, ControlFlags, ControlResult};
 use super::decoder::{PayloadDecoder, PayloadItem, PayloadType};
 use super::payload::{Payload, PayloadSender, PayloadStatus};
-use super::{codec::Codec, Message};
+use super::{codec::Codec, Message, ProtocolError};
 
 bitflags::bitflags! {
-    pub struct Flags: u16 {
-        /// We parsed one complete request message
-        const STARTED              = 0b0000_0001;
-        /// Keep-alive is enabled on current connection
-        const KEEPALIVE            = 0b0000_0010;
-        /// Keep-alive is registered
-        const KEEPALIVE_REG        = 0b0000_0100;
-        /// Upgrade request
-        const UPGRADE              = 0b0000_1000;
-        /// Handling upgrade
-        const UPGRADE_HND          = 0b0001_0000;
-        /// Stop after sending payload
-        const SENDPAYLOAD_AND_STOP = 0b0010_0000;
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    pub struct Flags: u8 {
+        /// Upgrade hnd
+        const UPGRADE              = 0b0000_0001;
+        /// Stopping
+        const SENDPAYLOAD_AND_STOP = 0b0000_0010;
+        /// Complete operation and disconnect
+        const DISCONNECT           = 0b0000_0100;
+        /// Keep-alive is enabled
+        const READ_KA_TIMEOUT      = 0b0001_0000;
+        /// Read headers timer is enabled
+        const READ_HDRS_TIMEOUT    = 0b0010_0000;
+        /// Read headers payload is enabled
+        const READ_PL_TIMEOUT      = 0b0100_0000;
     }
 }
 
 pin_project_lite::pin_project! {
     /// Dispatcher for HTTP/1.1 protocol
-    pub struct Dispatcher<F, S: Service<Request>, B, X: Service<Request>, U: Service<(Request, Io<F>, Codec)>>
-    where S: 'static, X: 'static, U: 'static
+    pub struct Dispatcher<F, S: Service<Request>, B, C: Service<Control<F, S::Error>>>
+    where
+        F: 'static,
+        S::Error: 'static,
     {
-        #[pin]
-        call: CallState<S, X>,
-        st: State<B>,
-        inner: DispatcherInner<F, S, B, X, U>,
+        st: State<F, C, S, B>,
+        inner: DispatcherInner<F, C, S, B>,
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-enum State<B> {
-    #[error("State::Call")]
-    Call,
-    #[error("State::ReadRequest")]
+#[derive(Debug)]
+enum State<F, C, S, B>
+where
+    F: 'static,
+    S: Service<Request>,
+    S::Error: 'static,
+    C: Service<Control<F, S::Error>>,
+{
+    CallPublish {
+        fut: PipelineCall<S, Request>,
+    },
+    CallControl {
+        fut: PipelineCall<C, Control<F, S::Error>>,
+    },
     ReadRequest,
-    #[error("State::ReadFirstRequest")]
-    ReadFirstRequest,
-    #[error("State::ReadPayload")]
     ReadPayload,
-    #[error("State::SendPayload")]
-    SendPayload { body: ResponseBody<B> },
-    #[error("State::SendPayloadAndStop")]
+    SendPayload {
+        body: ResponseBody<B>,
+    },
     SendPayloadAndStop {
         body: ResponseBody<B>,
-        boxed_io: Option<Box<(IoBoxed, Codec)>>,
+        io: IoBoxed,
     },
-    #[error("State::Upgrade")]
-    Upgrade(Option<Request>),
-    #[error("State::StopIo")]
-    StopIo(Box<(IoBoxed, Codec)>),
-    #[error("State::Stop")]
-    Stop,
+    Stop {
+        fut: Option<PipelineCall<C, Control<F, S::Error>>>,
+        io: Option<IoBoxed>,
+    },
 }
 
-pin_project_lite::pin_project! {
-    #[project = CallStateProject]
-    enum CallState<S: Service<Request>, X: Service<Request>>
-    where S: 'static, X: 'static
-    {
-        None,
-        Service { #[pin] fut: PipelineCall<S, Request> },
-        ServiceUpgrade { #[pin] fut: PipelineCall<S, Request>  },
-        Expect { #[pin] fut: PipelineCall<X, Request> },
-        Filter { fut: PipelineCall<OnRequest, (Request, IoRef)> }
-    }
-}
-
-struct DispatcherInner<F, S, B, X, U> {
+struct DispatcherInner<F, C, S, B> {
     io: Io<F>,
     flags: Flags,
     codec: Codec,
-    config: Rc<DispatcherConfig<S, X, U>>,
-    error: Option<DispatchError>,
+    config: Rc<DispatcherConfig<S, C>>,
     payload: Option<(PayloadDecoder, PayloadSender)>,
+    read_remains: u32,
+    read_consumed: u32,
+    read_max_timeout: Seconds,
     _t: marker::PhantomData<(S, B)>,
 }
 
-impl<F, S, B, X, U> Dispatcher<F, S, B, X, U>
+impl<F, S, B, C> Dispatcher<F, S, B, C>
 where
     F: Filter,
+    C: Service<Control<F, S::Error>, Response = ControlAck>,
     S: Service<Request>,
     S::Error: ResponseError,
     S::Response: Into<Response<B>>,
     B: MessageBody,
-    X: Service<Request, Response = Request>,
-    X::Error: ResponseError,
-    U: Service<(Request, Io<F>, Codec), Response = ()>,
 {
     /// Construct new `Dispatcher` instance with outgoing messages stream.
-    pub(in crate::http) fn new(io: Io<F>, config: Rc<DispatcherConfig<S, X, U>>) -> Self {
+    pub(in crate::http) fn new(io: Io<F>, config: Rc<DispatcherConfig<S, C>>) -> Self {
         let codec = Codec::new(config.timer.clone(), config.keep_alive_enabled());
-        io.set_disconnect_timeout(config.client_disconnect.into());
+        io.set_disconnect_timeout(config.client_disconnect);
 
         // slow-request timer
-        let flags = if config.client_timeout.is_zero() {
-            Flags::empty()
+        let (flags, max_timeout) = if let Some(cfg) = config.headers_read_rate() {
+            io.start_timer(cfg.timeout);
+            (Flags::READ_HDRS_TIMEOUT, cfg.max_timeout)
         } else {
-            io.start_keepalive_timer(config.client_timeout);
-            Flags::KEEPALIVE_REG
+            (Flags::empty(), Seconds::ZERO)
         };
 
         Dispatcher {
-            call: CallState::None,
-            st: State::ReadFirstRequest,
+            st: State::ReadRequest,
             inner: DispatcherInner {
                 io,
                 flags,
                 codec,
                 config,
-                error: None,
                 payload: None,
+                read_remains: 0,
+                read_consumed: 0,
+                read_max_timeout: max_timeout,
                 _t: marker::PhantomData,
             },
         }
     }
 }
 
-impl<F, S, B, X, U> Future for Dispatcher<F, S, B, X, U>
+impl<F, S, B, C> future::Future for Dispatcher<F, S, B, C>
 where
     F: Filter,
-    S: Service<Request>,
+    C: Service<Control<F, S::Error>, Response = ControlAck> + 'static,
+    C::Error: error::Error,
+    S: Service<Request> + 'static,
     S::Error: ResponseError + 'static,
     S::Response: Into<Response<B>>,
     B: MessageBody,
-    X: Service<Request, Response = Request>,
-    X::Error: ResponseError + 'static,
-    U: Service<(Request, Io<F>, Codec), Response = ()> + 'static,
 {
-    type Output = Result<(), DispatchError>;
+    type Output = Result<(), Box<dyn error::Error>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.as_mut().project();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let inner = &mut this.inner;
 
         loop {
-            match this.st {
-                State::Call => {
-                    let next = match this.call.project() {
-                        CallStateProject::Service { fut } => {
-                            match fut.poll(cx) {
-                                Poll::Ready(result) => match result {
-                                    Ok(res) => {
-                                        let (res, body) = res.into().into_parts();
-                                        *this.st = this.inner.send_response(res, body);
-                                    }
-                                    Err(e) => *this.st = this.inner.handle_error(e, false),
-                                },
-                                Poll::Pending => {
-                                    // we might need to read more data into a request payload
-                                    // (ie service future can wait for payload data)
-                                    if this.inner.payload.is_some() {
-                                        if let Err(e) =
-                                            ready!(this.inner.poll_request_payload(cx))
-                                        {
-                                            *this.st = State::Stop;
-                                            this.inner.error = Some(e);
-                                        }
-                                    } else if this.inner.poll_io_closed(cx) {
-                                        // check if io is closed
-                                        *this.st = State::Stop;
-                                    } else {
-                                        return Poll::Pending;
-                                    }
-                                }
-                            }
-                            None
+            *this.st = match this.st {
+                // handle publish service responses
+                State::CallPublish { fut } => match Pin::new(fut).poll(cx) {
+                    Poll::Ready(Ok(res)) => {
+                        let (res, body) = res.into().into_parts();
+                        if inner.flags.contains(Flags::UPGRADE) {
+                            inner.send_response_to(res, body, None)
+                        } else {
+                            inner.send_response(res, body)
                         }
-                        // special handling for upgrade requests.
-                        // we cannot continue to handle requests, because Io<F> get
-                        // converted to IoBoxed before we set it to request,
-                        // so we have to send response and disconnect. request payload
-                        // handling should be handled by service
-                        CallStateProject::ServiceUpgrade { fut } => {
-                            match ready!(fut.poll(cx)) {
-                                Ok(res) => {
-                                    let (msg, body) = res.into().into_parts();
-                                    let io = if let Some(item) = msg.head().take_io() {
-                                        item
-                                    } else {
-                                        log::trace!("Handler service consumed io, stop");
-                                        return Poll::Ready(Ok(()));
-                                    };
-
-                                    io.1.set_ctype(ConnectionType::Close);
-                                    io.1.unset_streaming();
-                                    let result = io
-                                        .0
-                                        .encode(Message::Item((msg, body.size())), &io.1);
-                                    if result.is_ok() {
-                                        match body.size() {
-                                            BodySize::None | BodySize::Empty => {
-                                                *this.st = State::StopIo(io)
-                                            }
-                                            _ => {
-                                                *this.st = State::SendPayloadAndStop {
-                                                    body,
-                                                    boxed_io: Some(io),
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        *this.st = State::StopIo(io);
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "Cannot handle error for upgrade handler: {:?}",
-                                        e
-                                    );
-                                    return Poll::Ready(Ok(()));
-                                }
-                            }
-                            None
-                        }
-                        // handle EXPECT call
-                        // expect service call must resolve before
-                        // we can do any more io processing.
-                        //
-                        // TODO: check keep-alive timer interaction
-                        CallStateProject::Expect { fut } => match ready!(fut.poll(cx)) {
-                            Ok(req) => {
-                                let result = this.inner.io.with_write_buf(|buf| {
-                                    buf.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n")
-                                });
-                                if result.is_err() {
-                                    log::error!(
-                                        "Expect handler returned error: {:?}",
-                                        result.err().unwrap()
-                                    );
-                                    *this.st = State::Stop;
-                                    this = self.as_mut().project();
-                                    continue;
-                                } else if this.inner.flags.contains(Flags::UPGRADE) {
-                                    *this.st = State::Upgrade(Some(req));
-                                    this = self.as_mut().project();
-                                    continue;
-                                } else if this.inner.flags.contains(Flags::UPGRADE_HND) {
-                                    Some(this.inner.service_upgrade(req))
-                                } else {
-                                    Some(this.inner.service_call(req))
-                                }
-                            }
-                            Err(e) => {
-                                *this.st = this.inner.handle_error(e, true);
-                                None
-                            }
-                        },
-                        // handle FILTER call
-                        CallStateProject::Filter { fut } => {
-                            match ready!(Pin::new(fut).poll(cx)) {
-                                Ok(req) => {
-                                    this.inner
-                                        .codec
-                                        .set_ctype(req.head().connection_type());
-                                    if req.head().expect() {
-                                        Some(this.inner.service_expect(req))
-                                    } else if this.inner.flags.contains(Flags::UPGRADE_HND)
-                                    {
-                                        Some(this.inner.service_upgrade(req))
-                                    } else {
-                                        Some(this.inner.service_call(req))
-                                    }
-                                }
-                                Err(res) => {
-                                    let (res, body) = res.into_parts();
-                                    *this.st =
-                                        this.inner.send_response(res, body.into_body());
-                                    None
-                                }
-                            }
-                        }
-                        CallStateProject::None => unreachable!(),
-                    };
-
-                    this = self.as_mut().project();
-                    if let Some(next) = next {
-                        this.call.set(next);
                     }
-                }
+                    Poll::Ready(Err(err)) => inner.control(Control::err(err)),
+                    Poll::Pending => {
+                        if !inner.flags.contains(Flags::UPGRADE) {
+                            ready!(inner.poll_request(cx))
+                        } else {
+                            return Poll::Pending;
+                        }
+                    }
+                },
+                // handle control service responses
+                State::CallControl { fut } => match Pin::new(fut).poll(cx) {
+                    Poll::Ready(Ok(ControlAck { result, flags })) => {
+                        if flags.contains(ControlFlags::CONTINUE) {
+                            let result = inner.io.with_write_buf(|buf| {
+                                buf.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n")
+                            });
+                            if let Err(err) = result {
+                                *this.st = inner.ctl_peer_gone(Some(err));
+                                continue;
+                            }
+                        }
+                        if flags.contains(ControlFlags::DISCONNECT) {
+                            inner.flags.insert(Flags::DISCONNECT);
+                        }
+
+                        match result {
+                            ControlResult::Publish(req) => inner.publish(req),
+                            ControlResult::PublishUpgrade(req) => {
+                                inner.flags.insert(Flags::UPGRADE);
+                                inner.publish(req)
+                            }
+                            ControlResult::Response(res, body) => {
+                                inner.send_response(res, body.into())
+                            }
+                            ControlResult::ResponseWithIo(res, body, io) => {
+                                inner.send_response_to(res, body.into(), Some(io))
+                            }
+                            ControlResult::Expect(req) => {
+                                inner.control(Control::expect(req))
+                            }
+                            ControlResult::Upgrade(req) => inner.ctl_upgrade(req),
+                            ControlResult::Stop => inner.stop(),
+                        }
+                    }
+                    Poll::Ready(Err(err)) => {
+                        log::error!("{}: Control plain error: {}", inner.io.tag(), err);
+                        return Poll::Ready(Err(Box::new(err)));
+                    }
+                    Poll::Pending => ready!(inner.poll_request(cx)),
+                },
                 // read request and call service
-                State::ReadRequest => {
-                    *this.st = ready!(this.inner.read_request(cx, &mut this.call));
-                }
+                State::ReadRequest => ready!(inner.poll_read_request(cx)),
                 // consume request's payload
                 State::ReadPayload => {
-                    if let Err(e) = ready!(this.inner.poll_request_payload(cx)) {
-                        *this.st = State::Stop;
-                        this.inner.error = Some(e);
+                    let result = inner.poll_request_payload(cx);
+                    if inner.flags.contains(Flags::SENDPAYLOAD_AND_STOP) {
+                        inner.stop()
                     } else {
-                        *this.st = this.inner.switch_to_read_request();
+                        ready!(result).unwrap_or(State::ReadRequest)
                     }
                 }
                 // send response body
-                State::SendPayload { ref mut body } => {
-                    if this.inner.io.is_closed() {
-                        *this.st = State::Stop;
-                    } else {
-                        if let Poll::Ready(Err(err)) = this.inner.poll_request_payload(cx) {
-                            this.inner.error = Some(err);
-                            this.inner.flags.insert(Flags::SENDPAYLOAD_AND_STOP);
-                        }
-                        loop {
-                            let _ = ready!(this.inner.io.poll_flush(cx, false));
-                            let item = ready!(body.poll_next_chunk(cx));
-                            if let Some(st) = this.inner.send_payload(item) {
-                                *this.st = st;
-                                break;
-                            }
-                        }
-                    }
+                State::SendPayload { body } => {
+                    ready!(inner.poll_send_payload(cx, body))
                 }
                 // send response body
-                State::SendPayloadAndStop {
-                    ref mut body,
-                    ref mut boxed_io,
-                } => {
-                    let io = boxed_io.as_ref().unwrap();
-
-                    if io.0.is_closed() {
-                        *this.st = State::Stop;
-                    } else {
-                        if let Poll::Ready(Err(err)) =
-                            _poll_request_payload(&io.0, &mut this.inner.payload, cx)
-                        {
-                            this.inner.error = Some(err);
-                        }
-                        loop {
-                            let _ = ready!(io.0.poll_flush(cx, false));
-                            let item = ready!(body.poll_next_chunk(cx));
-                            match item {
-                                Some(Ok(item)) => {
-                                    trace!("got response chunk: {:?}", item.len());
-                                    if let Err(e) =
-                                        io.0.encode(Message::Chunk(Some(item)), &io.1)
-                                    {
-                                        trace!("Cannot encode chunk: {:?}", e);
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                None => {
-                                    trace!("response payload eof {:?}", this.inner.flags);
-                                    if let Err(e) = io.0.encode(Message::Chunk(None), &io.1)
-                                    {
-                                        trace!("Cannot encode payload eof: {:?}", e);
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    trace!("error during response body poll: {:?}", e);
-                                }
-                            }
-                            *this.st = State::StopIo(boxed_io.take().unwrap());
-                            break;
-                        }
+                State::SendPayloadAndStop { body, io } => {
+                    ready!(inner.poll_send_payload_to(cx, body, io))
+                }
+                // shutdown io
+                State::Stop { fut, io } => {
+                    if let Some(ref mut f) = fut {
+                        let _ = ready!(Pin::new(f).poll(cx));
+                        fut.take();
                     }
-                }
-                // read first request and call service
-                State::ReadFirstRequest => {
-                    *this.st = ready!(this.inner.read_request(cx, &mut this.call));
-                    this.inner.flags.insert(Flags::STARTED);
-                }
-                // stop io tasks and call upgrade service
-                State::Upgrade(ref mut req) => {
-                    let io = this.inner.io.take();
-                    let req = req.take().unwrap();
+                    log::debug!("{}: Dispatcher is stopped", inner.io.tag());
 
-                    log::trace!("switching to upgrade service for {:?}", req);
-
-                    // Handle UPGRADE request
-                    let config = this.inner.config.clone();
-                    let codec = this.inner.codec.clone();
-                    crate::rt::spawn(async move {
-                        let _ = config
-                            .upgrade
-                            .as_ref()
-                            .unwrap()
-                            .call((req, io, codec))
-                            .await;
-                    });
-                    return Poll::Ready(Ok(()));
-                }
-                // prepare to shutdown
-                State::Stop => {
-                    this.inner.unregister_keepalive();
-
-                    return if let Err(e) = ready!(this.inner.io.poll_shutdown(cx)) {
-                        // get io error
-                        if let Some(e) = this.inner.error.take() {
-                            Poll::Ready(Err(e))
+                    return Poll::Ready(
+                        if let Some(io) = io {
+                            io.stop_timer();
+                            ready!(io.poll_shutdown(cx))
                         } else {
-                            Poll::Ready(Err(DispatchError::PeerGone(Some(e))))
+                            inner.io.stop_timer();
+                            ready!(inner.io.poll_shutdown(cx))
                         }
-                    } else {
-                        Poll::Ready(Ok(()))
-                    };
-                }
-                // prepare to shutdown
-                State::StopIo(ref item) => {
-                    return item.0.poll_shutdown(cx).map_err(From::from)
+                        .map_err(From::from),
+                    );
                 }
             }
         }
     }
 }
 
-impl<T, S, B, X, U> DispatcherInner<T, S, B, X, U>
+impl<F, C, S, B> DispatcherInner<F, C, S, B>
 where
-    T: Filter,
-    S: Service<Request>,
-    S::Error: ResponseError + 'static,
+    F: Filter,
+    C: Service<Control<F, S::Error>, Response = ControlAck> + 'static,
+    S: Service<Request> + 'static,
+    S::Error: ResponseError,
     S::Response: Into<Response<B>>,
     B: MessageBody,
-    X: Service<Request>,
 {
-    fn switch_to_read_request(&mut self) -> State<B> {
-        // connection is not keep-alive, disconnect
-        if !self.flags.contains(Flags::KEEPALIVE) || !self.codec.keepalive_enabled() {
-            self.io.close();
-            State::Stop
-        } else {
-            // register keep-alive timer
-            if self.flags.contains(Flags::KEEPALIVE) {
-                self.flags.remove(Flags::KEEPALIVE);
-                self.flags.insert(Flags::KEEPALIVE_REG);
-                self.io.start_keepalive_timer(self.config.keep_alive);
+    fn poll_read_request(&mut self, cx: &mut Context<'_>) -> Poll<State<F, C, S, B>> {
+        log::trace!("{}: Trying to read http message", self.io.tag());
+
+        let result = match self.io.poll_recv_decode(&self.codec, cx) {
+            Ok(decoded) => {
+                if let Some(st) = self.update_hdrs_timer(&decoded) {
+                    return Poll::Ready(st);
+                }
+                if let Some(item) = decoded.item {
+                    Ok(item)
+                } else {
+                    return Poll::Pending;
+                }
             }
-            State::ReadRequest
-        }
-    }
+            Err(err) => Err(err),
+        };
 
-    fn unregister_keepalive(&mut self) {
-        if self.flags.contains(Flags::KEEPALIVE_REG) {
-            self.io.stop_keepalive_timer();
-            self.flags.remove(Flags::KEEPALIVE | Flags::KEEPALIVE_REG);
-        }
-    }
+        // decode incoming bytes stream
+        let st = match result {
+            Ok((mut req, pl)) => {
+                log::trace!(
+                    "{}: Http message is received: {:?} and payload {:?}",
+                    self.io.tag(),
+                    req,
+                    pl
+                );
+                req.head_mut().io = CurrentIo::Ref(self.io.get_ref());
 
-    fn handle_error<E>(&mut self, err: E, critical: bool) -> State<B>
-    where
-        E: ResponseError + 'static,
-    {
-        let res: Response = (&err).into();
-        let (res, body) = res.into_parts();
-        let state = self.send_response(res, body.into_body());
-
-        // check if we can continue after error
-        if critical || self.payload.take().is_some() {
-            self.error = Some(DispatchError::Service(Box::new(err)));
-            if matches!(state, State::SendPayload { .. }) {
-                self.flags.insert(Flags::SENDPAYLOAD_AND_STOP);
-                state
-            } else {
-                State::Stop
+                // configure request payload
+                match pl {
+                    PayloadType::None => (),
+                    PayloadType::Payload(decoder) => {
+                        let (ps, pl) = Payload::create(false);
+                        req.replace_payload(http::Payload::H1(pl));
+                        self.payload = Some((decoder, ps));
+                    }
+                    PayloadType::Stream(decoder) => {
+                        let (ps, pl) = Payload::create(false);
+                        req.replace_payload(http::Payload::H1(pl));
+                        self.payload = Some((decoder, ps));
+                    }
+                };
+                self.control(Control::new_req(req))
             }
-        } else {
-            state
-        }
+            Err(RecvError::WriteBackpressure) => {
+                if let Err(err) = ready!(self.io.poll_flush(cx, false)) {
+                    log::trace!("{}: Peer is gone with {:?}", self.io.tag(), err);
+                    self.ctl_peer_gone(Some(err))
+                } else {
+                    ready!(self.poll_read_request(cx))
+                }
+            }
+            Err(RecvError::Decoder(err)) => {
+                // Malformed requests, respond with 400
+                log::trace!("{}: Malformed request: {:?}", self.io.tag(), err);
+                self.ctl_proto_err(err.into())
+            }
+            Err(RecvError::PeerGone(err)) => {
+                log::trace!("{}: Peer is gone with {:?}", self.io.tag(), err);
+                self.ctl_peer_gone(err)
+            }
+            Err(RecvError::KeepAlive) => {
+                if self.flags.contains(Flags::READ_HDRS_TIMEOUT) {
+                    if let Err(err) = self.handle_timeout() {
+                        log::trace!("{}: Slow request timeout", self.io.tag());
+                        self.ctl_proto_err(err)
+                    } else {
+                        ready!(self.poll_read_request(cx))
+                    }
+                } else {
+                    log::trace!("{}: Keep-alive timeout, close connection", self.io.tag());
+                    self.stop()
+                }
+            }
+            Err(RecvError::Stop) => {
+                log::trace!("{}: Dispatcher is instructed to stop", self.io.tag());
+                self.stop()
+            }
+        };
+
+        Poll::Ready(st)
     }
 
-    fn service_call(&self, req: Request) -> CallState<S, X> {
-        // Handle normal requests
-        CallState::Service {
-            fut: self.config.service.call_nowait(req),
-        }
-    }
-
-    fn service_filter(&self, req: Request, f: &Pipeline<OnRequest>) -> CallState<S, X> {
-        // Handle filter fut
-        CallState::Filter {
-            fut: f.call_nowait((req, self.io.get_ref())),
-        }
-    }
-
-    fn service_expect(&self, req: Request) -> CallState<S, X> {
-        // Handle normal requests with EXPECT: 100-Continue` header
-        CallState::Expect {
-            fut: self.config.expect.call_nowait(req),
-        }
-    }
-
-    fn service_upgrade(&mut self, mut req: Request) -> CallState<S, X> {
-        // Move io into request
-        let io: IoBoxed = self.io.take().into();
-        req.head_mut().io = CurrentIo::Io(Rc::new((
-            io.get_ref(),
-            RefCell::new(Some(Box::new((io, self.codec.clone())))),
-        )));
-        // Handle upgrade requests
-        CallState::ServiceUpgrade {
-            fut: self.config.service.call_nowait(req),
-        }
-    }
-
-    fn read_request(
+    fn send_response(
         &mut self,
-        cx: &mut Context<'_>,
-        call_state: &mut std::pin::Pin<&mut CallState<S, X>>,
-    ) -> Poll<State<B>> {
-        log::trace!("trying to read http message");
+        msg: Response<()>,
+        body: ResponseBody<B>,
+    ) -> State<F, C, S, B> {
+        log::trace!(
+            "{}: Sending response: {:?} body: {:?}",
+            self.io.tag(),
+            msg,
+            body.size()
+        );
 
-        loop {
-            let result = ready!(self.io.poll_recv(&self.codec, cx));
-
-            // decode incoming bytes stream
-            return match result {
-                Ok((mut req, pl)) => {
-                    log::trace!("http message is received: {:?} and payload {:?}", req, pl);
-
-                    // keep-alive timer
-                    if self.flags.contains(Flags::KEEPALIVE_REG) {
-                        self.flags.remove(Flags::KEEPALIVE_REG);
-                        self.io.stop_keepalive_timer();
-                    }
-
-                    // configure request payload
-                    let upgrade = match pl {
-                        PayloadType::None => false,
-                        PayloadType::Payload(decoder) => {
-                            let (ps, pl) = Payload::create(false);
-                            req.replace_payload(http::Payload::H1(pl));
-                            self.payload = Some((decoder, ps));
-                            false
-                        }
-                        PayloadType::Stream(decoder) => {
-                            if self.config.upgrade.is_none() {
-                                let (ps, pl) = Payload::create(false);
-                                req.replace_payload(http::Payload::H1(pl));
-                                self.payload = Some((decoder, ps));
-                                false
-                            } else {
-                                self.flags.insert(Flags::UPGRADE);
-                                true
-                            }
-                        }
-                    };
-
-                    if upgrade {
-                        // Handle UPGRADE request
-                        log::trace!("prep io for upgrade handler");
-                        Poll::Ready(State::Upgrade(Some(req)))
-                    } else {
-                        if req.upgrade() {
-                            self.flags.insert(Flags::UPGRADE_HND);
-                        } else {
-                            req.head_mut().io = CurrentIo::Ref(self.io.get_ref());
-                        }
-                        call_state.set(if let Some(ref f) = self.config.on_request {
-                            self.service_filter(req, f)
-                        } else if req.head().expect() {
-                            self.service_expect(req)
-                        } else if self.flags.contains(Flags::UPGRADE_HND) {
-                            self.service_upgrade(req)
-                        } else {
-                            self.service_call(req)
-                        });
-                        Poll::Ready(State::Call)
-                    }
-                }
-                Err(RecvError::WriteBackpressure) => {
-                    if let Err(err) = ready!(self.io.poll_flush(cx, false)) {
-                        log::trace!("peer is gone with {:?}", err);
-                        self.error = Some(DispatchError::PeerGone(Some(err)));
-                        Poll::Ready(State::Stop)
-                    } else {
-                        continue;
-                    }
-                }
-                Err(RecvError::Decoder(err)) => {
-                    // Malformed requests, respond with 400
-                    log::trace!("malformed request: {:?}", err);
-                    let (res, body) = Response::BadRequest().finish().into_parts();
-                    self.error = Some(DispatchError::Parse(err));
-                    Poll::Ready(self.send_response(res, body.into_body()))
-                }
-                Err(RecvError::PeerGone(err)) => {
-                    log::trace!("peer is gone with {:?}", err);
-                    self.error = Some(DispatchError::PeerGone(err));
-                    Poll::Ready(State::Stop)
-                }
-                Err(RecvError::Stop) => {
-                    log::trace!("dispatcher is instructed to stop");
-                    Poll::Ready(State::Stop)
-                }
-                Err(RecvError::KeepAlive) => {
-                    // keep-alive timeout
-                    if !self.flags.contains(Flags::STARTED) {
-                        log::trace!("slow request timeout");
-                        let (req, body) = Response::RequestTimeout().finish().into_parts();
-                        let _ = self.send_response(req, body.into_body());
-                        self.error = Some(DispatchError::SlowRequestTimeout);
-                    } else {
-                        log::trace!("keep-alive timeout, close connection");
-                    }
-                    Poll::Ready(State::Stop)
-                }
-            };
-        }
-    }
-
-    fn send_response(&mut self, msg: Response<()>, body: ResponseBody<B>) -> State<B> {
-        trace!("sending response: {:?} body: {:?}", msg, body.size());
         // we dont need to process responses if socket is disconnected
         // but we still want to handle requests with app service
         // so we skip response processing for droppped connection
         if self.io.is_closed() {
-            State::Stop
+            self.stop()
         } else {
             let result = self
                 .io
@@ -634,60 +367,171 @@ where
                     err
                 });
 
-            if result.is_err() {
-                State::Stop
-            } else {
-                self.flags.set(Flags::KEEPALIVE, self.codec.keepalive());
-
-                match body.size() {
+            match result {
+                Ok(()) => match body.size() {
                     BodySize::None | BodySize::Empty => {
-                        if self.error.is_some() {
-                            State::Stop
+                        if self
+                            .flags
+                            .intersects(Flags::DISCONNECT | Flags::SENDPAYLOAD_AND_STOP)
+                        {
+                            self.stop()
                         } else if self.payload.is_some() {
                             State::ReadPayload
                         } else {
-                            self.switch_to_read_request()
+                            State::ReadRequest
                         }
                     }
                     _ => State::SendPayload { body },
-                }
+                },
+                Err(_) if self.flags.contains(Flags::DISCONNECT) => self.stop(),
+                Err(err) => self.ctl_proto_err(err.into()),
             }
         }
     }
 
-    fn send_payload(
+    fn poll_send_payload(
         &mut self,
-        item: Option<Result<Bytes, Box<dyn Error>>>,
-    ) -> Option<State<B>> {
-        match item {
-            Some(Ok(item)) => {
-                trace!("got response chunk: {:?}", item.len());
-                match self.io.encode(Message::Chunk(Some(item)), &self.codec) {
-                    Ok(_) => None,
-                    Err(err) => {
-                        self.error = Some(DispatchError::Encode(err));
-                        Some(State::Stop)
+        cx: &mut Context<'_>,
+        body: &mut ResponseBody<B>,
+    ) -> Poll<State<F, C, S, B>> {
+        if self.io.is_closed() {
+            return Poll::Ready(self.stop());
+        } else if !self.flags.contains(Flags::SENDPAYLOAD_AND_STOP) {
+            if let Poll::Ready(Some(_)) = self.poll_request_payload(cx) {
+                self.flags.insert(Flags::SENDPAYLOAD_AND_STOP);
+            }
+        }
+        loop {
+            let _ = ready!(self.io.poll_flush(cx, false));
+            let item = ready!(body.poll_next_chunk(cx));
+
+            let st = match item {
+                Some(Ok(item)) => {
+                    log::trace!("{}: Got response chunk: {:?}", self.io.tag(), item.len());
+                    match self.io.encode(Message::Chunk(Some(item)), &self.codec) {
+                        Ok(_) => continue,
+                        Err(err) => self.ctl_proto_err(err.into()),
                     }
                 }
+                None => {
+                    log::trace!("{}: Response payload eof {:?}", self.io.tag(), self.flags);
+                    if let Err(err) = self.io.encode(Message::Chunk(None), &self.codec) {
+                        self.ctl_proto_err(err.into())
+                    } else if self.flags.contains(Flags::DISCONNECT) {
+                        self.stop()
+                    } else if self.payload.is_some() {
+                        State::ReadPayload
+                    } else {
+                        State::ReadRequest
+                    }
+                }
+                Some(Err(err)) => {
+                    log::trace!(
+                        "{}: Error during response body poll: {:?}",
+                        self.io.tag(),
+                        err
+                    );
+                    self.ctl_proto_err(ProtocolError::ResponsePayload(err))
+                }
+            };
+            return Poll::Ready(st);
+        }
+    }
+
+    fn send_response_to(
+        &mut self,
+        res: Response<()>,
+        body: ResponseBody<B>,
+        io: Option<IoBoxed>,
+    ) -> State<F, C, S, B> {
+        let io = if let Some(io) = io {
+            io
+        } else if let Some((io, codec)) = res.head().io.take() {
+            self.codec = codec;
+            io
+        } else {
+            log::trace!("Handler service consumed io, stop");
+            return self.stop();
+        };
+
+        self.codec.set_ctype(ConnectionType::Close);
+        self.codec.unset_streaming();
+
+        if io
+            .encode(Message::Item((res, body.size())), &self.codec)
+            .is_ok()
+        {
+            match body.size() {
+                BodySize::None | BodySize::Empty => self.stop_io(io),
+                _ => State::SendPayloadAndStop { io, body },
             }
-            None => {
-                trace!("response payload eof {:?}", self.flags);
-                if let Err(err) = self.io.encode(Message::Chunk(None), &self.codec) {
-                    self.error = Some(DispatchError::Encode(err));
-                    Some(State::Stop)
-                } else if self.flags.contains(Flags::SENDPAYLOAD_AND_STOP) {
-                    Some(State::Stop)
-                } else if self.payload.is_some() {
-                    Some(State::ReadPayload)
-                } else {
-                    Some(self.switch_to_read_request())
+        } else {
+            self.stop_io(io)
+        }
+    }
+
+    /// send response body to specified io
+    fn poll_send_payload_to(
+        &mut self,
+        cx: &mut Context<'_>,
+        body: &mut ResponseBody<B>,
+        io: &mut IoBoxed,
+    ) -> Poll<State<F, C, S, B>> {
+        if io.is_closed() {
+            return Poll::Ready(self.stop());
+        } else if !self.flags.contains(Flags::SENDPAYLOAD_AND_STOP) {
+            if let Poll::Ready(Err(_)) = self._poll_request_payload(Some(io), cx) {
+                self.flags.insert(Flags::SENDPAYLOAD_AND_STOP);
+            }
+        }
+
+        loop {
+            let _ = ready!(io.poll_flush(cx, false));
+            match ready!(body.poll_next_chunk(cx)) {
+                Some(Ok(item)) => {
+                    if let Err(e) = io.encode(Message::Chunk(Some(item)), &self.codec) {
+                        log::trace!("{}: Cannot encode chunk: {:?}", io.tag(), e);
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    if let Err(e) = io.encode(Message::Chunk(None), &self.codec) {
+                        log::trace!("{}: Cannot encode payload eof: {:?}", io.tag(), e);
+                    }
+                }
+                Some(Err(e)) => {
+                    log::trace!("{}: error during response body poll: {:?}", io.tag(), e);
                 }
             }
-            Some(Err(e)) => {
-                trace!("error during response body poll: {:?}", e);
-                self.error = Some(DispatchError::ResponsePayload(e));
-                Some(State::Stop)
+            return Poll::Ready(self.stop_io(io.take()));
+        }
+    }
+
+    /// we might need to read more data into a request payload
+    /// (ie service future can wait for payload data)
+    fn poll_request(&mut self, cx: &mut Context<'_>) -> Poll<State<F, C, S, B>> {
+        if self.payload.is_some() {
+            if let Some(st) = ready!(self.poll_request_payload(cx)) {
+                Poll::Ready(st)
+            } else {
+                Poll::Pending
             }
+        } else {
+            // check for io changes, could close while waiting for service call
+            match ready!(self.io.poll_status_update(cx)) {
+                IoStatusUpdate::KeepAlive => Poll::Pending,
+                IoStatusUpdate::Stop | IoStatusUpdate::PeerGone(_) => {
+                    Poll::Ready(self.stop())
+                }
+                IoStatusUpdate::WriteBackpressure => Poll::Pending,
+            }
+        }
+    }
+
+    fn set_payload_error(&mut self, err: PayloadError) {
+        if let Some(mut payload) = self.payload.take() {
+            payload.1.set_error(err);
         }
     }
 
@@ -695,105 +539,305 @@ where
     fn poll_request_payload(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), DispatchError>> {
-        _poll_request_payload(&self.io, &mut self.payload, cx)
-    }
-
-    /// check for io changes, could close while waiting for service call
-    fn poll_io_closed(&self, cx: &mut Context<'_>) -> bool {
-        match self.io.poll_status_update(cx) {
-            Poll::Pending => false,
-            Poll::Ready(
-                IoStatusUpdate::KeepAlive
-                | IoStatusUpdate::Stop
-                | IoStatusUpdate::PeerGone(_),
-            ) => true,
-            Poll::Ready(IoStatusUpdate::WriteBackpressure) => false,
+    ) -> Poll<Option<State<F, C, S, B>>> {
+        if let Err(err) = ready!(self._poll_request_payload::<F>(None, cx)) {
+            Poll::Ready(Some(match err {
+                Either::Left(e) => self.ctl_proto_err(e),
+                Either::Right(e) => self.ctl_peer_gone(e),
+            }))
+        } else {
+            Poll::Ready(None)
         }
     }
-}
 
-/// Process request's payload
-fn _poll_request_payload<F>(
-    io: &Io<F>,
-    slf_payload: &mut Option<(PayloadDecoder, PayloadSender)>,
-    cx: &mut Context<'_>,
-) -> Poll<Result<(), DispatchError>> {
-    // check if payload data is required
-    let payload = if let Some(ref mut payload) = slf_payload {
-        payload
-    } else {
-        return Poll::Ready(Ok(()));
-    };
-    match payload.1.poll_data_required(cx) {
-        PayloadStatus::Read => {
-            // read request payload
-            let mut updated = false;
-            loop {
-                match io.poll_recv(&payload.0, cx) {
-                    Poll::Ready(Ok(PayloadItem::Chunk(chunk))) => {
-                        updated = true;
-                        payload.1.feed_data(chunk);
-                    }
-                    Poll::Ready(Ok(PayloadItem::Eof)) => {
-                        updated = true;
-                        payload.1.feed_eof();
-                        *slf_payload = None;
-                        break;
-                    }
-                    Poll::Ready(Err(err)) => {
-                        let err = match err {
-                            RecvError::WriteBackpressure => {
-                                if io.poll_flush(cx, false)?.is_pending() {
-                                    break;
-                                } else {
-                                    continue;
+    /// Process request's payload
+    fn _poll_request_payload<Fi>(
+        &mut self,
+        io: Option<&Io<Fi>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Either<ProtocolError, Option<io::Error>>>> {
+        // check if payload data is required
+        if self.payload.is_none() {
+            return Poll::Ready(Ok(()));
+        };
+
+        match self.payload.as_mut().unwrap().1.poll_data_required(cx) {
+            PayloadStatus::Read => {
+                // read request payload
+                let mut updated = false;
+                loop {
+                    let recv_result = io
+                        .map(|io| {
+                            io.poll_recv_decode(&self.payload.as_ref().unwrap().0, cx)
+                        })
+                        .unwrap_or_else(|| {
+                            self.io
+                                .poll_recv_decode(&self.payload.as_ref().unwrap().0, cx)
+                        });
+
+                    let res = match recv_result {
+                        Ok(decoded) => {
+                            self.update_payload_timer(&decoded);
+                            if let Some(item) = decoded.item {
+                                updated = true;
+                                Ok(item)
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
+
+                    match res {
+                        Ok(PayloadItem::Chunk(chunk)) => {
+                            self.payload.as_mut().unwrap().1.feed_data(chunk);
+                        }
+                        Ok(PayloadItem::Eof) => {
+                            self.flags.remove(Flags::READ_PL_TIMEOUT);
+                            self.payload.as_mut().unwrap().1.feed_eof();
+                            self.payload = None;
+                            break;
+                        }
+                        Err(err) => {
+                            let err = match err {
+                                RecvError::WriteBackpressure => {
+                                    let flush_result = io
+                                        .map(|io| io.poll_flush(cx, false))
+                                        .unwrap_or_else(|| self.io.poll_flush(cx, false));
+
+                                    if flush_result
+                                        .map_err(|e| Either::Right(Some(e)))?
+                                        .is_pending()
+                                    {
+                                        break;
+                                    } else {
+                                        continue;
+                                    }
                                 }
-                            }
-                            RecvError::KeepAlive => {
-                                payload.1.set_error(PayloadError::EncodingCorrupted);
-                                *slf_payload = None;
-                                io::Error::new(io::ErrorKind::Other, "Keep-alive").into()
-                            }
-                            RecvError::Stop => {
-                                payload.1.set_error(PayloadError::EncodingCorrupted);
-                                *slf_payload = None;
-                                io::Error::new(io::ErrorKind::Other, "Dispatcher stopped")
-                                    .into()
-                            }
-                            RecvError::PeerGone(err) => {
-                                payload.1.set_error(PayloadError::EncodingCorrupted);
-                                *slf_payload = None;
-                                if let Some(err) = err {
-                                    DispatchError::PeerGone(Some(err))
-                                } else {
-                                    ParseError::Incomplete.into()
+                                RecvError::KeepAlive => {
+                                    if let Err(err) = self.handle_timeout() {
+                                        Either::Left(err)
+                                    } else {
+                                        continue;
+                                    }
                                 }
-                            }
-                            RecvError::Decoder(e) => {
-                                payload.1.set_error(PayloadError::EncodingCorrupted);
-                                *slf_payload = None;
-                                DispatchError::Parse(e)
-                            }
-                        };
-                        return Poll::Ready(Err(err));
+                                RecvError::Stop => {
+                                    self.set_payload_error(PayloadError::EncodingCorrupted);
+                                    Either::Right(Some(io::Error::new(
+                                        io::ErrorKind::Other,
+                                        "Dispatcher stopped",
+                                    )))
+                                }
+                                RecvError::PeerGone(err) => {
+                                    self.set_payload_error(PayloadError::EncodingCorrupted);
+                                    Either::Right(err)
+                                }
+                                RecvError::Decoder(e) => {
+                                    self.set_payload_error(PayloadError::EncodingCorrupted);
+                                    Either::Left(ProtocolError::Decode(e))
+                                }
+                            };
+                            return Poll::Ready(Err(err));
+                        }
                     }
-                    Poll::Pending => break,
+                }
+                if updated {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
                 }
             }
-            if updated {
-                Poll::Ready(Ok(()))
-            } else {
+            PayloadStatus::Pause => {
+                // stop payload timer
+                if self.flags.contains(Flags::READ_PL_TIMEOUT) {
+                    self.flags.remove(Flags::READ_PL_TIMEOUT);
+                    self.io.stop_timer();
+                }
+                Poll::Pending
+            }
+            PayloadStatus::Dropped => {
+                // service call is not interested in payload
+                // wait until future completes and then close
+                // connection
+                self.payload = None;
+                self.flags.insert(Flags::SENDPAYLOAD_AND_STOP);
                 Poll::Pending
             }
         }
-        PayloadStatus::Pause => Poll::Pending,
-        PayloadStatus::Dropped => {
-            // service call is not interested in payload
-            // wait until future completes and then close
-            // connection
-            *slf_payload = None;
-            Poll::Ready(Err(DispatchError::PayloadIsNotConsumed))
+    }
+
+    fn handle_timeout(&mut self) -> Result<(), ProtocolError> {
+        // check read rate
+        let cfg = if self.flags.contains(Flags::READ_HDRS_TIMEOUT) {
+            &self.config.headers_read_rate
+        } else if self.flags.contains(Flags::READ_PL_TIMEOUT) {
+            &self.config.payload_read_rate
+        } else {
+            return Ok(());
+        };
+
+        if let Some(ref cfg) = cfg {
+            let total = if self.flags.contains(Flags::READ_HDRS_TIMEOUT) {
+                let total = (self.read_remains - self.read_consumed)
+                    .try_into()
+                    .unwrap_or(u16::MAX);
+                self.read_remains = 0;
+                total
+            } else {
+                let total = (self.read_remains + self.read_consumed)
+                    .try_into()
+                    .unwrap_or(u16::MAX);
+                self.read_consumed = 0;
+                total
+            };
+
+            if total > cfg.rate {
+                // update max timeout
+                if !cfg.max_timeout.is_zero() {
+                    self.read_max_timeout =
+                        Seconds(self.read_max_timeout.0.saturating_sub(cfg.timeout.0));
+                }
+
+                // start timer for next period
+                if cfg.max_timeout.is_zero() || !self.read_max_timeout.is_zero() {
+                    log::trace!(
+                        "{}: Bytes read rate {:?}, extend timer",
+                        self.io.tag(),
+                        total
+                    );
+                    self.io.start_timer(cfg.timeout);
+                    return Ok(());
+                }
+            }
+
+            log::trace!(
+                "{}: Timeout during reading, {:?}",
+                self.io.tag(),
+                self.flags
+            );
+            if self.flags.contains(Flags::READ_PL_TIMEOUT) {
+                self.set_payload_error(PayloadError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Keep-alive",
+                )));
+                Err(ProtocolError::SlowPayloadTimeout)
+            } else {
+                Err(ProtocolError::SlowRequestTimeout)
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn update_hdrs_timer(
+        &mut self,
+        decoded: &Decoded<(Request, PayloadType)>,
+    ) -> Option<State<F, C, S, B>> {
+        // got parsed frame
+        if decoded.item.is_some() {
+            self.read_remains = 0;
+            self.flags.remove(
+                Flags::READ_KA_TIMEOUT | Flags::READ_HDRS_TIMEOUT | Flags::READ_PL_TIMEOUT,
+            );
+        } else if self.flags.contains(Flags::READ_HDRS_TIMEOUT) {
+            // received new data but not enough for parsing complete frame
+            self.read_remains = decoded.remains as u32;
+        } else if self.read_remains == 0 && decoded.remains == 0 {
+            // no new data, start keep-alive timer
+            if self.codec.keepalive() {
+                if !self.flags.contains(Flags::READ_KA_TIMEOUT)
+                    && self.config.keep_alive_enabled()
+                {
+                    log::debug!(
+                        "{}: Start keep-alive timer {:?}",
+                        self.io.tag(),
+                        self.config.keep_alive
+                    );
+                    self.flags.insert(Flags::READ_KA_TIMEOUT);
+                    self.io.start_timer(self.config.keep_alive);
+                }
+            } else {
+                self.io.close();
+                return Some(self.stop());
+            }
+        } else if let Some(ref cfg) = self.config.headers_read_rate {
+            log::debug!(
+                "{}: Start headers read timer {:?}",
+                self.io.tag(),
+                cfg.timeout
+            );
+
+            // we got new data but not enough to parse single frame
+            // start read timer
+            self.flags
+                .remove(Flags::READ_KA_TIMEOUT | Flags::READ_PL_TIMEOUT);
+            self.flags.insert(Flags::READ_HDRS_TIMEOUT);
+
+            self.read_consumed = 0;
+            self.read_remains = decoded.remains as u32;
+            self.read_max_timeout = cfg.max_timeout;
+            self.io.start_timer(cfg.timeout);
+        }
+        None
+    }
+
+    fn update_payload_timer(&mut self, decoded: &Decoded<PayloadItem>) {
+        if self.flags.contains(Flags::READ_PL_TIMEOUT) {
+            self.read_remains = decoded.remains as u32;
+            self.read_consumed += decoded.consumed as u32;
+        } else if let Some(ref cfg) = self.config.payload_read_rate {
+            log::debug!("{}: Start payload timer {:?}", self.io.tag(), cfg.timeout);
+
+            // start payload timer
+            self.flags.insert(Flags::READ_PL_TIMEOUT);
+
+            self.read_remains = decoded.remains as u32;
+            self.read_consumed = decoded.consumed as u32;
+            self.read_max_timeout = cfg.max_timeout;
+            self.io.start_timer(cfg.timeout);
+        }
+    }
+
+    fn publish(&self, req: Request) -> State<F, C, S, B> {
+        State::CallPublish {
+            fut: self.config.service.call_nowait(req),
+        }
+    }
+
+    fn control(&self, req: Control<F, S::Error>) -> State<F, C, S, B> {
+        State::CallControl {
+            fut: self.config.control.call_nowait(req),
+        }
+    }
+
+    fn ctl_proto_err(&self, err: ProtocolError) -> State<F, C, S, B> {
+        State::CallControl {
+            fut: self.config.control.call_nowait(Control::proto_err(err)),
+        }
+    }
+
+    fn ctl_peer_gone(&self, err: Option<io::Error>) -> State<F, C, S, B> {
+        State::CallControl {
+            fut: self.config.control.call_nowait(Control::peer_gone(err)),
+        }
+    }
+
+    fn ctl_upgrade(&mut self, req: Request) -> State<F, C, S, B> {
+        let msg = Control::upgrade(req, self.io.take(), self.codec.clone());
+        self.control(msg)
+    }
+
+    fn stop(&mut self) -> State<F, C, S, B> {
+        State::Stop {
+            io: None,
+            fut: Some(self.config.control.call_nowait(Control::closed())),
+        }
+    }
+
+    fn stop_io(&mut self, io: IoBoxed) -> State<F, C, S, B> {
+        State::Stop {
+            io: Some(io),
+            fut: Some(self.config.control.call_nowait(Control::closed())),
         }
     }
 }
@@ -801,19 +845,19 @@ fn _poll_request_payload<F>(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::{cell::Cell, io, sync::Arc};
+    use std::{cell::Cell, future::poll_fn, future::Future, sync::Arc};
 
     use ntex_h2::Config;
     use rand::Rng;
 
     use super::*;
-    use crate::http::config::{DispatcherConfig, ServiceConfig};
-    use crate::http::h1::{ClientCodec, ExpectHandler, UpgradeHandler};
-    use crate::http::{body, Request, ResponseHead, StatusCode};
+    use crate::http::config::ServiceConfig;
+    use crate::http::h1::{ClientCodec, DefaultControlService};
+    use crate::http::{body, ResponseHead, StatusCode};
     use crate::io::{self as nio, Base};
-    use crate::service::{boxed, fn_service, IntoService};
-    use crate::util::{lazy, poll_fn, stream_recv, Bytes, BytesMut};
-    use crate::{codec::Decoder, testing::Io, time::sleep, time::Millis, time::Seconds};
+    use crate::service::{fn_service, IntoService};
+    use crate::util::{lazy, stream_recv, Bytes, BytesMut};
+    use crate::{codec::Decoder, testing::Io, time::sleep, time::Millis};
 
     const BUFFER_SIZE: usize = 32_768;
 
@@ -821,7 +865,7 @@ mod tests {
     pub(crate) fn h1<F, S, B>(
         stream: Io,
         service: F,
-    ) -> Dispatcher<Base, S, B, ExpectHandler, UpgradeHandler<Base>>
+    ) -> Dispatcher<Base, S, B, DefaultControlService>
     where
         F: IntoService<S, Request>,
         S: Service<Request>,
@@ -831,7 +875,7 @@ mod tests {
     {
         let config = ServiceConfig::new(
             Seconds(5).into(),
-            Millis(1_000),
+            Seconds(1),
             Seconds::ZERO,
             Millis(5_000),
             Config::server(),
@@ -841,9 +885,7 @@ mod tests {
             Rc::new(DispatcherConfig::new(
                 config,
                 service.into_service(),
-                ExpectHandler,
-                None,
-                None,
+                DefaultControlService,
             )),
         )
     }
@@ -856,18 +898,14 @@ mod tests {
         S::Response: Into<Response<B>>,
         B: MessageBody + 'static,
     {
-        crate::rt::spawn(
-            Dispatcher::<Base, S, B, ExpectHandler, UpgradeHandler<Base>>::new(
-                nio::Io::new(stream),
-                Rc::new(DispatcherConfig::new(
-                    ServiceConfig::default(),
-                    service.into_service(),
-                    ExpectHandler,
-                    None,
-                    None,
-                )),
-            ),
-        );
+        crate::rt::spawn(Dispatcher::<Base, S, B, _>::new(
+            nio::Io::new(stream),
+            Rc::new(DispatcherConfig::new(
+                ServiceConfig::default(),
+                service.into_service(),
+                DefaultControlService,
+            )),
+        ));
     }
 
     fn load(decoder: &mut ClientCodec, buf: &mut BytesMut) -> ResponseHead {
@@ -884,26 +922,24 @@ mod tests {
         let data2 = data.clone();
         let config = ServiceConfig::new(
             Seconds(5).into(),
-            Millis(1_000),
+            Seconds(1),
             Seconds::ZERO,
             Millis(5_000),
             Config::server(),
         );
-        let mut h1 = Dispatcher::<_, _, _, _, UpgradeHandler<Base>>::new(
+        let mut h1 = Dispatcher::<_, _, _, _>::new(
             nio::Io::new(server),
             Rc::new(DispatcherConfig::new(
                 config,
                 fn_service(|_| {
                     Box::pin(async { Ok::<_, io::Error>(Response::Ok().finish()) })
                 }),
-                ExpectHandler,
-                None,
-                Some(boxed::service(crate::service::into_service(
-                    move |(req, _)| {
+                fn_service(move |req: Control<_, _>| {
+                    if let Control::NewRequest(_) = req {
                         data2.set(true);
-                        Box::pin(async move { Ok(req) })
-                    },
-                ))),
+                    }
+                    async move { Ok::<_, std::convert::Infallible>(req.ack()) }
+                }),
             )),
         );
         sleep(Millis(50)).await;
@@ -972,7 +1008,6 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_pipeline_with_payload() {
-        env_logger::init();
         let (client, server) = Io::create();
         client.remote_buffer_cap(4096);
         let mut decoder = ClientCodec::default();
@@ -1095,9 +1130,7 @@ mod tests {
 
         assert!(lazy(|cx| Pin::new(&mut h1).poll(cx)).await.is_pending());
         sleep(Millis(50)).await;
-        crate::util::poll_fn(|cx| Pin::new(&mut h1).poll(cx))
-            .await
-            .unwrap();
+        poll_fn(|cx| Pin::new(&mut h1).poll(cx)).await.unwrap();
         assert!(h1.inner.io.is_closed());
 
         let mut buf = BytesMut::from(&client.read().await.unwrap()[..]);
@@ -1153,7 +1186,7 @@ mod tests {
             fn poll_next_chunk(
                 &mut self,
                 _: &mut Context<'_>,
-            ) -> Poll<Option<Result<Bytes, Box<dyn std::error::Error>>>> {
+            ) -> Poll<Option<Result<Bytes, Box<dyn error::Error>>>> {
                 let data = rand::thread_rng()
                     .sample_iter(&rand::distributions::Alphanumeric)
                     .take(65_536)
@@ -1208,7 +1241,7 @@ mod tests {
             fn poll_next_chunk(
                 &mut self,
                 _: &mut Context<'_>,
-            ) -> Poll<Option<Result<Bytes, Box<dyn std::error::Error>>>> {
+            ) -> Poll<Option<Result<Bytes, Box<dyn error::Error>>>> {
                 if self.0 {
                     Poll::Pending
                 } else {
@@ -1266,5 +1299,73 @@ mod tests {
         let buf = client.local_buffer(|buf| buf.split());
         assert_eq!(&buf[..28], b"HTTP/1.1 500 Internal Server");
         assert_eq!(&buf[buf.len() - 5..], b"error");
+    }
+
+    #[crate::rt_test]
+    async fn test_payload_timeout() {
+        let mark = Arc::new(AtomicUsize::new(0));
+        let mark2 = mark.clone();
+        let err_mark = Arc::new(AtomicUsize::new(0));
+        let err_mark2 = err_mark.clone();
+
+        let (client, server) = Io::create();
+        client.remote_buffer_cap(4096);
+
+        let svc = move |mut req: Request| {
+            let m = mark2.clone();
+            async move {
+                // read one chunk
+                let mut pl = req.take_payload();
+                while let Some(item) = stream_recv(&mut pl).await {
+                    let size = m.load(Ordering::Relaxed);
+                    if let Ok(buf) = item {
+                        m.store(size + buf.len(), Ordering::Relaxed);
+                    } else {
+                        return Ok::<_, io::Error>(Response::Ok().finish());
+                    }
+                }
+                Ok::<_, io::Error>(Response::Ok().finish())
+            }
+        };
+
+        let mut config = ServiceConfig::new(
+            Seconds(5).into(),
+            Seconds(1),
+            Seconds::ZERO,
+            Millis(5_000),
+            Config::server(),
+        );
+        config.payload_read_rate(Seconds(1), Seconds(2), 512);
+        let disp: Dispatcher<Base, _, _, _> = Dispatcher::new(
+            nio::Io::new(server),
+            Rc::new(DispatcherConfig::new(
+                config,
+                svc.into_service(),
+                fn_service(move |msg: Control<_, _>| {
+                    if let Control::ProtocolError(ref err) = msg {
+                        if matches!(err.err(), ProtocolError::SlowPayloadTimeout) {
+                            err_mark2.store(
+                                err_mark2.load(Ordering::Relaxed) + 1,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    async move { Ok::<_, io::Error>(msg.ack()) }
+                }),
+            )),
+        );
+        crate::rt::spawn(disp);
+
+        client.write("GET /test HTTP/1.1\r\nContent-Length: 1048576\r\n\r\n");
+        sleep(Millis(50)).await;
+
+        // send partial data to server
+        for _ in 1..8 {
+            let random_bytes: Vec<u8> = (0..256).map(|_| rand::random::<u8>()).collect();
+            client.write(random_bytes);
+            sleep(Millis(750)).await;
+        }
+        assert!(mark.load(Ordering::Relaxed) == 1536);
+        assert!(err_mark.load(Ordering::Relaxed) == 1);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ntex-service"
-version = "1.2.6"
+version = "3.0.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "ntex service"
 keywords = ["network", "framework", "async", "futures"]
@@ -8,7 +8,7 @@ homepage = "https://ntex.rs"
 repository = "https://github.com/ntex-rs/ntex.git"
 documentation = "https://docs.rs/ntex-service/"
 categories = ["network-programming", "asynchronous"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 [lib]
@@ -16,9 +16,8 @@ name = "ntex_service"
 path = "src/lib.rs"
 
 [dependencies]
-pin-project-lite = "0.2.6"
 slab = "0.4"
 
 [dev-dependencies]
-ntex = { version = "0.7.0", features = ["tokio"] }
-ntex-util = "0.3.0"
+ntex = { version = "2", features = ["tokio"] }
+ntex-util = "2"

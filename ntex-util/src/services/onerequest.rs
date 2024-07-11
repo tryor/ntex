@@ -1,7 +1,7 @@
 //! Service that limits number of in-flight async requests to 1.
-use std::{cell::Cell, future::Future, pin::Pin, task::Context, task::Poll};
+use std::{cell::Cell, future::poll_fn, task::Poll};
 
-use ntex_service::{IntoService, Middleware, Service, ServiceCall, ServiceCtx};
+use ntex_service::{Middleware, Service, ServiceCtx};
 
 use crate::task::LocalWaker;
 
@@ -30,13 +30,12 @@ pub struct OneRequestService<S> {
 }
 
 impl<S> OneRequestService<S> {
-    pub fn new<U, R>(service: U) -> Self
+    pub fn new<R>(service: S) -> Self
     where
         S: Service<R>,
-        U: IntoService<S, R>,
     {
         Self {
-            service: service.into_service(),
+            service,
             ready: Cell::new(true),
             waker: LocalWaker::new(),
         }
@@ -49,77 +48,56 @@ where
 {
     type Response = T::Response;
     type Error = T::Error;
-    type Future<'f> = OneRequestServiceResponse<'f, T, R> where Self: 'f, R: 'f;
 
     #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.waker.register(cx.waker());
-        if self.service.poll_ready(cx)?.is_pending() {
-            Poll::Pending
-        } else if self.ready.get() {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        poll_fn(|cx| {
+            self.waker.register(cx.waker());
+            if self.ready.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        ctx.ready(&self.service).await
     }
 
     #[inline]
-    fn call<'a>(&'a self, req: R, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
+    async fn call(
+        &self,
+        req: R,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
         self.ready.set(false);
 
-        OneRequestServiceResponse {
-            fut: ctx.call(&self.service, req),
-            service: self,
-        }
-    }
-
-    ntex_service::forward_poll_shutdown!(service);
-}
-
-pin_project_lite::pin_project! {
-    #[doc(hidden)]
-    pub struct OneRequestServiceResponse<'f, T: Service<R>, R>
-    where T: 'f, R: 'f
-    {
-        #[pin]
-        fut: ServiceCall<'f, T, R>,
-        service: &'f OneRequestService<T>,
-    }
-}
-
-impl<'f, T: Service<R>, R> Future for OneRequestServiceResponse<'f, T, R> {
-    type Output = Result<T::Response, T::Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = self.as_mut().project().fut.poll(cx);
-        if result.is_ready() {
-            self.service.ready.set(true);
-            self.service.waker.wake();
-        }
+        let result = ctx.call(&self.service, req).await;
+        self.ready.set(true);
+        self.waker.wake();
         result
     }
+
+    ntex_service::forward_shutdown!(service);
 }
 
 #[cfg(test)]
 mod tests {
-    use ntex_service::{apply, fn_factory, Pipeline, Service, ServiceCtx, ServiceFactory};
-    use std::{cell::RefCell, task::Poll, time::Duration};
+    use ntex_service::{apply, fn_factory, Pipeline, ServiceFactory};
+    use std::{cell::RefCell, time::Duration};
 
     use super::*;
-    use crate::{channel::oneshot, future::lazy, future::BoxFuture};
+    use crate::{channel::oneshot, future::lazy};
 
     struct SleepService(oneshot::Receiver<()>);
 
     impl Service<()> for SleepService {
         type Response = ();
         type Error = ();
-        type Future<'f> = BoxFuture<'f, Result<(), ()>>;
 
-        fn call<'a>(&'a self, _: (), _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-            Box::pin(async move {
-                let _ = self.0.recv().await;
-                Ok::<_, ()>(())
-            })
+        async fn call(&self, _: (), _: ServiceCtx<'_, Self>) -> Result<(), ()> {
+            let _ = self.0.recv().await;
+            Ok::<_, ()>(())
         }
     }
 
@@ -127,7 +105,7 @@ mod tests {
     async fn test_oneshot() {
         let (tx, rx) = oneshot::channel();
 
-        let srv = Pipeline::new(OneRequestService::new(SleepService(rx)));
+        let srv = Pipeline::new(OneRequestService::new(SleepService(rx))).bind();
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
 
         let srv2 = srv.clone();
@@ -140,7 +118,7 @@ mod tests {
         let _ = tx.send(());
         crate::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
-        assert!(lazy(|cx| srv.poll_shutdown(cx)).await.is_ready());
+        assert_eq!(srv.shutdown().await, ());
     }
 
     #[ntex_macros::rt_test2]
@@ -157,7 +135,7 @@ mod tests {
             }),
         );
 
-        let srv = srv.pipeline(&()).await.unwrap();
+        let srv = srv.pipeline(&()).await.unwrap().bind();
         assert_eq!(lazy(|cx| srv.poll_ready(cx)).await, Poll::Ready(Ok(())));
 
         let srv2 = srv.clone();

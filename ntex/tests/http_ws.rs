@@ -1,11 +1,12 @@
-use std::{cell::Cell, io, sync::Arc, sync::Mutex, task::Context, task::Poll};
+use std::{cell::Cell, io, sync::Arc, sync::Mutex};
 
 use ntex::codec::BytesCodec;
 use ntex::http::test::server as test_server;
 use ntex::http::{body, h1, test, HttpService, Request, Response, StatusCode};
 use ntex::io::{DispatchItem, Dispatcher, Io};
-use ntex::service::{fn_factory, Service, ServiceCtx};
-use ntex::util::{BoxFuture, ByteString, Bytes, Ready};
+use ntex::service::{Pipeline, Service, ServiceCtx};
+use ntex::time::Seconds;
+use ntex::util::{ByteString, Bytes, Ready};
 use ntex::ws::{self, handshake, handshake_response};
 
 struct WsService(Arc<Mutex<Cell<bool>>>);
@@ -33,30 +34,28 @@ impl Clone for WsService {
 impl Service<(Request, Io, h1::Codec)> for WsService {
     type Response = ();
     type Error = io::Error;
-    type Future<'f> = BoxFuture<'f, Result<(), io::Error>>;
 
-    fn poll_ready(&self, _ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
         self.set_polled();
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
-    fn call<'a>(
-        &'a self,
+    async fn call(
+        &self,
         (req, io, codec): (Request, Io, h1::Codec),
-        _: ServiceCtx<'a, Self>,
-    ) -> Self::Future<'a> {
-        let fut = async move {
-            let res = handshake(req.head()).unwrap().message_body(());
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<(), io::Error> {
+        let res = handshake(req.head()).unwrap().message_body(());
 
-            io.encode((res, body::BodySize::None).into(), &codec)
-                .unwrap();
+        io.encode((res, body::BodySize::None).into(), &codec)
+            .unwrap();
 
-            Dispatcher::new(io.seal(), ws::Codec::new(), service)
-                .await
-                .map_err(|_| panic!())
-        };
+        let cfg = ntex_io::DispatcherConfig::default();
+        cfg.set_keepalive_timeout(Seconds(0));
 
-        Box::pin(fut)
+        Dispatcher::new(io.seal(), ws::Codec::new(), service, &cfg)
+            .await
+            .map_err(|_| panic!())
     }
 }
 
@@ -83,11 +82,22 @@ async fn test_simple() {
     let mut srv = test::server({
         let ws_service = ws_service.clone();
         move || {
-            let ws_service = ws_service.clone();
+            let ws_service = Pipeline::new(ws_service.clone());
             HttpService::build()
-                .upgrade(fn_factory(move || {
-                    Ready::Ok::<_, io::Error>(ws_service.clone())
-                }))
+                .keep_alive(1)
+                .headers_read_rate(Seconds(1), Seconds::ZERO, 16)
+                .payload_read_rate(Seconds(1), Seconds::ZERO, 16)
+                .h1_control(move |req: h1::Control<_, _>| {
+                    let ack = if let h1::Control::Upgrade(upg) = req {
+                        let ws_service = ws_service.clone();
+                        upg.handle(|req, io, codec| async move {
+                            ws_service.call((req, io, codec)).await
+                        })
+                    } else {
+                        req.ack()
+                    };
+                    async move { Ok::<_, io::Error>(ack) }
+                })
                 .h1(|_| Ready::Ok::<_, io::Error>(Response::NotFound()))
         }
     });
@@ -247,27 +257,32 @@ async fn test_simple() {
 async fn test_transport() {
     let mut srv = test_server(|| {
         HttpService::build()
-            .upgrade(|(req, io, codec): (Request, Io, h1::Codec)| {
-                async move {
-                    let res = handshake_response(req.head()).finish();
+            .h1_control(move |req: h1::Control<_, _>| {
+                let ack = if let h1::Control::Upgrade(upg) = req {
+                    upg.handle(|req, io, codec| async move {
+                        let res = handshake_response(req.head()).finish();
 
-                    // send handshake respone
-                    io.encode(
-                        h1::Message::Item((res.drop_body(), body::BodySize::None)),
-                        &codec,
-                    )
-                    .unwrap();
+                        // send handshake respone
+                        io.encode(
+                            h1::Message::Item((res.drop_body(), body::BodySize::None)),
+                            &codec,
+                        )
+                        .unwrap();
 
-                    let io = ws::WsTransport::create(io, ws::Codec::default());
+                        let io = ws::WsTransport::create(io, ws::Codec::default());
 
-                    // start websocket service
-                    while let Some(item) =
-                        io.recv(&BytesCodec).await.map_err(|e| e.into_inner())?
-                    {
-                        io.send(item.freeze(), &BytesCodec).await.unwrap()
-                    }
-                    Ok::<_, io::Error>(())
-                }
+                        // start websocket service
+                        while let Some(item) =
+                            io.recv(&BytesCodec).await.map_err(|e| e.into_inner())?
+                        {
+                            io.send(item.freeze(), &BytesCodec).await.unwrap()
+                        }
+                        Ok::<_, io::Error>(())
+                    })
+                } else {
+                    req.ack()
+                };
+                async move { Ok::<_, io::Error>(ack) }
             })
             .finish(|_| Ready::Ok::<_, io::Error>(Response::NotFound()))
     });

@@ -85,6 +85,7 @@ impl HeaderValue {
         let mut i = 0;
         while i < bytes.len() {
             if !is_visible_ascii(bytes[i]) {
+                #[allow(clippy::out_of_bounds_indexing)]
                 ([] as [u8; 0])[0]; // Invalid header value
             }
             i += 1;
@@ -545,7 +546,7 @@ impl PartialEq for HeaderValue {
 impl PartialOrd for HeaderValue {
     #[inline]
     fn partial_cmp(&self, other: &HeaderValue) -> Option<cmp::Ordering> {
-        self.inner.partial_cmp(&other.inner)
+        Some(self.cmp(other))
     }
 }
 
@@ -707,7 +708,7 @@ macro_rules! from_integers {
             let val = HeaderValue::from(n);
             assert_eq!(val, &n.to_string());
 
-            let n = ::std::$t::MAX;
+            let n = $t::MAX;
             let val = HeaderValue::from(n);
             assert_eq!(val, &n.to_string());
         }

@@ -1,10 +1,11 @@
 //! utilities and helpers for testing
+#![allow(clippy::let_underscore_future)]
+use std::future::{poll_fn, Future};
 use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll, Waker};
-use std::{any, cell::RefCell, cmp, fmt, future::Future, io, mem, net, pin::Pin, rc::Rc};
+use std::{any, cell::RefCell, cmp, fmt, io, mem, net, pin::Pin, rc::Rc};
 
 use ntex_bytes::{Buf, BufMut, Bytes, BytesVec};
-use ntex_util::future::poll_fn;
 use ntex_util::time::{sleep, Millis, Sleep};
 
 use crate::{types, Handle, IoStream, ReadContext, ReadStatus, WriteContext, WriteStatus};
@@ -37,6 +38,7 @@ pub struct IoTest {
 }
 
 bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct IoTestFlags: u8 {
         const FLUSHED = 0b0000_0001;
         const CLOSED  = 0b0000_0010;
@@ -354,11 +356,11 @@ impl IoStream for IoTest {
     fn start(self, read: ReadContext, write: WriteContext) -> Option<Box<dyn Handle>> {
         let io = Rc::new(self);
 
-        ntex_util::spawn(ReadTask {
+        let _ = ntex_util::spawn(ReadTask {
             io: io.clone(),
             state: read,
         });
-        ntex_util::spawn(WriteTask {
+        let _ = ntex_util::spawn(WriteTask {
             io: io.clone(),
             state: write,
             st: IoWriteState::Processing(None),
@@ -565,7 +567,7 @@ impl Future for WriteTask {
                                         log::trace!("write task is stopped");
                                         return Poll::Ready(());
                                     }
-                                    Poll::Ready(Ok(n)) if n == 0 => {
+                                    Poll::Ready(Ok(0)) => {
                                         this.state.close(None);
                                         log::trace!("write task is stopped");
                                         return Poll::Ready(());
@@ -683,5 +685,11 @@ mod tests {
 
         let res = lazy(|cx| server2.poll_write_buf(cx, b"123")).await;
         assert!(res.is_pending());
+
+        let (client, _) = IoTest::create();
+        let addr: net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let client = crate::Io::new(client.set_peer_addr(addr));
+        let item = client.query::<crate::types::PeerAddr>();
+        assert!(format!("{:?}", item).contains("QueryItem(127.0.0.1:8080)"));
     }
 }

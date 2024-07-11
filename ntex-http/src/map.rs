@@ -45,7 +45,7 @@ impl Value {
         }
     }
 
-    fn append(&mut self, val: HeaderValue) {
+    pub(crate) fn append(&mut self, val: HeaderValue) {
         match self {
             Value::One(prev_val) => {
                 let prev_val = std::mem::replace(prev_val, val);
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::needless_borrow)]
+    #[allow(clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
     fn test_basics() {
         let m = HeaderMap::default();
         assert!(m.is_empty());

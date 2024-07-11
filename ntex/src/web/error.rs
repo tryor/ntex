@@ -8,7 +8,6 @@ pub use serde_json::error::Error as JsonError;
 #[cfg(feature = "url")]
 pub use url_pkg::ParseError as UrlParseError;
 
-use super::{HttpRequest, HttpResponse};
 use crate::http::body::Body;
 use crate::http::helpers::Writer;
 use crate::http::{error, header, StatusCode};
@@ -16,6 +15,8 @@ use crate::util::{BytesMut, Either};
 
 pub use super::error_default::{DefaultError, Error};
 pub use crate::http::error::BlockingError;
+
+use super::{HttpRequest, HttpResponse};
 
 pub trait ErrorRenderer: Sized + 'static {
     type Container: ErrorContainer;
@@ -83,10 +84,6 @@ pub enum StateExtractorError {
     #[error("App state is not configured, to configure use App::state()")]
     NotConfigured,
 }
-
-#[deprecated]
-#[doc(hidden)]
-pub type DataExtractorError = StateExtractorError;
 
 /// Errors which can occur when attempting to generate resource uri.
 #[derive(Error, Debug, Copy, Clone, PartialEq, Eq)]
@@ -682,9 +679,9 @@ mod tests {
     use std::io;
 
     use super::*;
+    use crate::http;
     use crate::http::client::error::{ConnectError, SendRequestError};
     use crate::web::test::TestRequest;
-    use crate::web::DefaultError;
 
     #[test]
     fn test_into_error() {
@@ -715,6 +712,12 @@ mod tests {
             &req,
         );
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let resp = WebResponseError::<DefaultError>::error_response(
+            &TimeoutError::<UrlencodedError>::Service(UrlencodedError::Chunked),
+            &req,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = WebResponseError::<DefaultError>::error_response(
             &SendRequestError::Connect(ConnectError::Timeout),
@@ -754,6 +757,15 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let err = PayloadError::Decoding;
+        let resp = WebResponseError::<DefaultError>::error_response(&err, &req);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        #[allow(invalid_from_utf8)]
+        let err = std::str::from_utf8(b"\xF0").unwrap_err();
+        let resp = WebResponseError::<DefaultError>::error_response(&err, &req);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let err = http::error::PayloadError::EncodingCorrupted;
         let resp = WebResponseError::<DefaultError>::error_response(&err, &req);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }

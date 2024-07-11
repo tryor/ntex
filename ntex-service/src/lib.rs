@@ -1,14 +1,12 @@
 //! See [`Service`] docs for information on this crate's foundational trait.
+#![allow(async_fn_in_trait)]
 #![deny(
     rust_2018_idioms,
     warnings,
     unreachable_pub,
     missing_debug_implementations
 )]
-
-use std::future::Future;
 use std::rc::Rc;
-use std::task::{self, Context, Poll};
 
 mod and_then;
 mod apply;
@@ -25,15 +23,16 @@ mod map_init_err;
 mod middleware;
 mod pipeline;
 mod then;
+mod util;
 
 pub use self::apply::{apply_fn, apply_fn_factory};
 pub use self::chain::{chain, chain_factory};
-pub use self::ctx::{ServiceCall, ServiceCallToCall, ServiceCtx};
+pub use self::ctx::ServiceCtx;
 pub use self::fn_service::{fn_factory, fn_factory_with_config, fn_service};
 pub use self::fn_shutdown::fn_shutdown;
 pub use self::map_config::{map_config, unit_config};
 pub use self::middleware::{apply, Identity, Middleware, Stack};
-pub use self::pipeline::{Pipeline, PipelineCall};
+pub use self::pipeline::{Pipeline, PipelineBinding, PipelineCall};
 
 #[allow(unused_variables)]
 /// An asynchronous function of `Request` to a `Response`.
@@ -62,8 +61,6 @@ pub use self::pipeline::{Pipeline, PipelineCall};
 ///
 /// ```rust
 /// # use std::convert::Infallible;
-/// # use std::future::Future;
-/// # use std::pin::Pin;
 /// #
 /// # use ntex_service::{Service, ServiceCtx};
 ///
@@ -72,10 +69,9 @@ pub use self::pipeline::{Pipeline, PipelineCall};
 /// impl Service<u8> for MyService {
 ///     type Response = u64;
 ///     type Error = Infallible;
-///     type Future<'f> = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 ///
-///     fn call<'a>(&'a self, req: u8, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-///         Box::pin(std::future::ready(Ok(req as u64)))
+///     async fn call(&self, req: u8, ctx: ServiceCtx<'_, Self>) -> Result<Self::Response, Self::Error> {
+///         Ok(req as u64)
 ///     }
 /// }
 /// ```
@@ -87,7 +83,7 @@ pub use self::pipeline::{Pipeline, PipelineCall};
 /// async fn my_service(req: u8) -> Result<u64, Infallible>;
 /// ```
 ///
-/// Service cannot be called directly, it must be wrapped to an instance of [`Container`] or
+/// Service cannot be called directly, it must be wrapped to an instance of [`Pipeline``] or
 /// by using `ctx` argument of the call method in case of chanined services.
 ///
 pub trait Service<Req> {
@@ -97,47 +93,36 @@ pub trait Service<Req> {
     /// Errors produced by the service when polling readiness or executing call.
     type Error;
 
-    /// The future response value.
-    type Future<'f>: Future<Output = Result<Self::Response, Self::Error>>
-    where
-        Req: 'f,
-        Self: 'f;
-
     /// Process the request and return the response asynchronously.
     ///
     /// This function is expected to be callable off-task. As such, implementations of `call`
     /// should take care to not call `poll_ready`. Caller of the service verifies readiness,
     /// Only way to make a `call` is to use `ctx` argument, it enforces readiness before calling
     /// service.
-    fn call<'a>(&'a self, req: Req, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a>;
+    async fn call(
+        &self,
+        req: Req,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error>;
 
     #[inline]
-    /// Returns `Ready` when the service is able to process requests.
+    /// Returns when the service is able to process requests.
     ///
-    /// If the service is at capacity, then `Pending` is returned and the task is notified when
+    /// If the service is at capacity, then `ready` does not returns and the task is notified when
     /// the service becomes ready again. This function is expected to be called while on a task.
     ///
     /// This is a **best effort** implementation. False positives are permitted. It is permitted for
-    /// the service to return `Ready` from a `poll_ready` call and the next invocation of `call`
+    /// the service to returns from a `ready` call and the next invocation of `call`
     /// results in an error.
-    ///
-    /// # Notes
-    ///
-    /// 1. `.poll_ready()` might be called on different task from actual service call.
-    /// 2. In case of chained services, `.poll_ready()` is called for all services at once.
-    /// 3. Every `.call()` in chained services enforces readiness.
-    fn poll_ready(&self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     #[inline]
     /// Shutdown service.
     ///
-    /// Returns `Ready` when the service is properly shutdowns. This method might be called
-    /// after it returns `Ready`.
-    fn poll_shutdown(&self, cx: &mut task::Context<'_>) -> Poll<()> {
-        Poll::Ready(())
-    }
+    /// Returns when the service is properly shutdowns.
+    async fn shutdown(&self) {}
 
     #[inline]
     /// Map this service's output to a different type, returning a new service of the resulting type.
@@ -170,15 +155,6 @@ pub trait Service<Req> {
     {
         chain(dev::MapErr::new(self, f))
     }
-
-    #[inline]
-    /// Convert `Self` to a `ServiceChain`
-    fn chain(self) -> dev::ServiceChain<Self, Req>
-    where
-        Self: Sized,
-    {
-        chain(self)
-    }
 }
 
 /// Factory for creating `Service`s.
@@ -205,21 +181,16 @@ pub trait ServiceFactory<Req, Cfg = ()> {
     /// Errors potentially raised while building a service.
     type InitError;
 
-    /// The future of the `ServiceFactory` instance.
-    type Future<'f>: Future<Output = Result<Self::Service, Self::InitError>>
-    where
-        Cfg: 'f,
-        Self: 'f;
-
     /// Create and return a new service value asynchronously.
-    fn create(&self, cfg: Cfg) -> Self::Future<'_>;
+    async fn create(&self, cfg: Cfg) -> Result<Self::Service, Self::InitError>;
 
+    #[inline]
     /// Create and return a new service value asynchronously and wrap into a container
-    fn pipeline(&self, cfg: Cfg) -> dev::CreatePipeline<'_, Self, Req, Cfg>
+    async fn pipeline(&self, cfg: Cfg) -> Result<Pipeline<Self::Service>, Self::InitError>
     where
         Self: Sized,
     {
-        dev::CreatePipeline::new(self.create(cfg))
+        Ok(Pipeline::new(self.create(cfg).await?))
     }
 
     #[inline]
@@ -269,21 +240,24 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future<'f> = S::Future<'f> where 'a: 'f, Req: 'f;
 
     #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
-        (**self).poll_ready(cx)
+    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), S::Error> {
+        ctx.ready(&**self).await
     }
 
     #[inline]
-    fn poll_shutdown(&self, cx: &mut Context<'_>) -> Poll<()> {
-        (**self).poll_shutdown(cx)
+    async fn shutdown(&self) {
+        (**self).shutdown().await
     }
 
     #[inline]
-    fn call<'s>(&'s self, request: Req, ctx: ServiceCtx<'s, Self>) -> S::Future<'s> {
-        ctx.call_nowait(&**self, request)
+    async fn call(
+        &self,
+        request: Req,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        ctx.call_nowait(&**self, request).await
     }
 }
 
@@ -293,21 +267,24 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future<'f> = S::Future<'f> where S: 'f, Req: 'f;
 
     #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
-        (**self).poll_ready(cx)
+    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), S::Error> {
+        ctx.ready(&**self).await
     }
 
     #[inline]
-    fn poll_shutdown(&self, cx: &mut Context<'_>) -> Poll<()> {
-        (**self).poll_shutdown(cx)
+    async fn shutdown(&self) {
+        (**self).shutdown().await
     }
 
     #[inline]
-    fn call<'a>(&'a self, request: Req, ctx: ServiceCtx<'a, Self>) -> S::Future<'a> {
-        ctx.call_nowait(&**self, request)
+    async fn call(
+        &self,
+        request: Req,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        ctx.call_nowait(&**self, request).await
     }
 }
 
@@ -319,10 +296,9 @@ where
     type Error = S::Error;
     type Service = S::Service;
     type InitError = S::InitError;
-    type Future<'f> = S::Future<'f> where S: 'f, Cfg: 'f;
 
-    fn create(&self, cfg: Cfg) -> S::Future<'_> {
-        self.as_ref().create(cfg)
+    async fn create(&self, cfg: Cfg) -> Result<Self::Service, Self::InitError> {
+        self.as_ref().create(cfg).await
     }
 }
 
@@ -333,15 +309,6 @@ where
 {
     /// Convert to a `Service`
     fn into_service(self) -> Svc;
-
-    #[inline]
-    /// Convert `Self` to a `ServiceChain`
-    fn into_chain(self) -> dev::ServiceChain<Svc, Req>
-    where
-        Self: Sized,
-    {
-        chain(self)
-    }
 }
 
 /// Trait for types that can be converted to a `ServiceFactory`
@@ -351,15 +318,6 @@ where
 {
     /// Convert `Self` to a `ServiceFactory`
     fn into_factory(self) -> T;
-
-    #[inline]
-    /// Convert `Self` to a `ServiceChainFactory`
-    fn chain(self) -> dev::ServiceChainFactory<T, Req, Cfg>
-    where
-        Self: Sized,
-    {
-        chain_factory(self)
-    }
 }
 
 impl<Svc, Req> IntoService<Svc, Req> for Svc
@@ -382,15 +340,6 @@ where
     }
 }
 
-/// Convert object of type `T` to a service `S`
-pub fn into_service<Svc, Req, F>(tp: F) -> Svc
-where
-    Svc: Service<Req>,
-    F: IntoService<Svc, Req>,
-{
-    tp.into_service()
-}
-
 pub mod dev {
     pub use crate::and_then::{AndThen, AndThenFactory};
     pub use crate::apply::{Apply, ApplyFactory};
@@ -404,9 +353,5 @@ pub mod dev {
     pub use crate::map_err::{MapErr, MapErrFactory};
     pub use crate::map_init_err::MapInitErr;
     pub use crate::middleware::ApplyMiddleware;
-    pub use crate::pipeline::CreatePipeline;
     pub use crate::then::{Then, ThenFactory};
-
-    #[doc(hidden)]
-    pub type ApplyService<T> = crate::Pipeline<T>;
 }

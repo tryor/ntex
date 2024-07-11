@@ -1,6 +1,7 @@
 //! Stream encoder
 use std::{fmt, future::Future, io, io::Write, pin::Pin, task::Context, task::Poll};
 
+#[cfg(feature = "brotli")]
 use brotli2::write::BrotliEncoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 
@@ -14,7 +15,6 @@ use super::Writer;
 
 const INPLACE: usize = 1024;
 
-#[derive(Debug)]
 pub struct Encoder<B> {
     eof: bool,
     body: EncoderBody<B>,
@@ -22,7 +22,7 @@ pub struct Encoder<B> {
     fut: Option<JoinHandle<Result<ContentEncoder, io::Error>>>,
 }
 
-impl<B: MessageBody + 'static> Encoder<B> {
+impl<B: MessageBody> Encoder<B> {
     pub fn response(
         encoding: ContentEncoding,
         head: &mut ResponseHead,
@@ -59,6 +59,17 @@ impl<B: MessageBody + 'static> Encoder<B> {
                 encoder: Some(encoder),
             }))
         }
+    }
+}
+
+impl<B: fmt::Debug> fmt::Debug for Encoder<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Encoder")
+            .field("eof", &self.eof)
+            .field("body", &self.body)
+            .field("encoder", &self.encoder)
+            .field("fut", &self.fut.as_ref().map(|_| "JoinHandle(_)"))
+            .finish()
     }
 }
 
@@ -180,15 +191,23 @@ fn update_head(encoding: ContentEncoding, head: &mut ResponseHead) {
 enum ContentEncoder {
     Deflate(ZlibEncoder<Writer>),
     Gzip(GzEncoder<Writer>),
+    #[cfg(feature = "brotli")]
     Br(BrotliEncoder<Writer>),
 }
 
 impl ContentEncoder {
     fn can_encode(encoding: ContentEncoding) -> bool {
-        matches!(
-            encoding,
-            ContentEncoding::Deflate | ContentEncoding::Gzip | ContentEncoding::Br
-        )
+        #[cfg(feature = "brotli")]
+        {
+            matches!(
+                encoding,
+                ContentEncoding::Deflate | ContentEncoding::Gzip | ContentEncoding::Br
+            )
+        }
+        #[cfg(not(feature = "brotli"))]
+        {
+            matches!(encoding, ContentEncoding::Deflate | ContentEncoding::Gzip)
+        }
     }
 
     fn encoder(encoding: ContentEncoding) -> Option<Self> {
@@ -201,6 +220,7 @@ impl ContentEncoder {
                 Writer::new(),
                 flate2::Compression::fast(),
             ))),
+            #[cfg(feature = "brotli")]
             ContentEncoding::Br => {
                 Some(ContentEncoder::Br(BrotliEncoder::new(Writer::new(), 3)))
             }
@@ -210,6 +230,7 @@ impl ContentEncoder {
 
     fn take(&mut self) -> Bytes {
         match *self {
+            #[cfg(feature = "brotli")]
             ContentEncoder::Br(ref mut encoder) => encoder.get_mut().take(),
             ContentEncoder::Deflate(ref mut encoder) => encoder.get_mut().take(),
             ContentEncoder::Gzip(ref mut encoder) => encoder.get_mut().take(),
@@ -218,6 +239,7 @@ impl ContentEncoder {
 
     fn finish(self) -> Result<Bytes, io::Error> {
         match self {
+            #[cfg(feature = "brotli")]
             ContentEncoder::Br(encoder) => match encoder.finish() {
                 Ok(writer) => Ok(writer.buf.freeze()),
                 Err(err) => Err(err),
@@ -235,24 +257,25 @@ impl ContentEncoder {
 
     fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
         match *self {
+            #[cfg(feature = "brotli")]
             ContentEncoder::Br(ref mut encoder) => match encoder.write_all(data) {
                 Ok(_) => Ok(()),
                 Err(err) => {
-                    trace!("Error decoding br encoding: {}", err);
+                    log::trace!("Error decoding br encoding: {}", err);
                     Err(err)
                 }
             },
             ContentEncoder::Gzip(ref mut encoder) => match encoder.write_all(data) {
                 Ok(_) => Ok(()),
                 Err(err) => {
-                    trace!("Error decoding gzip encoding: {}", err);
+                    log::trace!("Error decoding gzip encoding: {}", err);
                     Err(err)
                 }
             },
             ContentEncoder::Deflate(ref mut encoder) => match encoder.write_all(data) {
                 Ok(_) => Ok(()),
                 Err(err) => {
-                    trace!("Error decoding deflate encoding: {}", err);
+                    log::trace!("Error decoding deflate encoding: {}", err);
                     Err(err)
                 }
             },
@@ -265,6 +288,7 @@ impl fmt::Debug for ContentEncoder {
         match self {
             ContentEncoder::Deflate(_) => write!(f, "ContentEncoder::Deflate"),
             ContentEncoder::Gzip(_) => write!(f, "ContentEncoder::Gzip"),
+            #[cfg(feature = "brotli")]
             ContentEncoder::Br(_) => write!(f, "ContentEncoder::Br"),
         }
     }

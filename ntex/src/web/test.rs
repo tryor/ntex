@@ -11,14 +11,17 @@ use crate::http::error::{HttpError, PayloadError, ResponseError};
 use crate::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use crate::http::test::TestRequest as HttpTestRequest;
 use crate::http::{HttpService, Method, Payload, Request, StatusCode, Uri, Version};
+#[cfg(feature = "ws")]
+use crate::io::Sealed;
 use crate::router::{Path, ResourceDef};
 use crate::service::{
     map_config, IntoService, IntoServiceFactory, Pipeline, Service, ServiceFactory,
 };
 use crate::time::{sleep, Millis, Seconds};
 use crate::util::{stream_recv, Bytes, BytesMut, Extensions, Ready, Stream};
+#[cfg(feature = "ws")]
 use crate::ws::{error::WsClientError, WsClient, WsConnection};
-use crate::{io::Sealed, rt::System, server::Server};
+use crate::{rt::System, server::Server};
 
 use crate::web::error::{DefaultError, ErrorRenderer};
 use crate::web::httprequest::{HttpRequest, HttpRequestPool};
@@ -73,7 +76,7 @@ pub async fn init_service<R, S, E>(
 where
     R: IntoServiceFactory<S, Request, AppConfig>,
     S: ServiceFactory<Request, AppConfig, Response = WebResponse, Error = E>,
-    S::InitError: std::fmt::Debug,
+    S::InitError: fmt::Debug,
 {
     let srv = app.into_factory();
     srv.pipeline(AppConfig::default()).await.unwrap()
@@ -282,8 +285,8 @@ pub async fn respond_to<T: Responder<DefaultError>>(
 ///     }
 /// }
 ///
-/// #[test]
-/// fn test_index() {
+/// #[ntex::test]
+/// async fn test_index() {
 ///     let req = test::TestRequest::with_header("content-type", "text/plain")
 ///         .to_http_request();
 ///
@@ -391,7 +394,10 @@ impl TestRequest {
 
     #[cfg(feature = "cookie")]
     /// Set cookie for this request
-    pub fn cookie(mut self, cookie: Cookie<'_>) -> Self {
+    pub fn cookie<C>(mut self, cookie: C) -> Self
+    where
+        C: Into<Cookie<'static>>,
+    {
         self.req.cookie(cookie);
         self
     }
@@ -605,7 +611,7 @@ where
         let local_addr = tcp.local_addr().unwrap();
 
         sys.run(move || {
-            let builder = Server::build().workers(1).disable_signals();
+            let builder = crate::server::build().workers(1).disable_signals();
 
             let srv = match cfg.stream {
                 StreamType::Tcp => match cfg.tp {
@@ -613,21 +619,21 @@ where
                         let cfg =
                             AppConfig::new(false, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .h1(map_config(factory(), move |_| cfg.clone()))
                     }),
                     HttpVer::Http2 => builder.listen("test", tcp, move |_| {
                         let cfg =
                             AppConfig::new(false, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .h2(map_config(factory(), move |_| cfg.clone()))
                     }),
                     HttpVer::Both => builder.listen("test", tcp, move |_| {
                         let cfg =
                             AppConfig::new(false, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .finish(map_config(factory(), move |_| cfg.clone()))
                     }),
                 },
@@ -637,7 +643,7 @@ where
                         let cfg =
                             AppConfig::new(true, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .h1(map_config(factory(), move |_| cfg.clone()))
                             .openssl(acceptor.clone())
                     }),
@@ -645,7 +651,7 @@ where
                         let cfg =
                             AppConfig::new(true, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .h2(map_config(factory(), move |_| cfg.clone()))
                             .openssl(acceptor.clone())
                     }),
@@ -653,7 +659,7 @@ where
                         let cfg =
                             AppConfig::new(true, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .finish(map_config(factory(), move |_| cfg.clone()))
                             .openssl(acceptor.clone())
                     }),
@@ -664,7 +670,7 @@ where
                         let cfg =
                             AppConfig::new(true, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .h1(map_config(factory(), move |_| cfg.clone()))
                             .rustls(config.clone())
                     }),
@@ -672,7 +678,7 @@ where
                         let cfg =
                             AppConfig::new(true, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .h2(map_config(factory(), move |_| cfg.clone()))
                             .rustls(config.clone())
                     }),
@@ -680,7 +686,7 @@ where
                         let cfg =
                             AppConfig::new(true, local_addr, format!("{}", local_addr));
                         HttpService::build()
-                            .client_timeout(ctimeout)
+                            .headers_read_rate(ctimeout, Seconds::ZERO, 256)
                             .finish(map_config(factory(), move |_| cfg.clone()))
                             .rustls(config.clone())
                     }),
@@ -711,7 +717,7 @@ where
                     .lifetime(Seconds::ZERO)
                     .keep_alive(Seconds(30))
                     .timeout(Millis(30_000))
-                    .disconnect_timeout(Millis(5_000))
+                    .disconnect_timeout(Seconds(5))
                     .openssl(builder.build())
                     .finish()
             }
@@ -755,6 +761,7 @@ enum HttpVer {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum StreamType {
     Tcp,
     #[cfg(feature = "openssl")]
@@ -904,6 +911,7 @@ impl TestServer {
         response.body().limit(10_485_760).await
     }
 
+    #[cfg(feature = "ws")]
     /// Connect to websocket server at a given path
     pub async fn ws_at(&self, path: &str) -> Result<WsConnection<Sealed>, WsClientError> {
         if self.ssl {
@@ -944,6 +952,7 @@ impl TestServer {
         }
     }
 
+    #[cfg(feature = "ws")]
     /// Connect to a websocket server
     pub async fn ws(&self) -> Result<WsConnection<Sealed>, WsClientError> {
         self.ws_at("/").await
@@ -969,9 +978,8 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use crate::http::header;
-    use crate::http::HttpMessage;
-    use crate::web::{self, App, HttpResponse};
+    use crate::http::{header, HttpMessage};
+    use crate::web::{self, App};
 
     #[crate::rt_test]
     async fn test_basics() {
@@ -1216,12 +1224,11 @@ mod tests {
     fn test_response_cookies() {
         let req = TestRequest::default()
             .cookie(
-                coo_kie::Cookie::build("name", "value")
+                coo_kie::Cookie::build(("name", "value"))
                     .domain("www.rust-lang.org")
                     .path("/test")
                     .http_only(true)
-                    .max_age(::time::Duration::days(1))
-                    .finish(),
+                    .max_age(::time::Duration::days(1)),
             )
             .to_http_request();
 

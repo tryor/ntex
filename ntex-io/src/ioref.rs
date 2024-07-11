@@ -1,9 +1,10 @@
-use std::{any, fmt, hash, io, time};
+use std::{any, fmt, hash, io};
 
 use ntex_bytes::{BytesVec, PoolRef};
 use ntex_codec::{Decoder, Encoder};
+use ntex_util::time::Seconds;
 
-use super::{io::Flags, timer, types, Filter, IoRef, OnDisconnect, WriteBuf};
+use super::{io::Flags, timer, types, Decoded, Filter, IoRef, OnDisconnect, WriteBuf};
 
 impl IoRef {
     #[inline]
@@ -34,7 +35,16 @@ impl IoRef {
     #[inline]
     /// Check if io stream is closed
     pub fn is_closed(&self) -> bool {
-        self.0.flags.get().contains(Flags::IO_STOPPING)
+        self.0
+            .flags
+            .get()
+            .intersects(Flags::IO_STOPPING | Flags::IO_STOPPED)
+    }
+
+    #[inline]
+    /// Check if write back-pressure is enabled
+    pub fn is_wr_backpressure(&self) -> bool {
+        self.0.flags.get().contains(Flags::WR_BACKPRESSURE)
     }
 
     #[inline]
@@ -58,7 +68,7 @@ impl IoRef {
     /// Dispatcher does not wait for uncompleted responses. Io stream get terminated
     /// without any graceful period.
     pub fn force_close(&self) {
-        log::trace!("force close io stream object");
+        log::trace!("{}: Force close io stream object", self.tag());
         self.0.insert_flags(
             Flags::DSP_STOP
                 | Flags::IO_STOPPED
@@ -79,7 +89,11 @@ impl IoRef {
             .get()
             .intersects(Flags::IO_STOPPED | Flags::IO_STOPPING | Flags::IO_STOPPING_FILTERS)
         {
-            log::trace!("initiate io shutdown {:?}", self.0.flags.get());
+            log::trace!(
+                "{}: Initiate io shutdown {:?}",
+                self.tag(),
+                self.0.flags.get()
+            );
             self.0.insert_flags(Flags::IO_STOPPING_FILTERS);
             self.0.read_task.wake();
         }
@@ -101,9 +115,7 @@ impl IoRef {
     where
         U: Encoder,
     {
-        let flags = self.0.flags.get();
-
-        if !flags.contains(Flags::IO_STOPPING) {
+        if !self.is_closed() {
             self.with_write_buf(|buf| {
                 // make sure we've got room
                 self.memory_pool().resize_write_buf(buf);
@@ -111,14 +123,19 @@ impl IoRef {
                 // encode item and wake write task
                 codec.encode_vec(item, buf)
             })
-            .map_or_else(
-                |err| {
-                    self.0.io_stopped(Some(err));
-                    Ok(())
-                },
-                |item| item,
-            )
+            // .with_write_buf() could return io::Error<Result<(), U::Error>>,
+            // in that case mark io as failed
+            .unwrap_or_else(|err| {
+                log::trace!(
+                    "{}: Got io error while encoding, error: {:?}",
+                    self.tag(),
+                    err
+                );
+                self.0.io_stopped(Some(err));
+                Ok(())
+            })
         } else {
+            log::trace!("{}: Io is closed/closing, skip frame encoding", self.tag());
             Ok(())
         }
     }
@@ -135,6 +152,25 @@ impl IoRef {
         self.0
             .buffer
             .with_read_destination(self, |buf| codec.decode_vec(buf))
+    }
+
+    #[inline]
+    /// Attempts to decode a frame from the read buffer
+    pub fn decode_item<U>(
+        &self,
+        codec: &U,
+    ) -> Result<Decoded<<U as Decoder>::Item>, <U as Decoder>::Error>
+    where
+        U: Decoder,
+    {
+        self.0.buffer.with_read_destination(self, |buf| {
+            let len = buf.len();
+            codec.decode_vec(buf).map(|item| Decoded {
+                item,
+                remains: buf.len(),
+                consumed: len - buf.len(),
+            })
+        })
     }
 
     #[inline]
@@ -187,27 +223,66 @@ impl IoRef {
     }
 
     #[inline]
-    /// Start keep-alive timer
-    pub fn start_keepalive_timer(&self, timeout: time::Duration) {
-        if self.flags().contains(Flags::KEEPALIVE) {
-            timer::unregister(self.0.keepalive.get(), self);
-        }
+    /// current timer handle
+    pub fn timer_handle(&self) -> timer::TimerHandle {
+        self.0.timeout.get()
+    }
+
+    #[inline]
+    /// wakeup dispatcher and send keep-alive error
+    pub fn notify_timeout(&self) {
+        self.0.notify_timeout()
+    }
+
+    #[inline]
+    /// Start timer
+    pub fn start_timer(&self, timeout: Seconds) -> timer::TimerHandle {
+        let cur_hnd = self.0.timeout.get();
+
         if !timeout.is_zero() {
-            log::debug!("start keep-alive timeout {:?}", timeout);
-            self.0.insert_flags(Flags::KEEPALIVE);
-            self.0.keepalive.set(timer::register(timeout, self));
+            if cur_hnd.is_set() {
+                let hnd = timer::update(cur_hnd, timeout, self);
+                if hnd != cur_hnd {
+                    log::debug!("{}: Update timer {:?}", self.tag(), timeout);
+                    self.0.timeout.set(hnd);
+                }
+                hnd
+            } else {
+                log::debug!("{}: Start timer {:?}", self.tag(), timeout);
+                let hnd = timer::register(timeout, self);
+                self.0.timeout.set(hnd);
+                hnd
+            }
         } else {
-            self.0.remove_flags(Flags::KEEPALIVE);
+            if cur_hnd.is_set() {
+                self.0.timeout.set(timer::TimerHandle::ZERO);
+                timer::unregister(cur_hnd, self);
+            }
+            timer::TimerHandle::ZERO
         }
     }
 
     #[inline]
-    /// Stop keep-alive timer
-    pub fn stop_keepalive_timer(&self) {
-        if self.flags().contains(Flags::KEEPALIVE) {
-            log::debug!("unregister keep-alive timeout");
-            timer::unregister(self.0.keepalive.get(), self)
+    /// Stop timer
+    pub fn stop_timer(&self) {
+        let hnd = self.0.timeout.get();
+        if hnd.is_set() {
+            log::debug!("{}: Stop timer", self.tag());
+            self.0.timeout.set(timer::TimerHandle::ZERO);
+            timer::unregister(hnd, self)
         }
+    }
+
+    #[inline]
+    /// Get tag
+    pub fn tag(&self) -> &'static str {
+        self.0.tag.get()
+    }
+
+    #[inline]
+    /// Set tag
+    pub fn set_tag(&self, tag: &'static str) {
+        self.0.tag.set(tag)
     }
 
     #[inline]
@@ -244,15 +319,15 @@ impl fmt::Debug for IoRef {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::{future::Future, pin::Pin, rc::Rc, task::Poll};
+    use std::{future::poll_fn, future::Future, pin::Pin, rc::Rc, task::Poll};
 
     use ntex_bytes::Bytes;
     use ntex_codec::BytesCodec;
-    use ntex_util::future::{lazy, poll_fn};
+    use ntex_util::future::lazy;
     use ntex_util::time::{sleep, Millis};
 
     use super::*;
-    use crate::{testing::IoTest, FilterLayer, Io, ReadBuf, WriteBuf};
+    use crate::{testing::IoTest, FilterLayer, Io, ReadBuf};
 
     const BIN: &[u8] = b"GET /test HTTP/1\r\n\r\n";
     const TEXT: &str = "GET /test HTTP/1\r\n\r\n";
@@ -303,6 +378,11 @@ mod tests {
         let state = Io::new(server);
         state.write(b"test").unwrap();
         let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"test"));
+
+        client.write(b"test");
+        state.read_ready().await.unwrap();
+        let buf = state.decode(&BytesCodec).unwrap().unwrap();
         assert_eq!(buf, Bytes::from_static(b"test"));
 
         client.write_error(io::Error::new(io::ErrorKind::Other, "err"));
@@ -409,13 +489,15 @@ mod tests {
         let write_order = Rc::new(RefCell::new(Vec::new()));
 
         let (client, server) = IoTest::create();
-        let io = Io::new(server).add_filter(Counter {
+        let counter = Counter {
             idx: 1,
             in_bytes: in_bytes.clone(),
             out_bytes: out_bytes.clone(),
             read_order: read_order.clone(),
             write_order: write_order.clone(),
-        });
+        };
+        format!("{:?}", counter);
+        let io = Io::new(server).add_filter(counter);
 
         client.remote_buffer_cap(1024);
         client.write(TEXT);

@@ -1,31 +1,29 @@
-use std::task::{Context, Poll};
-use std::{error::Error, future::Future, marker::PhantomData, pin::Pin};
+use std::{cell::RefCell, error::Error, fmt, io};
 
-use ntex_io::{Filter, FilterFactory, Io, Layer};
+use ntex_io::{Filter, Io, Layer};
 use ntex_service::{Service, ServiceCtx, ServiceFactory};
-use ntex_util::{future::Ready, time::Millis};
-use tls_openssl::ssl::SslAcceptor;
+use ntex_util::time::{self, Millis};
+use tls_openssl::ssl;
 
-use crate::counter::{Counter, CounterGuard};
+use crate::counter::Counter;
 use crate::MAX_SSL_ACCEPT_COUNTER;
 
-use super::{SslAcceptor as IoSslAcceptor, SslFilter};
+use super::SslFilter;
 
-#[derive(Debug)]
 /// Support `TLS` server connections via openssl package
 ///
 /// `openssl` feature enables `Acceptor` type
-pub struct Acceptor<F> {
-    acceptor: IoSslAcceptor,
-    _t: PhantomData<F>,
+pub struct SslAcceptor {
+    acceptor: ssl::SslAcceptor,
+    timeout: Millis,
 }
 
-impl<F> Acceptor<F> {
+impl SslAcceptor {
     /// Create default openssl acceptor service
-    pub fn new(acceptor: SslAcceptor) -> Self {
-        Acceptor {
-            acceptor: IoSslAcceptor::new(acceptor),
-            _t: PhantomData,
+    pub fn new(acceptor: ssl::SslAcceptor) -> Self {
+        SslAcceptor {
+            acceptor,
+            timeout: Millis(5_000),
         }
     }
 
@@ -33,93 +31,113 @@ impl<F> Acceptor<F> {
     ///
     /// Default is set to 5 seconds.
     pub fn timeout<U: Into<Millis>>(mut self, timeout: U) -> Self {
-        self.acceptor.timeout(timeout);
+        self.timeout = timeout.into();
         self
     }
 }
 
-impl<F> From<SslAcceptor> for Acceptor<F> {
-    fn from(acceptor: SslAcceptor) -> Self {
+impl fmt::Debug for SslAcceptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SslAcceptor")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl From<ssl::SslAcceptor> for SslAcceptor {
+    fn from(acceptor: ssl::SslAcceptor) -> Self {
         Self::new(acceptor)
     }
 }
 
-impl<F> Clone for Acceptor<F> {
+impl Clone for SslAcceptor {
     fn clone(&self) -> Self {
         Self {
             acceptor: self.acceptor.clone(),
-            _t: PhantomData,
+            timeout: self.timeout,
         }
     }
 }
 
-impl<F: Filter, C: 'static> ServiceFactory<Io<F>, C> for Acceptor<F> {
+impl<F: Filter, C> ServiceFactory<Io<F>, C> for SslAcceptor {
     type Response = Io<Layer<SslFilter, F>>;
     type Error = Box<dyn Error>;
-    type Service = AcceptorService<F>;
+    type Service = SslAcceptorService;
     type InitError = ();
-    type Future<'f> = Ready<Self::Service, Self::InitError>;
 
-    #[inline]
-    fn create(&self, _: C) -> Self::Future<'_> {
+    async fn create(&self, _: C) -> Result<Self::Service, Self::InitError> {
         MAX_SSL_ACCEPT_COUNTER.with(|conns| {
-            Ready::Ok(AcceptorService {
+            Ok(SslAcceptorService {
                 acceptor: self.acceptor.clone(),
+                timeout: self.timeout,
                 conns: conns.clone(),
-                _t: PhantomData,
             })
         })
     }
 }
 
-#[derive(Debug)]
 /// Support `TLS` server connections via openssl package
 ///
 /// `openssl` feature enables `Acceptor` type
-pub struct AcceptorService<F> {
-    acceptor: IoSslAcceptor,
+pub struct SslAcceptorService {
+    acceptor: ssl::SslAcceptor,
+    timeout: Millis,
     conns: Counter,
-    _t: PhantomData<F>,
 }
 
-impl<F: Filter> Service<Io<F>> for AcceptorService<F> {
+impl fmt::Debug for SslAcceptorService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SslAcceptorService")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl<F: Filter> Service<Io<F>> for SslAcceptorService {
     type Response = Io<Layer<SslFilter, F>>;
     type Error = Box<dyn Error>;
-    type Future<'f> = AcceptorServiceResponse<F>;
 
-    #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.conns.available(cx) {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+    async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        self.conns.available().await;
+        Ok(())
     }
 
-    #[inline]
-    fn call<'a>(&'a self, req: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-        AcceptorServiceResponse {
-            _guard: self.conns.get(),
-            fut: self.acceptor.clone().create(req),
-        }
-    }
-}
+    async fn call(
+        &self,
+        io: Io<F>,
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        let timeout = self.timeout;
+        let ctx_result = ssl::Ssl::new(self.acceptor.context());
 
-pin_project_lite::pin_project! {
-    pub struct AcceptorServiceResponse<F>
-    where
-        F: Filter,
-    {
-        #[pin]
-        fut: <IoSslAcceptor as FilterFactory<F>>::Future,
-        _guard: CounterGuard,
-    }
-}
+        time::timeout(timeout, async {
+            let ssl = ctx_result.map_err(super::map_to_ioerr)?;
+            let inner = super::IoInner {
+                source: None,
+                destination: None,
+            };
+            let filter = SslFilter {
+                inner: RefCell::new(ssl::SslStream::new(ssl, inner)?),
+            };
+            let io = io.add_filter(filter);
 
-impl<F: Filter> Future for AcceptorServiceResponse<F> {
-    type Output = Result<Io<Layer<SslFilter, F>>, Box<dyn Error>>;
+            log::debug!("Accepting tls connection");
+            loop {
+                let result = io.with_buf(|buf| {
+                    let filter = io.filter();
+                    filter.with_buffers(buf, || filter.inner.borrow_mut().accept())
+                })?;
+                if super::handle_result(&io, result).await?.is_some() {
+                    break;
+                }
+            }
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.project().fut.poll(cx)
+            Ok(io)
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "ssl handshake timeout").into()
+        })
+        .and_then(|item| item)
     }
 }

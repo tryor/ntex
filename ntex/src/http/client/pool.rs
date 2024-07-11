@@ -7,13 +7,12 @@ use ntex_h2::{self as h2};
 use crate::http::uri::{Authority, Scheme, Uri};
 use crate::io::{types::HttpProtocol, IoBoxed};
 use crate::service::{Pipeline, PipelineCall, Service, ServiceCtx};
-use crate::time::{now, Millis};
-use crate::util::{ready, BoxFuture, ByteString, HashMap, HashSet};
+use crate::time::{now, Seconds};
+use crate::util::{ready, ByteString, HashMap, HashSet};
 use crate::{channel::pool, rt::spawn, task::LocalWaker};
 
 use super::connection::{Connection, ConnectionType};
-use super::h2proto::{H2Client, H2PublishService};
-use super::{error::ConnectError, Connect};
+use super::{error::ConnectError, h2proto::H2Client, Connect};
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub(super) struct Key {
@@ -58,7 +57,7 @@ where
         connector: T,
         conn_lifetime: Duration,
         conn_keep_alive: Duration,
-        disconnect_timeout: Millis,
+        disconnect_timeout: Seconds,
         limit: usize,
         h2config: h2::Config,
     ) -> Self {
@@ -81,7 +80,7 @@ where
         }));
 
         // start pool support future
-        crate::rt::spawn(ConnectionPoolSupport {
+        let _ = crate::rt::spawn(ConnectionPoolSupport {
             connector: connector.clone(),
             inner: inner.clone(),
             waiters: waiters.clone(),
@@ -117,61 +116,67 @@ where
 {
     type Response = Connection;
     type Error = ConnectError;
-    type Future<'f> = BoxFuture<'f, Result<Connection, ConnectError>>;
 
-    crate::forward_poll_ready!(connector);
-    crate::forward_poll_shutdown!(connector);
+    async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        self.connector.ready().await
+    }
 
-    fn call<'a>(&'a self, req: Connect, _: ServiceCtx<'a, Self>) -> Self::Future<'_> {
-        trace!("Get connection for {:?}", req.uri);
+    async fn shutdown(&self) {
+        self.connector.shutdown().await
+    }
+
+    async fn call(
+        &self,
+        req: Connect,
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<Connection, ConnectError> {
+        log::trace!("Get connection for {:?}", req.uri);
         let inner = self.inner.clone();
         let waiters = self.waiters.clone();
 
-        Box::pin(async move {
-            let key = if let Some(authority) = req.uri.authority() {
-                authority.clone().into()
-            } else {
-                return Err(ConnectError::Unresolved);
-            };
+        let key = if let Some(authority) = req.uri.authority() {
+            authority.clone().into()
+        } else {
+            return Err(ConnectError::Unresolved);
+        };
 
-            // acquire connection
-            let result = inner.borrow_mut().acquire(&key);
-            match result {
-                // use existing connection
-                Acquire::Acquired(io, created) => {
-                    trace!("Use existing {:?} connection for {:?}", io, req.uri);
-                    Ok(Connection::new(
-                        io,
-                        created,
-                        Some(Acquired::new(key, inner)),
-                    ))
-                }
-                // open new tcp connection
-                Acquire::Available => {
-                    trace!("Connecting to {:?}", req.uri);
-                    let uri = req.uri.clone();
-                    let (tx, rx) = waiters.borrow_mut().pool.channel();
-                    OpenConnection::spawn(key, tx, uri, inner, &self.connector, req);
+        // acquire connection
+        let result = inner.borrow_mut().acquire(&key);
+        match result {
+            // use existing connection
+            Acquire::Acquired(io, created) => {
+                log::trace!("Use existing {:?} connection for {:?}", io, req.uri);
+                Ok(Connection::new(
+                    io,
+                    created,
+                    Some(Acquired::new(key, inner)),
+                ))
+            }
+            // open new tcp connection
+            Acquire::Available => {
+                log::trace!("Connecting to {:?}", req.uri);
+                let uri = req.uri.clone();
+                let (tx, rx) = waiters.borrow_mut().pool.channel();
+                OpenConnection::spawn(key, tx, uri, inner, &self.connector, req);
 
-                    match rx.await {
-                        Err(_) => Err(ConnectError::Disconnected(None)),
-                        Ok(res) => res,
-                    }
-                }
-                // pool is full, wait
-                Acquire::NotAvailable => {
-                    trace!(
-                        "Pool is full, waiting for available connections for {:?}",
-                        req.uri
-                    );
-                    let rx = waiters.borrow_mut().wait_for(req);
-                    match rx.await {
-                        Err(_) => Err(ConnectError::Disconnected(None)),
-                        Ok(res) => res,
-                    }
+                match rx.await {
+                    Err(_) => Err(ConnectError::Disconnected(None)),
+                    Ok(res) => res,
                 }
             }
-        })
+            // pool is full, wait
+            Acquire::NotAvailable => {
+                log::trace!(
+                    "Pool is full, waiting for available connections for {:?}",
+                    req.uri
+                );
+                let rx = waiters.borrow_mut().wait_for(req);
+                match rx.await {
+                    Err(_) => Err(ConnectError::Disconnected(None)),
+                    Ok(res) => res,
+                }
+            }
+        }
     }
 }
 
@@ -179,7 +184,7 @@ where
 pub(super) struct Inner {
     conn_lifetime: Duration,
     conn_keep_alive: Duration,
-    disconnect_timeout: Millis,
+    disconnect_timeout: Seconds,
     limit: usize,
     h2config: h2::Config,
     acquired: usize,
@@ -202,7 +207,7 @@ impl Waiters {
         let key: Key = connect.uri.authority().unwrap().clone().into();
         self.waiters
             .entry(key)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_back((connect, tx));
         rx
     }
@@ -217,7 +222,7 @@ impl Waiters {
                 let (req, tx) = waiters.front().unwrap();
                 // check if waiter is still alive
                 if tx.is_canceled() {
-                    trace!("Waiter for {:?} is gone, remove waiter", req.uri);
+                    log::trace!("Waiter for {:?} is gone, remove waiter", req.uri);
                     waiters.pop_front();
                     continue;
                 };
@@ -252,7 +257,7 @@ impl Inner {
                     || (now - conn.created) > self.conn_lifetime
                 {
                     if let ConnectionType::H1(io) = conn.io {
-                        spawn(async move {
+                        let _ = spawn(async move {
                             let _ = io.shutdown().await;
                         });
                     }
@@ -338,7 +343,7 @@ where
             while let Some((req, tx)) = waiters.front() {
                 // is waiter still alive
                 if tx.is_canceled() {
-                    trace!("Waiter for {:?} is gone, cleanup", req.uri);
+                    log::trace!("Waiter for {:?} is gone, cleanup", req.uri);
                     cleanup = true;
                     waiters.pop_front();
                     continue;
@@ -348,7 +353,7 @@ where
                 match result {
                     Acquire::NotAvailable => break,
                     Acquire::Acquired(io, created) => {
-                        trace!(
+                        log::trace!(
                             "Use existing {:?} connection for {:?}, wake up waiter",
                             io,
                             req.uri
@@ -362,7 +367,7 @@ where
                         )));
                     }
                     Acquire::Available => {
-                        trace!("Connecting to {:?} and wake up waiter", req.uri);
+                        log::trace!("Connecting to {:?} and wake up waiter", req.uri);
                         cleanup = true;
                         let (connect, tx) = waiters.pop_front().unwrap();
                         let uri = connect.uri.clone();
@@ -388,8 +393,9 @@ where
 }
 
 pin_project_lite::pin_project! {
-    struct OpenConnection<T: Service<Connect>>
-    where T: 'static
+    struct OpenConnection<T>
+    where T: Service<Connect>,
+          T: 'static
     {
         key: Key,
         #[pin]
@@ -397,7 +403,7 @@ pin_project_lite::pin_project! {
         uri: Uri,
         tx: Option<Waiter>,
         guard: Option<OpenGuard>,
-        disconnect_timeout: Millis,
+        disconnect_timeout: Seconds,
         inner: Rc<RefCell<Inner>>,
     }
 }
@@ -418,7 +424,7 @@ where
         let disconnect_timeout = inner.borrow().disconnect_timeout;
 
         #[allow(clippy::redundant_async_block)]
-        spawn(async move {
+        let _ = spawn(async move {
             OpenConnection::<T> {
                 tx: Some(tx),
                 key: key.clone(),
@@ -445,7 +451,7 @@ where
         // open tcp connection
         match ready!(this.fut.poll(cx)) {
             Err(err) => {
-                trace!(
+                log::trace!(
                     "Failed to open client connection for {:?} with error {:?}",
                     &this.key.authority,
                     err
@@ -472,24 +478,13 @@ where
                         ByteString::new()
                     };
 
-                    let connection = h2::client::ClientConnection::with_params(
+                    let client = h2::client::SimpleClient::new(
                         io,
                         this.inner.borrow().h2config.clone(),
-                        this.uri.scheme() == Some(&Scheme::HTTPS),
+                        this.uri.scheme().cloned().unwrap_or(Scheme::HTTPS),
                         auth,
                     );
-                    let client = H2Client::new(connection.client());
-                    let key = this.key.clone();
-                    let publish = H2PublishService::new(client.clone());
-                    crate::rt::spawn(async move {
-                        let res = connection.start(publish).await;
-                        log::trace!(
-                            "Http/2 connection is closed for {:?} with {:?}",
-                            key.authority,
-                            res
-                        );
-                    });
-
+                    let client = H2Client::new(client);
                     let guard = this.guard.take().unwrap().consume();
                     let conn = Connection::new(
                         ConnectionType::H2(client.clone()),
@@ -586,7 +581,7 @@ impl Acquired {
                 );
                 match io {
                     ConnectionType::H1(io) => {
-                        spawn(async move {
+                        let _ = spawn(async move {
                             let _ = io.shutdown().await;
                         });
                     }
@@ -621,12 +616,9 @@ impl Drop for Acquired {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
-
     use super::*;
-    use crate::{
-        http::Uri, io as nio, service::fn_service, testing::Io, time::sleep, util::lazy,
-    };
+    use crate::time::{sleep, Millis};
+    use crate::{io as nio, service::fn_service, testing::Io, util::lazy};
 
     #[crate::rt_test]
     async fn test_basics() {
@@ -642,12 +634,13 @@ mod tests {
                 }),
                 Duration::from_secs(10),
                 Duration::from_secs(10),
-                Millis::ZERO,
+                Seconds::ZERO,
                 1,
                 h2::Config::client(),
             )
             .clone(),
-        );
+        )
+        .bind();
 
         // uri must contain authority
         let req = Connect {
@@ -672,8 +665,8 @@ mod tests {
         assert!(pool.get_ref().inner.borrow().connecting.is_empty());
 
         // pool is full, waiting
-        let mut fut = pool.call(req.clone());
-        assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
+        let mut fut = std::pin::pin!(pool.call(req.clone()));
+        assert!(lazy(|cx| fut.as_mut().poll(cx)).await.is_pending());
         assert_eq!(pool.get_ref().waiters.borrow().waiters.len(), 1);
 
         // release connection and push it to next waiter
@@ -689,8 +682,8 @@ mod tests {
         assert_eq!(store.borrow().len(), 2);
         assert_eq!(pool.get_ref().inner.borrow().acquired, 1);
         assert!(pool.get_ref().inner.borrow().connecting.is_empty());
-        let mut fut = pool.call(req.clone());
-        assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
+        let mut fut = std::pin::pin!(pool.call(req.clone()));
+        assert!(lazy(|cx| fut.as_mut().poll(cx)).await.is_pending());
         assert_eq!(pool.get_ref().waiters.borrow().waiters.len(), 1);
 
         // release and close
@@ -705,7 +698,7 @@ mod tests {
         assert_eq!(pool.get_ref().inner.borrow().acquired, 1);
 
         // drop waiter, no interest in connection
-        let mut fut = pool.call(req.clone());
+        let mut fut = Box::pin(pool.call(req.clone()));
         assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
         drop(fut);
         sleep(Millis(50)).await;
@@ -717,8 +710,8 @@ mod tests {
             uri: Uri::try_from("http://localhost2/test").unwrap(),
             addr: None,
         };
-        let mut fut = pool.call(req.clone());
-        assert!(lazy(|cx| Pin::new(&mut fut).poll(cx)).await.is_pending());
+        let mut fut = std::pin::pin!(pool.call(req.clone()));
+        assert!(lazy(|cx| fut.as_mut().poll(cx)).await.is_pending());
         assert_eq!(pool.get_ref().waiters.borrow().waiters.len(), 1);
         conn.release(false);
         assert_eq!(pool.get_ref().inner.borrow().acquired, 0);

@@ -1,11 +1,13 @@
 //! A multi-producer, single-consumer, futures-aware, FIFO queue.
-use std::{collections::VecDeque, fmt, pin::Pin, task::Context, task::Poll};
+use std::collections::VecDeque;
+use std::future::poll_fn;
+use std::{fmt, panic::UnwindSafe, pin::Pin, task::Context, task::Poll};
 
-use futures_core::Stream;
+use futures_core::{FusedStream, Stream};
 use futures_sink::Sink;
 
 use super::cell::{Cell, WeakCell};
-use crate::{future::poll_fn, task::LocalWaker};
+use crate::task::LocalWaker;
 
 /// Creates a unbounded in-memory channel with buffered storage.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
@@ -131,7 +133,7 @@ pub struct WeakSender<T> {
 }
 
 impl<T> WeakSender<T> {
-    /// Upgrade to Sender<T>
+    /// Upgrade to `Sender<T>`
     pub fn upgrade(&self) -> Option<Sender<T>> {
         self.shared.upgrade().map(|shared| Sender { shared })
     }
@@ -206,6 +208,14 @@ impl<T> Stream for Receiver<T> {
     }
 }
 
+impl<T> FusedStream for Receiver<T> {
+    fn is_terminated(&self) -> bool {
+        self.is_closed()
+    }
+}
+
+impl<T> UnwindSafe for Receiver<T> {}
+
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let shared = self.shared.get_mut();
@@ -242,8 +252,7 @@ impl<T> SendError<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{future::lazy, future::stream_recv, Stream};
-    use futures_sink::Sink;
+    use crate::{future::lazy, future::stream_recv};
 
     #[ntex_macros::rt_test2]
     async fn test_mpsc() {
@@ -313,10 +322,12 @@ mod tests {
         let (tx, rx) = channel::<()>();
         assert!(!tx.is_closed());
         assert!(!rx.is_closed());
+        assert!(!rx.is_terminated());
 
         tx.close();
         assert!(tx.is_closed());
         assert!(rx.is_closed());
+        assert!(rx.is_terminated());
 
         let (tx, rx) = channel::<()>();
         rx.close();
@@ -325,7 +336,9 @@ mod tests {
         let (tx, rx) = channel::<()>();
         drop(tx);
         assert!(rx.is_closed());
+        assert!(rx.is_terminated());
         let _tx = rx.sender();
         assert!(!rx.is_closed());
+        assert!(!rx.is_terminated());
     }
 }

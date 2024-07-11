@@ -1,4 +1,4 @@
-use std::{any::Any, any::TypeId, fmt, iter::Extend};
+use std::{any::Any, any::TypeId, fmt};
 
 #[derive(Default)]
 /// A type map of request extensions.
@@ -19,8 +19,10 @@ impl Extensions {
     ///
     /// If a extension of this type already existed, it will
     /// be returned.
-    pub fn insert<T: 'static>(&mut self, val: T) {
-        self.map.insert(TypeId::of::<T>(), Box::new(val));
+    pub fn insert<T: 'static>(&mut self, val: T) -> Option<T> {
+        self.map
+            .insert(TypeId::of::<T>(), Box::new(val))
+            .and_then(|item| item.downcast::<T>().map(|boxed| *boxed).ok())
     }
 
     /// Check if container contains entry
@@ -89,6 +91,7 @@ fn test_remove() {
 
     map.insert::<i8>(123);
     assert!(map.get::<i8>().is_some());
+    assert_eq!(map.insert::<i8>(10), Some(123));
 
     map.remove::<i8>();
     assert!(map.get::<i8>().is_none());

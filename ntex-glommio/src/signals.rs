@@ -1,9 +1,7 @@
 use std::{cell::RefCell, future::Future, pin::Pin, rc::Rc, task::Context, task::Poll};
 
-use async_oneshot as oneshot;
-
 thread_local! {
-    static SRUN: RefCell<bool> = RefCell::new(false);
+    static SRUN: RefCell<bool> = const { RefCell::new(false) };
     static SHANDLERS: Rc<RefCell<Vec<oneshot::Sender<Signal>>>> = Default::default();
 }
 
@@ -29,7 +27,7 @@ pub fn signal() -> Option<oneshot::Receiver<Signal>> {
         glommio::spawn_local(Signals::new()).detach();
     }
     SHANDLERS.with(|handlers| {
-        let (tx, rx) = oneshot::oneshot();
+        let (tx, rx) = oneshot::channel();
         handlers.borrow_mut().push(tx);
         Some(rx)
     })

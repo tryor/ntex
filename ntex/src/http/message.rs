@@ -1,9 +1,8 @@
-use std::{cell::Ref, cell::RefCell, cell::RefMut, net, rc::Rc};
+use std::{cell::Ref, cell::RefCell, cell::RefMut, fmt, net, rc::Rc};
 
 use bitflags::bitflags;
 
-use crate::http::header::HeaderMap;
-use crate::http::{h1::Codec, Method, StatusCode, Uri, Version};
+use crate::http::{h1::Codec, header::HeaderMap, Method, StatusCode, Uri, Version};
 use crate::io::{types, IoBoxed, IoRef};
 use crate::util::Extensions;
 
@@ -19,6 +18,7 @@ pub enum ConnectionType {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     pub(crate) struct Flags: u8 {
         const CLOSE       = 0b0000_0001;
         const KEEP_ALIVE  = 0b0000_0010;
@@ -28,7 +28,7 @@ bitflags! {
     }
 }
 
-pub(crate) trait Head: Default + 'static {
+pub(crate) trait Head: Default + 'static + fmt::Debug {
     fn clear(&mut self);
 
     fn with_pool<F, R>(f: F) -> R
@@ -39,16 +39,27 @@ pub(crate) trait Head: Default + 'static {
 #[derive(Clone, Debug)]
 pub(crate) enum CurrentIo {
     Ref(IoRef),
-    Io(Rc<(IoRef, RefCell<Option<Box<(IoBoxed, Codec)>>>)>),
+    Io(Rc<(IoRef, RefCell<Option<(IoBoxed, Codec)>>)>),
     None,
 }
 
 impl CurrentIo {
+    pub(crate) fn new(io: IoBoxed, codec: Codec) -> Self {
+        CurrentIo::Io(Rc::new((io.get_ref(), RefCell::new(Some((io, codec))))))
+    }
+
     pub(crate) fn as_ref(&self) -> Option<&IoRef> {
         match self {
             CurrentIo::Ref(ref io) => Some(io),
             CurrentIo::Io(ref io) => Some(&io.0),
             CurrentIo::None => None,
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<(IoBoxed, Codec)> {
+        match self {
+            CurrentIo::Io(ref inner) => inner.1.borrow_mut().take(),
+            _ => None,
         }
     }
 }
@@ -196,10 +207,22 @@ impl RequestHead {
     /// Take io and codec for current request
     ///
     /// This objects are set only for upgrade requests
-    pub fn take_io(&self) -> Option<Box<(IoBoxed, Codec)>> {
-        match self.io {
-            CurrentIo::Io(ref inner) => inner.1.borrow_mut().take(),
-            _ => None,
+    pub fn take_io(&self) -> Option<(IoBoxed, Codec)> {
+        self.io.take()
+    }
+
+    #[doc(hidden)]
+    pub fn remove_io(&mut self) {
+        self.io = CurrentIo::None;
+    }
+
+    pub(crate) fn take_io_rc(
+        &self,
+    ) -> Option<Rc<(IoRef, RefCell<Option<(IoBoxed, Codec)>>)>> {
+        if let CurrentIo::Io(ref r) = self.io {
+            Some(r.clone())
+        } else {
+            None
         }
     }
 }
@@ -362,15 +385,8 @@ impl ResponseHead {
         }
     }
 
-    pub(crate) fn set_io(&mut self, head: &RequestHead) {
-        self.io = head.io.clone();
-    }
-
-    pub(crate) fn take_io(&self) -> Option<Box<(IoBoxed, Codec)>> {
-        match self.io {
-            CurrentIo::Io(ref inner) => inner.1.borrow_mut().take(),
-            _ => None,
-        }
+    pub(crate) fn set_io(&mut self, io: Rc<(IoRef, RefCell<Option<(IoBoxed, Codec)>>)>) {
+        self.io = CurrentIo::Io(io)
     }
 }
 
@@ -396,6 +412,7 @@ impl Head for ResponseHead {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Message<T: Head> {
     head: Rc<T>,
 }
@@ -432,7 +449,15 @@ impl<T: Head> std::ops::DerefMut for Message<T> {
 
 impl<T: Head> Drop for Message<T> {
     fn drop(&mut self) {
-        T::with_pool(|p| p.release(self.head.clone()));
+        T::with_pool(|pool| {
+            let v = &mut pool.0.borrow_mut();
+            if v.len() < 128 {
+                Rc::get_mut(&mut self.head)
+                    .expect("Multiple copies exist")
+                    .clear();
+                v.push(self.head.clone());
+            }
+        });
     }
 }
 
@@ -450,24 +475,14 @@ impl<T: Head> MessagePool<T> {
     /// Get message from the pool
     #[inline]
     fn get_message(&self) -> Message<T> {
-        if let Some(mut msg) = self.0.borrow_mut().pop() {
-            if let Some(r) = Rc::get_mut(&mut msg) {
-                r.clear();
+        let head = if let Some(mut msg) = self.0.borrow_mut().pop() {
+            if let Some(msg) = Rc::get_mut(&mut msg) {
+                msg.clear();
             }
-            Message { head: msg }
+            msg
         } else {
-            Message {
-                head: Rc::new(T::default()),
-            }
-        }
-    }
-
-    #[inline]
-    /// Release request instance
-    fn release(&self, msg: Rc<T>) {
-        let v = &mut self.0.borrow_mut();
-        if v.len() < 128 {
-            v.push(msg);
-        }
+            Rc::new(T::default())
+        };
+        Message { head }
     }
 }

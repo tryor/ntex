@@ -1,5 +1,103 @@
 # Changes
 
+## [2.0.0] - 2024-05-28
+
+* Use async fn for Service::ready() and Service::shutdown()
+
+## [1.2.0] - 2024-05-12
+
+* Better write back-pressure handling
+
+* Dispatcher optimization for handling first item
+
+## [1.1.0] - 2024-05-01
+
+* Add IoRef::notify_timeout() helper method
+
+* Fix KeepAlive timeout handling in default dispatcher
+
+## [1.0.2] - 2024-03-31
+
+* Add IoRef::is_wr_backpressure() method
+
+## [1.0.1] - 2024-02-05
+
+* Add IoBoxed::take() method
+
+## [1.0.0] - 2024-01-09
+
+* Release
+
+## [1.0.0-b.1] - 2024-01-08
+
+* Remove FilterFactory trait and related utils
+
+## [1.0.0-b.0] - 2024-01-07
+
+* Use "async fn" in trait for Service definition
+
+* Min timeout more than 1sec
+
+## [0.3.17] - 2023-12-25
+
+* Fix filter leak during Io drop
+
+## [0.3.16] - 2023-12-14
+
+* Better io tags handling
+
+## [0.3.15] - 2023-12-12
+
+* Add io tags for logging
+
+* Stop dispatcher timers on memory pool pause
+
+## [0.3.14] - 2023-12-10
+
+* Fix KEEP-ALIVE timer handling
+
+## [0.3.13] - 2023-12-02
+
+* Optimize KEEP-ALIVE timer
+
+## [0.3.12] - 2023-11-29
+
+* Refactor io timers
+
+* Tune logging
+
+## [0.3.11] - 2023-11-25
+
+* Fix keep-alive timeout handling
+
+## [0.3.10] - 2023-11-23
+
+* Refactor slow frame timeout handling
+
+## [0.3.9] - 2023-11-21
+
+* Remove slow frame timer if service is not ready
+
+* Do not process data in Dispatcher from read buffer after disconnect
+
+## [0.3.8] - 2023-11-17
+
+* Remove useless logs
+
+## [0.3.7] - 2023-11-12
+
+* Handle io flush during write back-pressure
+
+## [0.3.6] - 2023-11-11
+
+* Add support for frame read timeout
+
+* Add DispatcherConfig type
+
+## [0.3.5] - 2023-11-03
+
+* Add Io::force_ready_ready() and Io::poll_force_ready_ready() methods
+
 ## [0.3.3] - 2023-09-11
 
 * Add missing fmt::Debug impls

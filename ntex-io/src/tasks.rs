@@ -14,6 +14,12 @@ impl ReadContext {
     }
 
     #[inline]
+    /// Io tag
+    pub fn tag(&self) -> &'static str {
+        self.0.tag()
+    }
+
+    #[inline]
     /// Check readiness for read operations
     pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<ReadStatus> {
         self.0.filter().poll_read_ready(cx)
@@ -38,29 +44,49 @@ impl ReadContext {
 
         // handle buffer changes
         if nbytes > 0 {
-            let buf_full = nbytes >= hw;
             let filter = self.0.filter();
             let _ = filter
                 .process_read_buf(&self.0, &inner.buffer, 0, nbytes)
                 .and_then(|status| {
                     if status.nbytes > 0 {
-                        if buf_full || inner.buffer.read_destination_size() >= hw {
+                        // dest buffer has new data, wake up dispatcher
+                        if inner.buffer.read_destination_size() >= hw {
                             log::trace!(
-                                "io read buffer is too large {}, enable read back-pressure",
+                                "{}: Io read buffer is too large {}, enable read back-pressure",
+                                self.0.tag(),
                                 total
                             );
                             inner.insert_flags(Flags::RD_READY | Flags::RD_BUF_FULL);
                         } else {
                             inner.insert_flags(Flags::RD_READY);
+
+                            if nbytes >= hw {
+                                // read task is paused because of read back-pressure
+                                // but there is no new data in top most read buffer
+                                // so we need to wake up read task to read more data
+                                // otherwise read task would sleep forever
+                                inner.read_task.wake();
+                            }
                         }
-                        log::trace!("new {} bytes available, wakeup dispatcher", nbytes,);
+                        log::trace!(
+                            "{}: New {} bytes available, wakeup dispatcher",
+                            self.0.tag(),
+                            nbytes
+                        );
                         inner.dispatch_task.wake();
-                    } else if buf_full {
-                        // read task is paused because of read back-pressure
-                        // but there is no new data in top most read buffer
-                        // so we need to wake up read task to read more data
-                        // otherwise read task would sleep forever
-                        inner.read_task.wake();
+                    } else {
+                        if nbytes >= hw {
+                            // read task is paused because of read back-pressure
+                            // but there is no new data in top most read buffer
+                            // so we need to wake up read task to read more data
+                            // otherwise read task would sleep forever
+                            inner.read_task.wake();
+                        }
+                        if inner.flags.get().contains(Flags::RD_FORCE_READY) {
+                            // in case of "force read" we must wake up dispatch task
+                            // if we read any data from source
+                            inner.dispatch_task.wake();
+                        }
                     }
 
                     // while reading, filter wrote some data
@@ -74,8 +100,8 @@ impl ReadContext {
                 })
                 .map_err(|err| {
                     inner.dispatch_task.wake();
-                    inner.insert_flags(Flags::RD_READY);
                     inner.io_stopped(Some(err));
+                    inner.insert_flags(Flags::RD_READY);
                 });
         }
 
@@ -108,6 +134,12 @@ impl WriteContext {
     }
 
     #[inline]
+    /// Io tag
+    pub fn tag(&self) -> &'static str {
+        self.0.tag()
+    }
+
+    #[inline]
     /// Return memory pool for this context
     pub fn memory_pool(&self) -> PoolRef {
         self.0.memory_pool()
@@ -134,16 +166,16 @@ impl WriteContext {
 
         // if write buffer is smaller than high watermark value, turn off back-pressure
         let mut flags = inner.flags.get();
-        let mut wake_dispatcher = false;
-        if flags.contains(Flags::WR_BACKPRESSURE)
+        if len == 0 {
+            if flags.intersects(Flags::WR_WAIT | Flags::WR_BACKPRESSURE) {
+                flags.remove(Flags::WR_WAIT | Flags::WR_BACKPRESSURE);
+                inner.dispatch_task.wake();
+            }
+        } else if flags.contains(Flags::WR_BACKPRESSURE)
             && len < inner.pool.get().write_params_high() << 1
         {
             flags.remove(Flags::WR_BACKPRESSURE);
-            wake_dispatcher = true;
-        }
-        if flags.contains(Flags::WR_WAIT) && len == 0 {
-            flags.remove(Flags::WR_WAIT);
-            wake_dispatcher = true;
+            inner.dispatch_task.wake();
         }
 
         match result {
@@ -153,10 +185,6 @@ impl WriteContext {
         }
 
         inner.flags.set(flags);
-        if wake_dispatcher {
-            inner.dispatch_task.wake();
-        }
-
         result
     }
 

@@ -1,5 +1,4 @@
-use std::{cell::RefCell, io, task::Context, task::Poll};
-use std::{marker::PhantomData, mem, rc::Rc};
+use std::{cell::RefCell, error::Error, fmt, future::poll_fn, io, marker, mem, rc::Rc};
 
 use ntex_h2::{self as h2, frame::StreamId, server};
 
@@ -11,18 +10,20 @@ use crate::http::message::{CurrentIo, ResponseHead};
 use crate::http::{DateService, Method, Request, Response, StatusCode, Uri, Version};
 use crate::io::{types, Filter, Io, IoBoxed, IoRef};
 use crate::service::{IntoServiceFactory, Service, ServiceCtx, ServiceFactory};
-use crate::util::{poll_fn, BoxFuture, Bytes, BytesMut, Either, HashMap, Ready};
+use crate::util::{Bytes, BytesMut, HashMap};
 
 use super::payload::{Payload, PayloadSender};
+use super::DefaultControlService;
 
 /// `ServiceFactory` implementation for HTTP2 transport
-pub struct H2Service<F, S, B> {
+pub struct H2Service<F, S, B, C> {
     srv: S,
+    ctl: Rc<C>,
     cfg: ServiceConfig,
-    _t: PhantomData<(F, B)>,
+    _t: marker::PhantomData<(F, B)>,
 }
 
-impl<F, S, B> H2Service<F, S, B>
+impl<F, S, B> H2Service<F, S, B, DefaultControlService>
 where
     S: ServiceFactory<Request>,
     S::Error: ResponseError,
@@ -37,63 +38,71 @@ where
         H2Service {
             cfg,
             srv: service.into_factory(),
-            _t: PhantomData,
+            ctl: Rc::new(DefaultControlService),
+            _t: marker::PhantomData,
         }
     }
 }
 
 #[cfg(feature = "openssl")]
 mod openssl {
-    use ntex_tls::openssl::{Acceptor, SslFilter};
-    use tls_openssl::ssl::SslAcceptor;
+    use ntex_tls::openssl::{SslAcceptor, SslFilter};
+    use tls_openssl::ssl;
 
     use crate::{io::Layer, server::SslError};
 
     use super::*;
 
-    impl<F, S, B> H2Service<Layer<SslFilter, F>, S, B>
+    impl<F, S, B, C> H2Service<Layer<SslFilter, F>, S, B, C>
     where
         F: Filter,
         S: ServiceFactory<Request> + 'static,
         S::Error: ResponseError,
+        S::InitError: fmt::Debug,
         S::Response: Into<Response<B>>,
         B: MessageBody,
+        C: ServiceFactory<h2::Control<H2Error>, Response = h2::ControlAck> + 'static,
+        C::Error: Error,
+        C::InitError: fmt::Debug,
     {
         /// Create ssl based service
         pub fn openssl(
             self,
-            acceptor: SslAcceptor,
+            acceptor: ssl::SslAcceptor,
         ) -> impl ServiceFactory<
             Io<F>,
             Response = (),
             Error = SslError<DispatchError>,
-            InitError = S::InitError,
+            InitError = (),
         > {
-            Acceptor::new(acceptor)
-                .timeout(self.cfg.0.ssl_handshake_timeout)
-                .chain()
+            SslAcceptor::new(acceptor)
+                .timeout(self.cfg.ssl_handshake_timeout)
                 .map_err(SslError::Ssl)
                 .map_init_err(|_| panic!())
-                .and_then(self.chain().map_err(SslError::Service))
+                .and_then(self.map_err(SslError::Service))
         }
     }
 }
 
 #[cfg(feature = "rustls")]
 mod rustls {
-    use ntex_tls::rustls::{Acceptor, TlsFilter};
+    use ntex_tls::rustls::{TlsAcceptor, TlsServerFilter};
     use tls_rustls::ServerConfig;
 
     use super::*;
     use crate::{io::Layer, server::SslError};
 
-    impl<F, S, B> H2Service<Layer<TlsFilter, F>, S, B>
+    impl<F, S, B, C> H2Service<Layer<TlsServerFilter, F>, S, B, C>
     where
         F: Filter,
         S: ServiceFactory<Request> + 'static,
         S::Error: ResponseError,
+        S::InitError: fmt::Debug,
         S::Response: Into<Response<B>>,
         B: MessageBody,
+        C: ServiceFactory<h2::Control<H2Error>, Response = h2::ControlAck> + 'static,
+        C::Error: Error,
+        C::InitError: fmt::Debug,
     {
         /// Create openssl based service
         pub fn rustls(
@@ -103,111 +112,154 @@ mod rustls {
             Io<F>,
             Response = (),
             Error = SslError<DispatchError>,
-            InitError = S::InitError,
+            InitError = (),
         > {
             let protos = vec!["h2".to_string().into()];
             config.alpn_protocols = protos;
 
-            Acceptor::from(config)
-                .timeout(self.cfg.0.ssl_handshake_timeout)
-                .chain()
+            TlsAcceptor::from(config)
+                .timeout(self.cfg.ssl_handshake_timeout)
                 .map_err(|e| SslError::Ssl(Box::new(e)))
                 .map_init_err(|_| panic!())
-                .and_then(self.chain().map_err(SslError::Service))
+                .and_then(self.map_err(SslError::Service))
         }
     }
 }
 
-impl<F, S, B> ServiceFactory<Io<F>> for H2Service<F, S, B>
+impl<F, S, B, C> H2Service<F, S, B, C>
+where
+    F: Filter,
+    S: ServiceFactory<Request> + 'static,
+    S::Response: Into<Response<B>>,
+    S::Error: ResponseError,
+    S::InitError: fmt::Debug,
+    B: MessageBody,
+    C: ServiceFactory<h2::Control<H2Error>, Response = h2::ControlAck>,
+    C::Error: Error,
+    C::InitError: fmt::Debug,
+{
+    /// Provide http/2 control service
+    pub fn control<CT>(self, ctl: CT) -> H2Service<F, S, B, CT>
+    where
+        CT: ServiceFactory<h2::Control<H2Error>, Response = h2::ControlAck>,
+        CT::Error: Error,
+        CT::InitError: fmt::Debug,
+    {
+        H2Service {
+            ctl: Rc::new(ctl),
+            cfg: self.cfg,
+            srv: self.srv,
+            _t: marker::PhantomData,
+        }
+    }
+}
+
+impl<F, S, B, C> ServiceFactory<Io<F>> for H2Service<F, S, B, C>
 where
     F: Filter,
     S: ServiceFactory<Request> + 'static,
     S::Error: ResponseError,
+    S::InitError: fmt::Debug,
     S::Response: Into<Response<B>>,
     B: MessageBody,
+    C: ServiceFactory<h2::Control<H2Error>, Response = h2::ControlAck> + 'static,
+    C::Error: Error,
+    C::InitError: fmt::Debug,
 {
     type Response = ();
     type Error = DispatchError;
-    type InitError = S::InitError;
-    type Service = H2ServiceHandler<F, S::Service, B>;
-    type Future<'f> = BoxFuture<'f, Result<Self::Service, Self::InitError>>;
+    type InitError = ();
+    type Service = H2ServiceHandler<F, S::Service, B, C>;
 
-    fn create(&self, _: ()) -> Self::Future<'_> {
-        let fut = self.srv.create(());
-        let cfg = self.cfg.clone();
+    async fn create(&self, _: ()) -> Result<Self::Service, Self::InitError> {
+        let service = self
+            .srv
+            .create(())
+            .await
+            .map_err(|e| log::error!("Cannot construct publish service: {:?}", e))?;
+        let config = Rc::new(DispatcherConfig::new(self.cfg.clone(), service, ()));
 
-        Box::pin(async move {
-            let service = fut.await?;
-            let config = Rc::new(DispatcherConfig::new(cfg, service, (), None, None));
-
-            Ok(H2ServiceHandler {
-                config,
-                _t: PhantomData,
-            })
+        Ok(H2ServiceHandler {
+            config,
+            control: self.ctl.clone(),
+            _t: marker::PhantomData,
         })
     }
 }
 
 /// `Service` implementation for http/2 transport
-pub struct H2ServiceHandler<F, S: Service<Request>, B> {
-    config: Rc<DispatcherConfig<S, (), ()>>,
-    _t: PhantomData<(F, B)>,
+pub struct H2ServiceHandler<F, S: Service<Request>, B, C> {
+    config: Rc<DispatcherConfig<S, ()>>,
+    control: Rc<C>,
+    _t: marker::PhantomData<(F, B)>,
 }
 
-impl<F, S, B> Service<Io<F>> for H2ServiceHandler<F, S, B>
+impl<F, S, B, C> Service<Io<F>> for H2ServiceHandler<F, S, B, C>
 where
     F: Filter,
     S: Service<Request> + 'static,
     S::Error: ResponseError,
     S::Response: Into<Response<B>>,
     B: MessageBody,
+    C: ServiceFactory<h2::Control<H2Error>, Response = h2::ControlAck> + 'static,
+    C::Error: Error,
+    C::InitError: fmt::Debug,
 {
     type Response = ();
     type Error = DispatchError;
-    type Future<'f> = BoxFuture<'f, Result<Self::Response, Self::Error>>;
 
     #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.config.service.poll_ready(cx).map_err(|e| {
+    async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        self.config.service.ready().await.map_err(|e| {
             log::error!("Service readiness error: {:?}", e);
             DispatchError::Service(Box::new(e))
         })
     }
 
     #[inline]
-    fn poll_shutdown(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.config.service.poll_shutdown(cx)
+    async fn shutdown(&self) {
+        self.config.service.shutdown().await
     }
 
-    fn call<'a>(&'a self, io: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'_> {
+    async fn call(
+        &self,
+        io: Io<F>,
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
         log::trace!(
             "New http2 connection, peer address {:?}",
             io.query::<types::PeerAddr>().get()
         );
+        let control = self.control.create(()).await.map_err(|e| {
+            DispatchError::Control(
+                format!("Cannot construct control service: {:?}", e).into(),
+            )
+        })?;
 
-        Box::pin(handle(io.into(), self.config.clone()))
+        handle(io.into(), control, self.config.clone()).await
     }
 }
 
-pub(in crate::http) async fn handle<S, B, X, U>(
+pub(in crate::http) async fn handle<S, B, C1: 'static, C2>(
     io: IoBoxed,
-    config: Rc<DispatcherConfig<S, X, U>>,
+    control: C2,
+    config: Rc<DispatcherConfig<S, C1>>,
 ) -> Result<(), DispatchError>
 where
     S: Service<Request> + 'static,
     S::Error: ResponseError,
     S::Response: Into<Response<B>>,
     B: MessageBody,
-    X: 'static,
-    U: 'static,
+    C2: Service<h2::Control<H2Error>, Response = h2::ControlAck> + 'static,
+    C2::Error: Error,
 {
-    io.set_disconnect_timeout(config.client_disconnect.into());
+    io.set_disconnect_timeout(config.client_disconnect);
     let ioref = io.get_ref();
 
     let _ = server::handle_one(
         io,
         config.h2config.clone(),
-        ControlService::new(),
+        control,
         PublishService::new(ioref, config),
     )
     .await;
@@ -215,84 +267,57 @@ where
     Ok(())
 }
 
-struct ControlService {}
-
-impl ControlService {
-    fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Service<h2::ControlMessage<H2Error>> for ControlService {
-    type Response = h2::ControlResult;
-    type Error = ();
-    type Future<'f> = Ready<Self::Response, Self::Error>;
-
-    fn call<'a>(
-        &'a self,
-        msg: h2::ControlMessage<H2Error>,
-        _: ServiceCtx<'a, Self>,
-    ) -> Self::Future<'a> {
-        log::trace!("Control message: {:?}", msg);
-        Ready::Ok::<_, ()>(msg.ack())
-    }
-}
-
-struct PublishService<S: Service<Request>, B, X, U> {
+struct PublishService<S: Service<Request>, B, C> {
     io: IoRef,
-    config: Rc<DispatcherConfig<S, X, U>>,
+    config: Rc<DispatcherConfig<S, C>>,
     streams: RefCell<HashMap<StreamId, PayloadSender>>,
-    _t: PhantomData<B>,
+    _t: marker::PhantomData<B>,
 }
 
-impl<S, B, X, U> PublishService<S, B, X, U>
+impl<S, B, C> PublishService<S, B, C>
 where
     S: Service<Request> + 'static,
     S::Error: ResponseError,
     S::Response: Into<Response<B>>,
     B: MessageBody,
 {
-    fn new(io: IoRef, config: Rc<DispatcherConfig<S, X, U>>) -> Self {
+    fn new(io: IoRef, config: Rc<DispatcherConfig<S, C>>) -> Self {
         Self {
             io,
             config,
             streams: RefCell::new(HashMap::default()),
-            _t: PhantomData,
+            _t: marker::PhantomData,
         }
     }
 }
 
-impl<S, B, X, U> Service<h2::Message> for PublishService<S, B, X, U>
+impl<S, B, C> Service<h2::Message> for PublishService<S, B, C>
 where
     S: Service<Request> + 'static,
     S::Error: ResponseError,
     S::Response: Into<Response<B>>,
     B: MessageBody,
-    X: 'static,
-    U: 'static,
+    C: 'static,
 {
     type Response = ();
     type Error = H2Error;
-    type Future<'f> = Either<
-        BoxFuture<'f, Result<Self::Response, Self::Error>>,
-        Ready<Self::Response, Self::Error>,
-    >;
 
-    fn call<'a>(
-        &'a self,
-        mut msg: h2::Message,
-        _: ServiceCtx<'a, Self>,
-    ) -> Self::Future<'a> {
-        let (io, pseudo, headers, eof, payload) = match msg.kind().take() {
+    async fn call(
+        &self,
+        msg: h2::Message,
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        let h2::Message { stream, kind } = msg;
+        let (io, pseudo, headers, eof, payload) = match kind {
             h2::MessageKind::Headers {
                 pseudo,
                 headers,
                 eof,
             } => {
                 let pl = if !eof {
-                    log::debug!("Creating local payload stream for {:?}", msg.id());
-                    let (sender, payload) = Payload::create(msg.stream().empty_capacity());
-                    self.streams.borrow_mut().insert(msg.id(), sender);
+                    log::debug!("Creating local payload stream for {:?}", stream.id());
+                    let (sender, payload) = Payload::create(stream.empty_capacity());
+                    self.streams.borrow_mut().insert(stream.id(), sender);
                     Some(payload)
                 } else {
                     None
@@ -300,17 +325,17 @@ where
                 (self.io.clone(), pseudo, headers, eof, pl)
             }
             h2::MessageKind::Data(data, cap) => {
-                log::debug!("Got data chunk for {:?}: {:?}", msg.id(), data.len());
-                if let Some(sender) = self.streams.borrow_mut().get_mut(&msg.id()) {
+                log::debug!("Got data chunk for {:?}: {:?}", stream.id(), data.len());
+                if let Some(sender) = self.streams.borrow_mut().get_mut(&stream.id()) {
                     sender.feed_data(data, cap)
                 } else {
-                    log::error!("Payload stream does not exists for {:?}", msg.id());
+                    log::error!("Payload stream does not exists for {:?}", stream.id());
                 };
-                return Either::Right(Ready::Ok(()));
+                return Ok(());
             }
             h2::MessageKind::Eof(item) => {
-                log::debug!("Got payload eof for {:?}: {:?}", msg.id(), item);
-                if let Some(mut sender) = self.streams.borrow_mut().remove(&msg.id()) {
+                log::debug!("Got payload eof for {:?}: {:?}", stream.id(), item);
+                if let Some(mut sender) = self.streams.borrow_mut().remove(&stream.id()) {
                     match item {
                         h2::StreamEof::Data(data) => {
                             sender.feed_eof(data);
@@ -321,96 +346,93 @@ where
                         h2::StreamEof::Error(err) => sender.set_error(err.into()),
                     }
                 }
-                return Either::Right(Ready::Ok(()));
+                return Ok(());
             }
             h2::MessageKind::Disconnect(err) => {
                 log::debug!("Connection is disconnected {:?}", err);
-                if let Some(mut sender) = self.streams.borrow_mut().remove(&msg.id()) {
+                if let Some(mut sender) = self.streams.borrow_mut().remove(&stream.id()) {
                     sender.set_error(io::Error::new(io::ErrorKind::Other, err).into());
                 }
-                return Either::Right(Ready::Ok(()));
+                return Ok(());
             }
-            h2::MessageKind::Empty => return Either::Right(Ready::Ok(())),
         };
 
         let cfg = self.config.clone();
 
-        Either::Left(Box::pin(async move {
-            log::trace!(
-                "{:?} got request (eof: {}): {:#?}\nheaders: {:#?}",
-                msg.id(),
-                eof,
-                pseudo,
-                headers
-            );
-            let mut req = if let Some(pl) = payload {
-                Request::with_payload(crate::http::Payload::H2(pl))
-            } else {
-                Request::new()
-            };
+        log::trace!(
+            "{:?} got request (eof: {}): {:#?}\nheaders: {:#?}",
+            stream.id(),
+            eof,
+            pseudo,
+            headers
+        );
+        let mut req = if let Some(pl) = payload {
+            Request::with_payload(crate::http::Payload::H2(pl))
+        } else {
+            Request::new()
+        };
 
-            let path = pseudo.path.ok_or(H2Error::MissingPseudo("Path"))?;
-            let method = pseudo.method.ok_or(H2Error::MissingPseudo("Method"))?;
+        let path = pseudo.path.ok_or(H2Error::MissingPseudo("Path"))?;
+        let method = pseudo.method.ok_or(H2Error::MissingPseudo("Method"))?;
 
-            let head = req.head_mut();
-            head.uri = if let Some(ref authority) = pseudo.authority {
-                let scheme = pseudo.scheme.ok_or(H2Error::MissingPseudo("Scheme"))?;
-                Uri::try_from(format!("{}://{}{}", scheme, authority, path))?
-            } else {
-                Uri::try_from(path.as_str())?
-            };
-            let is_head_req = method == Method::HEAD;
-            head.version = Version::HTTP_2;
-            head.method = method;
-            head.headers = headers;
-            head.io = CurrentIo::Ref(io);
+        let head = req.head_mut();
+        head.uri = if let Some(ref authority) = pseudo.authority {
+            let scheme = pseudo.scheme.ok_or(H2Error::MissingPseudo("Scheme"))?;
+            Uri::try_from(format!("{}://{}{}", scheme, authority, path))?
+        } else {
+            Uri::try_from(path.as_str())?
+        };
+        let is_head_req = method == Method::HEAD;
+        head.version = Version::HTTP_2;
+        head.method = method;
+        head.headers = headers;
+        head.io = CurrentIo::Ref(io);
 
-            let (mut res, mut body) = match cfg.service.call(req).await {
-                Ok(res) => res.into().into_parts(),
-                Err(err) => {
-                    let (res, body) = Response::from(&err).into_parts();
-                    (res, body.into_body())
-                }
-            };
+        let (mut res, mut body) = match cfg.service.call(req).await {
+            Ok(res) => res.into().into_parts(),
+            Err(err) => {
+                let (res, body) = Response::from(&err).into_parts();
+                (res, body.into_body())
+            }
+        };
 
-            let head = res.head_mut();
-            let mut size = body.size();
-            prepare_response(&cfg.timer, head, &mut size);
+        let head = res.head_mut();
+        let mut size = body.size();
+        prepare_response(&cfg.timer, head, &mut size);
 
-            log::debug!("Received service response: {:?} payload: {:?}", head, size);
+        log::debug!("Received service response: {:?} payload: {:?}", head, size);
 
-            let hdrs = mem::replace(&mut head.headers, HeaderMap::new());
-            if size.is_eof() || is_head_req {
-                msg.stream().send_response(head.status, hdrs, true)?;
-            } else {
-                msg.stream().send_response(head.status, hdrs, false)?;
+        let hdrs = mem::replace(&mut head.headers, HeaderMap::new());
+        if size.is_eof() || is_head_req {
+            stream.send_response(head.status, hdrs, true)?;
+        } else {
+            stream.send_response(head.status, hdrs, false)?;
 
-                loop {
-                    match poll_fn(|cx| body.poll_next_chunk(cx)).await {
-                        None => {
-                            log::debug!("{:?} closing payload stream", msg.id());
-                            msg.stream().send_payload(Bytes::new(), true).await?;
-                            break;
+            loop {
+                match poll_fn(|cx| body.poll_next_chunk(cx)).await {
+                    None => {
+                        log::debug!("{:?} closing payload stream", stream.id());
+                        stream.send_payload(Bytes::new(), true).await?;
+                        break;
+                    }
+                    Some(Ok(chunk)) => {
+                        log::debug!(
+                            "{:?} sending data chunk {:?} bytes",
+                            stream.id(),
+                            chunk.len()
+                        );
+                        if !chunk.is_empty() {
+                            stream.send_payload(chunk, false).await?;
                         }
-                        Some(Ok(chunk)) => {
-                            log::debug!(
-                                "{:?} sending data chunk {:?} bytes",
-                                msg.id(),
-                                chunk.len()
-                            );
-                            if !chunk.is_empty() {
-                                msg.stream().send_payload(chunk, false).await?;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            error!("Response payload stream error: {:?}", e);
-                            return Err(e.into());
-                        }
+                    }
+                    Some(Err(e)) => {
+                        log::error!("Response payload stream error: {:?}", e);
+                        return Err(e.into());
                     }
                 }
             }
-            Ok(())
-        }))
+        }
+        Ok(())
     }
 }
 

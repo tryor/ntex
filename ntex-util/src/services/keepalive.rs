@@ -1,9 +1,7 @@
-use std::task::{Context, Poll};
-use std::{cell::Cell, convert::Infallible, fmt, marker, time::Duration, time::Instant};
+use std::{cell::Cell, convert::Infallible, fmt, future::poll_fn, marker, task, time};
 
 use ntex_service::{Service, ServiceCtx, ServiceFactory};
 
-use crate::future::Ready;
 use crate::time::{now, sleep, Millis, Sleep};
 
 /// KeepAlive service factory
@@ -54,19 +52,19 @@ impl<R, E, F> fmt::Debug for KeepAlive<R, E, F> {
     }
 }
 
-impl<R, E, F, C: 'static> ServiceFactory<R, C> for KeepAlive<R, E, F>
+impl<R, E, F, C> ServiceFactory<R, C> for KeepAlive<R, E, F>
 where
     F: Fn() -> E + Clone,
 {
     type Response = R;
     type Error = E;
-    type InitError = Infallible;
+
     type Service = KeepAliveService<R, E, F>;
-    type Future<'f> = Ready<Self::Service, Self::InitError> where Self: 'f, C: 'f;
+    type InitError = Infallible;
 
     #[inline]
-    fn create(&self, _: C) -> Self::Future<'_> {
-        Ready::Ok(KeepAliveService::new(self.ka, self.f.clone()))
+    async fn create(&self, _: C) -> Result<Self::Service, Self::InitError> {
+        Ok(KeepAliveService::new(self.ka, self.f.clone()))
     }
 }
 
@@ -74,7 +72,7 @@ pub struct KeepAliveService<R, E, F> {
     f: F,
     dur: Millis,
     sleep: Sleep,
-    expire: Cell<Instant>,
+    expire: Cell<time::Instant>,
     _t: marker::PhantomData<(R, E)>,
 }
 
@@ -111,36 +109,36 @@ where
 {
     type Response = R;
     type Error = E;
-    type Future<'f> = Ready<R, E> where Self: 'f, R: 'f;
 
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self.sleep.poll_elapsed(cx) {
-            Poll::Ready(_) => {
+    async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        poll_fn(|cx| match self.sleep.poll_elapsed(cx) {
+            task::Poll::Ready(_) => {
                 let now = now();
-                let expire = self.expire.get() + Duration::from(self.dur);
+                let expire = self.expire.get() + time::Duration::from(self.dur);
                 if expire <= now {
-                    Poll::Ready(Err((self.f)()))
+                    task::Poll::Ready(Err((self.f)()))
                 } else {
                     let expire = expire - now;
                     self.sleep
                         .reset(Millis(expire.as_millis().try_into().unwrap_or(u32::MAX)));
                     let _ = self.sleep.poll_elapsed(cx);
-                    Poll::Ready(Ok(()))
+                    task::Poll::Ready(Ok(()))
                 }
             }
-            Poll::Pending => Poll::Ready(Ok(())),
-        }
+            task::Poll::Pending => task::Poll::Ready(Ok(())),
+        })
+        .await
     }
 
-    fn call<'a>(&'a self, req: R, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
+    async fn call(&self, req: R, _: ServiceCtx<'_, Self>) -> Result<R, E> {
         self.expire.set(now());
-        Ready::Ok(req)
+        Ok(req)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ntex_service::ServiceFactory;
+    use std::task::Poll;
 
     use super::*;
     use crate::future::lazy;
@@ -151,9 +149,11 @@ mod tests {
     #[ntex_macros::rt_test2]
     async fn test_ka() {
         let factory = KeepAlive::new(Millis(100), || TestErr);
+        assert!(format!("{:?}", factory).contains("KeepAlive"));
         let _ = factory.clone();
 
-        let service = factory.pipeline(&()).await.unwrap();
+        let service = factory.pipeline(&()).await.unwrap().bind();
+        assert!(format!("{:?}", service).contains("KeepAliveService"));
 
         assert_eq!(service.call(1usize).await, Ok(1usize));
         assert!(lazy(|cx| service.poll_ready(cx)).await.is_ready());

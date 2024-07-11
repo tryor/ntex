@@ -1,18 +1,21 @@
+#![allow(clippy::let_underscore_future)]
 use std::any::{Any, TypeId};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::{cell::RefCell, collections::HashMap, fmt, future::Future, pin::Pin, thread};
 
 use async_channel::{unbounded, Receiver, Sender};
-use async_oneshot as oneshot;
 use futures_core::stream::Stream;
 
 use crate::system::System;
 
 thread_local!(
-    static ADDR: RefCell<Option<Arbiter>> = RefCell::new(None);
+    static ADDR: RefCell<Option<Arbiter>> = const { RefCell::new(None) };
     static STORAGE: RefCell<HashMap<TypeId, Box<dyn Any>>> = RefCell::new(HashMap::new());
 );
+
+type ServerCommandRx = Pin<Box<dyn Stream<Item = SystemCommand>>>;
+type ArbiterCommandRx = Pin<Box<dyn Stream<Item = ArbiterCommand>>>;
 
 pub(super) static COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -57,7 +60,13 @@ impl Arbiter {
         ADDR.with(|cell| *cell.borrow_mut() = Some(arb.clone()));
         STORAGE.with(|cell| cell.borrow_mut().clear());
 
-        (arb, ArbiterController { stop: None, rx })
+        (
+            arb,
+            ArbiterController {
+                stop: None,
+                rx: Box::pin(rx),
+            },
+        )
     }
 
     /// Returns the current thread's arbiter's address. If no Arbiter is present, then this
@@ -88,16 +97,16 @@ impl Arbiter {
             .spawn(move || {
                 let arb = Arbiter::with_sender(arb_tx);
 
-                let (stop, stop_rx) = oneshot::oneshot();
+                let (stop, stop_rx) = oneshot::channel();
                 STORAGE.with(|cell| cell.borrow_mut().clear());
 
                 System::set_current(sys);
 
                 crate::block_on(async move {
                     // start arbiter controller
-                    crate::spawn(ArbiterController {
+                    let _ = crate::spawn(ArbiterController {
                         stop: Some(stop),
-                        rx: arb_rx,
+                        rx: Box::pin(arb_rx),
                     });
                     ADDR.with(|cell| *cell.borrow_mut() = Some(arb.clone()));
 
@@ -138,18 +147,16 @@ impl Arbiter {
     /// Send a function to the Arbiter's thread. This function will be executed asynchronously.
     /// A future is created, and when resolved will contain the result of the function sent
     /// to the Arbiters thread.
-    pub fn exec<F, R>(&self, f: F) -> impl Future<Output = Result<R, oneshot::Closed>>
+    pub fn exec<F, R>(&self, f: F) -> impl Future<Output = Result<R, oneshot::RecvError>>
     where
         F: FnOnce() -> R + Send + 'static,
-        R: Sync + Send + 'static,
+        R: Send + 'static,
     {
-        let (mut tx, rx) = oneshot::oneshot();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .sender
             .try_send(ArbiterCommand::ExecuteFn(Box::new(move || {
-                if !tx.is_closed() {
-                    let _ = tx.send(f());
-                }
+                let _ = tx.send(f());
             })));
         rx
     }
@@ -231,7 +238,7 @@ impl Arbiter {
 
 pub(crate) struct ArbiterController {
     stop: Option<oneshot::Sender<i32>>,
-    rx: Receiver<ArbiterCommand>,
+    rx: ArbiterCommandRx,
 }
 
 impl Drop for ArbiterController {
@@ -256,13 +263,13 @@ impl Future for ArbiterController {
                 Poll::Ready(None) => return Poll::Ready(()),
                 Poll::Ready(Some(item)) => match item {
                     ArbiterCommand::Stop => {
-                        if let Some(mut stop) = self.stop.take() {
+                        if let Some(stop) = self.stop.take() {
                             let _ = stop.send(0);
                         };
                         return Poll::Ready(());
                     }
                     ArbiterCommand::Execute(fut) => {
-                        crate::spawn(fut);
+                        let _ = crate::spawn(fut);
                     }
                     ArbiterCommand::ExecuteFn(f) => {
                         f.call_box();
@@ -281,10 +288,9 @@ pub(super) enum SystemCommand {
     UnregisterArbiter(usize),
 }
 
-#[derive(Debug)]
 pub(super) struct SystemArbiter {
     stop: Option<oneshot::Sender<i32>>,
-    commands: Receiver<SystemCommand>,
+    commands: ServerCommandRx,
     arbiters: HashMap<usize, Arbiter>,
 }
 
@@ -294,10 +300,18 @@ impl SystemArbiter {
         commands: Receiver<SystemCommand>,
     ) -> Self {
         SystemArbiter {
-            commands,
+            commands: Box::pin(commands),
             stop: Some(stop),
             arbiters: HashMap::new(),
         }
+    }
+}
+
+impl fmt::Debug for SystemArbiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SystemArbiter")
+            .field("arbiters", &self.arbiters)
+            .finish()
     }
 }
 
@@ -306,16 +320,23 @@ impl Future for SystemArbiter {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            match Pin::new(&mut self.commands).poll_next(cx) {
-                Poll::Ready(None) => return Poll::Ready(()),
-                Poll::Ready(Some(cmd)) => match cmd {
+            let cmd = ready!(Pin::new(&mut self.commands).poll_next(cx));
+            log::debug!("Received system command: {:?}", cmd);
+            match cmd {
+                None => {
+                    log::debug!("System stopped");
+                    return Poll::Ready(());
+                }
+                Some(cmd) => match cmd {
                     SystemCommand::Exit(code) => {
+                        log::debug!("Stopping system with {} code", code);
+
                         // stop arbiters
                         for arb in self.arbiters.values() {
                             arb.stop();
                         }
                         // stop event loop
-                        if let Some(mut stop) = self.stop.take() {
+                        if let Some(stop) = self.stop.take() {
                             let _ = stop.send(code);
                         }
                     }
@@ -326,7 +347,6 @@ impl Future for SystemArbiter {
                         self.arbiters.remove(&name);
                     }
                 },
-                Poll::Pending => return Poll::Pending,
             }
         }
     }

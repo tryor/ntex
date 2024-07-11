@@ -1,5 +1,45 @@
 # Changes
 
+## [2.1.0] - 2024-06-26
+
+* Add task::yield_to() helper
+
+## [2.0.1] - 2024-05-28
+
+* Re-enable BufferService
+
+## [2.0.0] - 2024-05-28
+
+* Use async fn for Service::ready() and Service::shutdown()
+
+## [1.1.0] - 2024-04-xx
+
+* Change Extensions::insert() method according doc #345
+
+## [1.0.1] - 2024-01-19
+
+* Allow to lock readiness for Condition
+
+## [1.0.0] - 2024-01-09
+
+* Release
+
+## [1.0.0-b.1] - 2024-01-08
+
+* Remove unnecessary 'static
+
+## [1.0.0-b.0] - 2024-01-07
+
+* Use "async fn" in trait for Service definition
+
+## [0.3.4] - 2023-11-06
+
+* Add UnwindSafe trait on mpsc::Receiver<T> #239
+
+## [0.3.3] - 2023-11-02
+
+* Add FusedStream trait on mpsc::Receiver<T> #235
+
 ## [0.3.2] - 2023-09-11
 
 * Add missing fmt::Debug impls

@@ -85,6 +85,8 @@ mod service;
 pub mod test;
 pub mod types;
 mod util;
+
+#[cfg(feature = "ws")]
 pub mod ws;
 
 // re-export proc macro
@@ -125,12 +127,13 @@ pub mod dev {
     //! The purpose of this module is to alleviate imports of many common
     //! traits by adding a glob import to the top of ntex::web heavy modules:
 
-    use super::Handler;
     pub use crate::web::config::AppConfig;
     pub use crate::web::info::ConnectionInfo;
     pub use crate::web::rmap::ResourceMap;
     pub use crate::web::route::IntoRoutes;
     pub use crate::web::service::{WebServiceAdapter, WebServiceConfig, WebServiceFactory};
+
+    use crate::web::Handler;
 
     pub(crate) fn insert_slash(mut patterns: Vec<String>) -> Vec<String> {
         for path in &mut patterns {
@@ -155,11 +158,11 @@ pub mod dev {
     #[inline(always)]
     pub fn __assert_handler<Err, Fun, Fut>(
         f: Fun,
-    ) -> impl for<'r> Handler<(), Err, Future<'r> = Fut, Output = Fut::Output>
+    ) -> impl Handler<(), Err, Output = Fut::Output>
     where
         Err: super::ErrorRenderer,
         Fun: Fn() -> Fut + 'static,
-        Fut: std::future::Future + 'static,
+        Fut: std::future::Future,
         Fut::Output: super::Responder<Err>,
     {
         f
@@ -170,12 +173,12 @@ pub mod dev {
         #[inline(always)]
         pub fn $name<Err, Fun, Fut, $($T,)+>(
             f: Fun,
-        ) -> impl for<'r> Handler<($($T,)+), Err, Future<'r> = Fut, Output = Fut::Output>
+        ) -> impl Handler<($($T,)+), Err, Output = Fut::Output>
         where
             Err: $crate::web::ErrorRenderer,
             Fun: Fn($($T,)+) -> Fut + 'static,
             Fut: std::future::Future + 'static,
-            Fut::Output: $crate::web::Responder<Err>,
+            Fut::Output: super::Responder<Err>,
         $($T: $crate::web::FromRequest<Err>),+,
         {
             f

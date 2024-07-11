@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tls_openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
-use tls_rustls::ClientConfig;
 
 use ntex::http::client::{Client, Connector};
 use ntex::http::test::server as test_server;
@@ -11,6 +10,8 @@ use ntex::http::HttpService;
 use ntex::service::{chain_factory, map_config, ServiceFactory};
 use ntex::util::Ready;
 use ntex::web::{self, dev::AppConfig, App, HttpResponse};
+
+mod rustls_utils;
 
 fn ssl_acceptor() -> SslAcceptor {
     // load ssl keys
@@ -32,27 +33,6 @@ fn ssl_acceptor() -> SslAcceptor {
     });
     builder.set_alpn_protos(b"\x02h2").unwrap();
     builder.build()
-}
-
-mod danger {
-    use std::time::SystemTime;
-    use tls_rustls::{Certificate, ServerName};
-
-    pub struct NoCertificateVerification {}
-
-    impl tls_rustls::client::ServerCertVerifier for NoCertificateVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: SystemTime,
-        ) -> Result<tls_rustls::client::ServerCertVerified, tls_rustls::Error> {
-            Ok(tls_rustls::client::ServerCertVerified::assertion())
-        }
-    }
 }
 
 #[ntex::test]
@@ -80,10 +60,7 @@ async fn test_connection_reuse_h2() {
     });
 
     // disable ssl verification
-    let mut config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification {}))
-        .with_no_client_auth();
+    let mut config = rustls_utils::tls_connector();
     let protos = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     config.alpn_protocols = protos;
 

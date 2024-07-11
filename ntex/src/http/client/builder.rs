@@ -37,6 +37,8 @@ impl ClientBuilder {
             config: ClientConfig {
                 headers: HeaderMap::new(),
                 timeout: Millis(5_000),
+                response_pl_limit: 262_144,
+                response_pl_timeout: Millis(10_000),
                 connector: Box::new(ConnectorWrapper(Connector::default().finish().into())),
             },
         }
@@ -88,6 +90,22 @@ impl ClientBuilder {
     /// By default `Date` and `User-Agent` headers are set.
     pub fn no_default_headers(mut self) -> Self {
         self.default_headers = false;
+        self
+    }
+
+    /// Max size of response payload.
+    /// By default max size is 256Kb
+    pub fn response_payload_limit(mut self, limit: usize) -> Self {
+        self.config.response_pl_limit = limit;
+        self
+    }
+
+    /// Set response timeout.
+    ///
+    /// Response payload timeout is the total time before a payload must be received.
+    /// Default value is 10 seconds.
+    pub fn response_payload_timeout(mut self, timeout: Millis) -> Self {
+        self.config.response_pl_timeout = timeout;
         self
     }
 
@@ -155,6 +173,52 @@ mod tests {
         assert!(!builder.allow_redirects);
         assert!(!builder.default_headers);
         assert_eq!(builder.max_redirects, 10);
+    }
+
+    #[crate::rt_test]
+    async fn response_payload_limit() {
+        let builder = ClientBuilder::default();
+        assert_eq!(builder.config.response_pl_limit, 262_144);
+
+        let builder = builder.response_payload_limit(10);
+        assert_eq!(builder.config.response_pl_limit, 10);
+    }
+
+    #[crate::rt_test]
+    async fn response_payload_timeout() {
+        let builder = ClientBuilder::default();
+        assert_eq!(builder.config.response_pl_timeout, Millis(10_000));
+
+        let builder = builder.response_payload_timeout(Millis(10));
+        assert_eq!(builder.config.response_pl_timeout, Millis(10));
+    }
+
+    #[crate::rt_test]
+    async fn valid_header_name() {
+        let builder = ClientBuilder::new().header("Content-Length", 1);
+        assert!(builder.config.headers.contains_key("Content-Length"));
+    }
+
+    #[crate::rt_test]
+    async fn invalid_header_name() {
+        let builder = ClientBuilder::new().header("no valid header name", 1);
+        assert!(!builder.config.headers.contains_key("no valid header name"));
+    }
+
+    #[crate::rt_test]
+    async fn valid_header_value() {
+        let valid_header_value = HeaderValue::from(1234);
+        let builder = ClientBuilder::new().header("Content-Length", &valid_header_value);
+        assert_eq!(
+            builder.config.headers.get("Content-Length"),
+            Some(&valid_header_value)
+        );
+    }
+
+    #[crate::rt_test]
+    async fn invalid_header_value() {
+        let builder = ClientBuilder::new().header("Content-Length", "\n");
+        assert!(!builder.config.headers.contains_key("Content-Length"));
     }
 
     #[crate::rt_test]

@@ -133,7 +133,7 @@ impl Future for WriteTask {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.as_mut().get_mut();
+        let this = self.as_mut().get_mut();
 
         match this.st {
             IoWriteState::Processing(ref mut delay) => {
@@ -202,6 +202,7 @@ impl Future for WriteTask {
                             match this.state.with_buf(|buf| flush_io(&mut *io, buf, cx)) {
                                 Poll::Ready(Ok(())) => {
                                     let io = this.io.clone();
+                                    #[allow(clippy::await_holding_refcell_ref)]
                                     let fut = Box::pin(async move {
                                         io.0.borrow()
                                             .shutdown(std::net::Shutdown::Write)
@@ -441,7 +442,7 @@ impl Future for UnixWriteTask {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.as_mut().get_mut();
+        let this = self.as_mut().get_mut();
 
         match this.st {
             IoWriteState::Processing(ref mut delay) => {
@@ -510,6 +511,7 @@ impl Future for UnixWriteTask {
                             match this.state.with_buf(|buf| flush_io(&mut *io, buf, cx)) {
                                 Poll::Ready(Ok(())) => {
                                     let io = this.io.clone();
+                                    #[allow(clippy::await_holding_refcell_ref)]
                                     let fut = Box::pin(async move {
                                         io.0.borrow()
                                             .shutdown(std::net::Shutdown::Write)

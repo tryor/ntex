@@ -2,12 +2,12 @@
 //!
 //! If the response does not complete within the specified timeout, the response
 //! will be aborted.
-use std::{fmt, future::Future, marker, pin::Pin, task::Context, task::Poll};
+use std::{fmt, marker};
 
-use ntex_service::{IntoService, Middleware, Service, ServiceCall, ServiceCtx};
+use ntex_service::{Middleware, Service, ServiceCtx};
 
-use crate::future::Either;
-use crate::time::{sleep, Millis, Sleep};
+use crate::future::{select, Either};
+use crate::time::{sleep, Millis};
 
 /// Applies a timeout to requests.
 ///
@@ -104,15 +104,14 @@ pub struct TimeoutService<S> {
 }
 
 impl<S> TimeoutService<S> {
-    pub fn new<T, U, R>(timeout: T, service: U) -> Self
+    pub fn new<T, R>(timeout: T, service: S) -> Self
     where
         T: Into<Millis>,
         S: Service<R>,
-        U: IntoService<S, R>,
     {
         TimeoutService {
+            service,
             timeout: timeout.into(),
-            service: service.into_service(),
         }
     }
 }
@@ -123,101 +122,35 @@ where
 {
     type Response = S::Response;
     type Error = TimeoutError<S::Error>;
-    type Future<'f> = Either<TimeoutServiceResponse<'f, S, R>, TimeoutServiceResponse2<'f, S, R>> where Self: 'f, R: 'f;
 
-    fn call<'a>(&'a self, request: R, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
+    async fn call(
+        &self,
+        request: R,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
         if self.timeout.is_zero() {
-            Either::Right(TimeoutServiceResponse2 {
-                fut: ctx.call(&self.service, request),
-                _t: marker::PhantomData,
-            })
+            ctx.call(&self.service, request)
+                .await
+                .map_err(TimeoutError::Service)
         } else {
-            Either::Left(TimeoutServiceResponse {
-                fut: ctx.call(&self.service, request),
-                sleep: sleep(self.timeout),
-                _t: marker::PhantomData,
-            })
+            match select(sleep(self.timeout), ctx.call(&self.service, request)).await {
+                Either::Left(_) => Err(TimeoutError::Timeout),
+                Either::Right(res) => res.map_err(TimeoutError::Service),
+            }
         }
     }
 
-    ntex_service::forward_poll_ready!(service, TimeoutError::Service);
-    ntex_service::forward_poll_shutdown!(service);
-}
-
-pin_project_lite::pin_project! {
-    /// `TimeoutService` response future
-    #[doc(hidden)]
-    #[must_use = "futures do nothing unless polled"]
-    pub struct TimeoutServiceResponse<'f, T: Service<R>, R>
-    where T: 'f, R: 'f,
-    {
-        #[pin]
-        fut: ServiceCall<'f, T, R>,
-        sleep: Sleep,
-        _t: marker::PhantomData<R>
-    }
-}
-
-impl<'f, T, R> Future for TimeoutServiceResponse<'f, T, R>
-where
-    T: Service<R>,
-{
-    type Output = Result<T::Response, TimeoutError<T::Error>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        // First, try polling the future
-        match this.fut.poll(cx) {
-            Poll::Ready(Ok(v)) => return Poll::Ready(Ok(v)),
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(TimeoutError::Service(e))),
-            Poll::Pending => {}
-        }
-
-        // Now check the sleep
-        match this.sleep.poll_elapsed(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(_) => Poll::Ready(Err(TimeoutError::Timeout)),
-        }
-    }
-}
-
-pin_project_lite::pin_project! {
-    /// `TimeoutService` response future
-    #[doc(hidden)]
-    #[must_use = "futures do nothing unless polled"]
-    pub struct TimeoutServiceResponse2<'f, T: Service<R>, R>
-    where T: 'f, R: 'f,
-    {
-        #[pin]
-        fut: ServiceCall<'f, T, R>,
-        _t: marker::PhantomData<R>,
-    }
-}
-
-impl<'f, T, R> Future for TimeoutServiceResponse2<'f, T, R>
-where
-    T: Service<R>,
-{
-    type Output = Result<T::Response, TimeoutError<T::Error>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.project().fut.poll(cx) {
-            Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(TimeoutError::Service(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+    ntex_service::forward_ready!(service, TimeoutError::Service);
+    ntex_service::forward_shutdown!(service);
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, time::Duration};
+    use std::time::Duration;
 
-    use ntex_service::{apply, fn_factory, Pipeline, Service, ServiceFactory};
+    use ntex_service::{apply, fn_factory, Pipeline, ServiceFactory};
 
     use super::*;
-    use crate::future::{lazy, BoxFuture};
 
     #[derive(Clone, Debug, PartialEq)]
     struct SleepService(Duration);
@@ -234,14 +167,10 @@ mod tests {
     impl Service<()> for SleepService {
         type Response = ();
         type Error = SrvError;
-        type Future<'f> = BoxFuture<'f, Result<(), SrvError>>;
 
-        fn call<'a>(&'a self, _: (), _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-            let fut = crate::time::sleep(self.0);
-            Box::pin(async move {
-                fut.await;
-                Ok::<_, SrvError>(())
-            })
+        async fn call(&self, _: (), _: ServiceCtx<'_, Self>) -> Result<(), SrvError> {
+            crate::time::sleep(self.0).await;
+            Ok::<_, SrvError>(())
         }
     }
 
@@ -253,8 +182,8 @@ mod tests {
         let timeout =
             Pipeline::new(TimeoutService::new(resolution, SleepService(wait_time)).clone());
         assert_eq!(timeout.call(()).await, Ok(()));
-        assert!(lazy(|cx| timeout.poll_ready(cx)).await.is_ready());
-        assert!(lazy(|cx| timeout.poll_shutdown(cx)).await.is_ready());
+        assert_eq!(timeout.ready().await, Ok(()));
+        assert_eq!(timeout.shutdown().await, ());
     }
 
     #[ntex_macros::rt_test2]
@@ -265,7 +194,7 @@ mod tests {
         let timeout =
             Pipeline::new(TimeoutService::new(resolution, SleepService(wait_time)));
         assert_eq!(timeout.call(()).await, Ok(()));
-        assert!(lazy(|cx| timeout.poll_ready(cx)).await.is_ready());
+        assert_eq!(timeout.ready().await, Ok(()));
     }
 
     #[ntex_macros::rt_test2]

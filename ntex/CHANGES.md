@@ -1,5 +1,125 @@
 # Changes
 
+## [2.0.3] - 2024-06-27
+
+* Re-export server signals api
+
+## [2.0.2] - 2024-06-22
+
+* web: Cleanup http request in cache
+
+* http: Fix handling of connection header
+
+## [2.0.1] - 2024-05-29
+
+* http: Fix handling payload timer after payload got consumed
+
+* http: Fix handling not consumed request's payload
+
+## [2.0.0] - 2024-05-28
+
+* Use "async fn" for Service::ready() and Service::shutdown()
+
+## [1.2.1] - 2024-03-28
+
+* Feature gate websocket support #320
+
+* Feature gate brotli2 encoder
+
+## [1.2.0] - 2024-03-24
+
+* Refactor server workers management
+
+* Move ntex::server to separate crate
+
+* Use ntex-net
+
+## [1.1.2] - 2024-03-12
+
+* Update ntex-h2
+
+## [1.1.1] - 2024-03-11
+
+* http: Replace EncodeError::Internal with Fmt error
+
+## [1.1.0] - 2024-02-07
+
+* http: Add http/1 control service
+
+* http: Add http/2 control service
+
+## [1.0.0] - 2024-01-09
+
+* web: Use async fn for Responder and Handler traits
+
+## [1.0.0-b.1] - 2024-01-08
+
+* web: Refactor FromRequest trait, use async fn
+
+* Refactor io tls filters
+
+* Update cookie related api
+
+## [1.0.0-b.0] - 2024-01-07
+
+* Use "async fn" in trait for Service definition
+
+## [0.7.17] - 2024-01-05
+
+* Allow to set default response payload limit and timeout
+
+## [0.7.16] - 2023-12-15
+
+* Stop timer before handling UPGRADE h1 requests
+
+## [0.7.15] - 2023-12-14
+
+* Better io tags handling
+
+## [0.7.14] - 2023-12-12
+
+* Add io tag support for server
+
+## [0.7.13] - 2023-11-29
+
+* Refactor h1 timers
+
+## [0.7.12] - 2023-11-22
+
+* Replace async-oneshot with oneshot
+
+## [0.7.11] - 2023-11-20
+
+* Refactor http/1 timeouts
+
+* Add http/1 payload read timeout
+
+## [0.7.10] - 2023-11-12
+
+* Start http client timeout after sending body
+
+## [0.7.9] - 2023-11-11
+
+* Update ntex io
+
+## [0.7.8] - 2023-11-06
+
+* Stopping Server does not release resources #233
+
+* Drop num_cpu dep
+
+## [0.7.7] - 2023-10-23
+
+* Fix rust tls client TLS_SERVER_ROOTS #232
+
+## [0.7.6] - 2023-10-16
+
+* Upgrade ntex-h2 to 0.4
+
+## [0.7.5] - 2023-10-01
+
+* Fix compile error for 'compress' feature with async-std & glommio #226
+
 ## [0.7.4] - 2023-09-11
 
 * Add missing fmt::Debug impls

@@ -1,19 +1,21 @@
 use std::cell::Cell;
+use std::future::{poll_fn, Future};
 use std::task::{Context, Poll};
-use std::{fmt, future::Future, hash, io, marker, mem, ops, pin::Pin, ptr, rc::Rc, time};
+use std::{fmt, hash, io, marker, mem, ops, pin::Pin, ptr, rc::Rc};
 
 use ntex_bytes::{PoolId, PoolRef};
 use ntex_codec::{Decoder, Encoder};
-use ntex_util::time::{now, Millis};
-use ntex_util::{future::poll_fn, future::Either, task::LocalWaker};
+use ntex_util::{future::Either, task::LocalWaker, time::Seconds};
 
 use crate::buf::Stack;
 use crate::filter::{Base, Filter, Layer, NullFilter};
 use crate::seal::Sealed;
 use crate::tasks::{ReadContext, WriteContext};
-use crate::{FilterLayer, Handle, IoStatusUpdate, IoStream, RecvError};
+use crate::timer::TimerHandle;
+use crate::{Decoded, FilterLayer, Handle, IoStatusUpdate, IoStream, RecvError};
 
 bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     pub struct Flags: u16 {
         /// io is closed
         const IO_STOPPED          = 0b0000_0000_0000_0001;
@@ -30,6 +32,8 @@ bitflags::bitflags! {
         const RD_READY            = 0b0000_0000_0010_0000;
         /// read buffer is full
         const RD_BUF_FULL         = 0b0000_0000_0100_0000;
+        /// any new data is available
+        const RD_FORCE_READY      = 0b0000_0000_1000_0000;
 
         /// wait write completion
         const WR_WAIT             = 0b0000_0001_0000_0000;
@@ -40,11 +44,8 @@ bitflags::bitflags! {
 
         /// dispatcher is marked stopped
         const DSP_STOP            = 0b0001_0000_0000_0000;
-        /// keep-alive timeout occured
-        const DSP_KEEPALIVE       = 0b0010_0000_0000_0000;
-
-        /// keep-alive timeout started
-        const KEEPALIVE           = 0b0100_0000_0000_0000;
+        /// timeout occured
+        const DSP_TIMEOUT         = 0b0010_0000_0000_0000;
     }
 }
 
@@ -57,7 +58,7 @@ pub struct IoRef(pub(super) Rc<IoState>);
 pub(crate) struct IoState {
     pub(super) flags: Cell<Flags>,
     pub(super) pool: Cell<PoolRef>,
-    pub(super) disconnect_timeout: Cell<Millis>,
+    pub(super) disconnect_timeout: Cell<Seconds>,
     pub(super) error: Cell<Option<io::Error>>,
     pub(super) read_task: LocalWaker,
     pub(super) write_task: LocalWaker,
@@ -65,10 +66,13 @@ pub(crate) struct IoState {
     pub(super) buffer: Stack,
     pub(super) filter: Cell<&'static dyn Filter>,
     pub(super) handle: Cell<Option<Box<dyn Handle>>>,
+    pub(super) timeout: Cell<TimerHandle>,
+    pub(super) tag: Cell<&'static str>,
     #[allow(clippy::box_collection)]
     pub(super) on_disconnect: Cell<Option<Box<Vec<LocalWaker>>>>,
-    pub(super) keepalive: Cell<time::Instant>,
 }
+
+const DEFAULT_TAG: &str = "IO";
 
 impl IoState {
     pub(super) fn insert_flags(&self, f: Flags) {
@@ -77,21 +81,25 @@ impl IoState {
         self.flags.set(flags);
     }
 
-    pub(super) fn remove_flags(&self, f: Flags) {
+    pub(super) fn remove_flags(&self, f: Flags) -> bool {
         let mut flags = self.flags.get();
-        flags.remove(f);
-        self.flags.set(flags);
+        if flags.intersects(f) {
+            flags.remove(f);
+            self.flags.set(flags);
+            true
+        } else {
+            false
+        }
     }
 
-    pub(super) fn notify_keepalive(&self) {
-        log::trace!("keep-alive timeout, notify dispatcher");
+    pub(super) fn notify_timeout(&self) {
         let mut flags = self.flags.get();
-        flags.remove(Flags::KEEPALIVE);
-        if !flags.contains(Flags::DSP_KEEPALIVE) {
-            flags.insert(Flags::DSP_KEEPALIVE);
+        if !flags.contains(Flags::DSP_TIMEOUT) {
+            flags.insert(Flags::DSP_TIMEOUT);
+            self.flags.set(flags);
             self.dispatch_task.wake();
+            log::trace!("{}: Timer, notify dispatcher", self.tag.get());
         }
-        self.flags.set(flags);
     }
 
     pub(super) fn notify_disconnect(&self) {
@@ -123,7 +131,11 @@ impl IoState {
             .get()
             .intersects(Flags::IO_STOPPED | Flags::IO_STOPPING | Flags::IO_STOPPING_FILTERS)
         {
-            log::trace!("initiate io shutdown {:?}", self.flags.get());
+            log::trace!(
+                "{}: Initiate io shutdown {:?}",
+                self.tag.get(),
+                self.flags.get()
+            );
             self.insert_flags(Flags::IO_STOPPING_FILTERS);
             self.read_task.wake();
         }
@@ -161,9 +173,9 @@ impl fmt::Debug for IoState {
             .field("flags", &self.flags)
             .field("pool", &self.pool)
             .field("disconnect_timeout", &self.disconnect_timeout)
+            .field("timeout", &self.timeout)
             .field("error", &err)
             .field("buffer", &self.buffer)
-            .field("keepalive", &self.keepalive)
             .finish();
         self.error.set(err);
         res
@@ -184,15 +196,16 @@ impl Io {
             pool: Cell::new(pool),
             flags: Cell::new(Flags::empty()),
             error: Cell::new(None),
-            disconnect_timeout: Cell::new(Millis::ONE_SEC),
+            disconnect_timeout: Cell::new(Seconds(1)),
             dispatch_task: LocalWaker::new(),
             read_task: LocalWaker::new(),
             write_task: LocalWaker::new(),
             buffer: Stack::new(),
             filter: Cell::new(NullFilter::get()),
             handle: Cell::new(None),
+            timeout: Cell::new(TimerHandle::default()),
             on_disconnect: Cell::new(None),
-            keepalive: Cell::new(now()),
+            tag: Cell::new(DEFAULT_TAG),
         });
 
         let filter = Box::new(Base::new(IoRef(inner.clone())));
@@ -222,7 +235,7 @@ impl<F> Io<F> {
 
     #[inline]
     /// Set io disconnect timeout in millis
-    pub fn set_disconnect_timeout(&self, timeout: Millis) {
+    pub fn set_disconnect_timeout(&self, timeout: Seconds) {
         self.0 .0.disconnect_timeout.set(timeout);
     }
 
@@ -240,15 +253,16 @@ impl<F> Io<F> {
                     | Flags::IO_STOPPING_FILTERS,
             ),
             error: Cell::new(None),
-            disconnect_timeout: Cell::new(Millis::ONE_SEC),
+            disconnect_timeout: Cell::new(Seconds(1)),
             dispatch_task: LocalWaker::new(),
             read_task: LocalWaker::new(),
             write_task: LocalWaker::new(),
             buffer: Stack::new(),
             filter: Cell::new(NullFilter::get()),
             handle: Cell::new(None),
+            timeout: Cell::new(TimerHandle::default()),
             on_disconnect: Cell::new(None),
-            keepalive: Cell::new(now()),
+            tag: Cell::new(DEFAULT_TAG),
         });
 
         let state = mem::replace(&mut self.0, IoRef(inner));
@@ -269,13 +283,6 @@ impl<F> Io<F> {
     /// Get instance of `IoRef`
     pub fn get_ref(&self) -> IoRef {
         self.0.clone()
-    }
-
-    #[inline]
-    #[doc(hidden)]
-    #[deprecated]
-    pub fn remove_keepalive_timer(&self) {
-        self.stop_keepalive_timer()
     }
 
     /// Get current io error
@@ -338,8 +345,8 @@ impl<F> Io<F> {
             return match poll_fn(|cx| self.poll_recv(codec, cx)).await {
                 Ok(item) => Ok(Some(item)),
                 Err(RecvError::KeepAlive) => Err(Either::Right(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Keep-alive",
+                    io::ErrorKind::TimedOut,
+                    "Timeout",
                 ))),
                 Err(RecvError::Stop) => Err(Either::Right(io::Error::new(
                     io::ErrorKind::Other,
@@ -364,6 +371,13 @@ impl<F> Io<F> {
         poll_fn(|cx| self.poll_read_ready(cx)).await
     }
 
+    #[doc(hidden)]
+    #[inline]
+    /// Wait until read becomes ready.
+    pub async fn force_read_ready(&self) -> io::Result<Option<()>> {
+        poll_fn(|cx| self.poll_force_read_ready(cx)).await
+    }
+
     #[inline]
     /// Pause read task
     pub fn pause(&self) {
@@ -374,7 +388,7 @@ impl<F> Io<F> {
     }
 
     #[inline]
-    /// Encode item, send to a peer
+    /// Encode item, send to the peer. Fully flush write buffer.
     pub async fn send<U>(
         &self,
         item: U::Item,
@@ -430,11 +444,6 @@ impl<F> Io<F> {
 
             let ready = flags.contains(Flags::RD_READY);
             if flags.intersects(Flags::RD_BUF_FULL | Flags::RD_PAUSED) {
-                if flags.intersects(Flags::RD_BUF_FULL) {
-                    log::trace!("read back-pressure is disabled, wake io task");
-                } else {
-                    log::trace!("read task is resumed, wake io task");
-                }
                 flags.remove(Flags::RD_READY | Flags::RD_BUF_FULL | Flags::RD_PAUSED);
                 self.0 .0.read_task.wake();
                 self.0 .0.flags.set(flags);
@@ -444,13 +453,45 @@ impl<F> Io<F> {
                     Poll::Pending
                 }
             } else if ready {
-                log::trace!("waking up io read task");
                 flags.remove(Flags::RD_READY);
                 self.0 .0.flags.set(flags);
                 Poll::Ready(Ok(Some(())))
             } else {
                 Poll::Pending
             }
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    /// Polls for read readiness.
+    ///
+    /// If the io stream is not currently ready for reading,
+    /// this method will store a clone of the Waker from the provided Context.
+    /// When the io stream becomes ready for reading, Waker::wake will be called on the waker.
+    ///
+    /// Return value
+    /// The function returns:
+    ///
+    /// `Poll::Pending` if the io stream is not ready for reading.
+    /// `Poll::Ready(Ok(Some(()))))` if the io stream is ready for reading.
+    /// `Poll::Ready(Ok(None))` if io stream is disconnected
+    /// `Some(Poll::Ready(Err(e)))` if an error is encountered.
+    pub fn poll_force_read_ready(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<()>>> {
+        let ready = self.poll_read_ready(cx);
+
+        if ready.is_pending() {
+            if self.0 .0.remove_flags(Flags::RD_FORCE_READY) {
+                Poll::Ready(Ok(Some(())))
+            } else {
+                self.0 .0.insert_flags(Flags::RD_FORCE_READY);
+                Poll::Pending
+            }
+        } else {
+            ready
         }
     }
 
@@ -467,36 +508,62 @@ impl<F> Io<F> {
     where
         U: Decoder,
     {
-        match self.decode(codec) {
-            Ok(Some(el)) => Poll::Ready(Ok(el)),
-            Ok(None) => {
-                let flags = self.flags();
-                if flags.contains(Flags::IO_STOPPED) {
-                    Poll::Ready(Err(RecvError::PeerGone(self.error())))
-                } else if flags.contains(Flags::DSP_STOP) {
-                    self.0 .0.remove_flags(Flags::DSP_STOP);
-                    Poll::Ready(Err(RecvError::Stop))
-                } else if flags.contains(Flags::DSP_KEEPALIVE) {
-                    self.0 .0.remove_flags(Flags::DSP_KEEPALIVE);
-                    Poll::Ready(Err(RecvError::KeepAlive))
-                } else if flags.contains(Flags::WR_BACKPRESSURE) {
-                    Poll::Ready(Err(RecvError::WriteBackpressure))
-                } else {
-                    match self.poll_read_ready(cx) {
-                        Poll::Pending | Poll::Ready(Ok(Some(()))) => {
-                            log::trace!("not enough data to decode next frame");
-                            Poll::Pending
+        let decoded = self.poll_recv_decode(codec, cx)?;
+
+        if let Some(item) = decoded.item {
+            Poll::Ready(Ok(item))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    /// Decode codec item from incoming bytes stream.
+    ///
+    /// Wake read task and request to read more data if data is not enough for decoding.
+    /// If error get returned this method does not register waker for later wake up action.
+    pub fn poll_recv_decode<U>(
+        &self,
+        codec: &U,
+        cx: &mut Context<'_>,
+    ) -> Result<Decoded<U::Item>, RecvError<U>>
+    where
+        U: Decoder,
+    {
+        let decoded = self
+            .decode_item(codec)
+            .map_err(|err| RecvError::Decoder(err))?;
+
+        if decoded.item.is_some() {
+            Ok(decoded)
+        } else {
+            let flags = self.flags();
+            if flags.contains(Flags::IO_STOPPED) {
+                Err(RecvError::PeerGone(self.error()))
+            } else if flags.contains(Flags::DSP_STOP) {
+                self.0 .0.remove_flags(Flags::DSP_STOP);
+                Err(RecvError::Stop)
+            } else if flags.contains(Flags::DSP_TIMEOUT) {
+                self.0 .0.remove_flags(Flags::DSP_TIMEOUT);
+                Err(RecvError::KeepAlive)
+            } else if flags.contains(Flags::WR_BACKPRESSURE) {
+                Err(RecvError::WriteBackpressure)
+            } else {
+                match self.poll_read_ready(cx) {
+                    Poll::Pending | Poll::Ready(Ok(Some(()))) => {
+                        if log::log_enabled!(log::Level::Debug) && decoded.remains != 0 {
+                            log::debug!(
+                                "{}: Not enough data to decode next frame",
+                                self.tag()
+                            );
                         }
-                        Poll::Ready(Err(e)) => {
-                            Poll::Ready(Err(RecvError::PeerGone(Some(e))))
-                        }
-                        Poll::Ready(Ok(None)) => {
-                            Poll::Ready(Err(RecvError::PeerGone(None)))
-                        }
+                        Ok(decoded)
                     }
+                    Poll::Ready(Err(e)) => Err(RecvError::PeerGone(Some(e))),
+                    Poll::Ready(Ok(None)) => Err(RecvError::PeerGone(None)),
                 }
             }
-            Err(err) => Poll::Ready(Err(RecvError::Decoder(err))),
         }
     }
 
@@ -570,13 +637,13 @@ impl<F> Io<F> {
     /// Wait for status updates
     pub fn poll_status_update(&self, cx: &mut Context<'_>) -> Poll<IoStatusUpdate> {
         let flags = self.flags();
-        if flags.contains(Flags::IO_STOPPED) {
+        if flags.intersects(Flags::IO_STOPPED | Flags::IO_STOPPING) {
             Poll::Ready(IoStatusUpdate::PeerGone(self.error()))
         } else if flags.contains(Flags::DSP_STOP) {
             self.0 .0.remove_flags(Flags::DSP_STOP);
             Poll::Ready(IoStatusUpdate::Stop)
-        } else if flags.contains(Flags::DSP_KEEPALIVE) {
-            self.0 .0.remove_flags(Flags::DSP_KEEPALIVE);
+        } else if flags.contains(Flags::DSP_TIMEOUT) {
+            self.0 .0.remove_flags(Flags::DSP_TIMEOUT);
             Poll::Ready(IoStatusUpdate::KeepAlive)
         } else if flags.contains(Flags::WR_BACKPRESSURE) {
             Poll::Ready(IoStatusUpdate::WriteBackpressure)
@@ -633,12 +700,18 @@ impl<F> ops::Deref for Io<F> {
 
 impl<F> Drop for Io<F> {
     fn drop(&mut self) {
-        self.stop_keepalive_timer();
+        self.stop_timer();
+
+        // filter must be dropped, it is unsafe
+        // and wont be dropped without special attention
         if self.1.is_set() {
-            log::trace!(
-                "io is dropped, force stopping io streams {:?}",
-                self.0.flags()
-            );
+            if !self.0.flags().contains(Flags::IO_STOPPED) {
+                log::trace!(
+                    "{}: Io is dropped, force stopping io streams {:?}",
+                    self.tag(),
+                    self.0.flags()
+                );
+            }
 
             self.force_close();
             self.1.drop_filter();
@@ -854,10 +927,28 @@ impl Future for OnDisconnect {
 
 #[cfg(test)]
 mod tests {
+    use ntex_bytes::Bytes;
     use ntex_codec::BytesCodec;
 
     use super::*;
-    use crate::testing::IoTest;
+    use crate::{testing::IoTest, ReadBuf, WriteBuf};
+
+    const BIN: &[u8] = b"GET /test HTTP/1\r\n\r\n";
+    const TEXT: &str = "GET /test HTTP/1\r\n\r\n";
+
+    #[ntex::test]
+    async fn test_basics() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let server = Io::new(server);
+        assert!(server.eq(&server));
+        assert!(server.0.eq(&server.0));
+
+        assert!(format!("{:?}", Flags::IO_STOPPED).contains("IO_STOPPED"));
+        assert!(Flags::IO_STOPPED == Flags::IO_STOPPED);
+        assert!(Flags::IO_STOPPED != Flags::IO_STOPPING);
+    }
 
     #[ntex::test]
     async fn test_recv() {
@@ -865,19 +956,87 @@ mod tests {
         client.remote_buffer_cap(1024);
 
         let server = Io::new(server);
-        assert!(server.eq(&server));
 
-        server.0 .0.notify_keepalive();
+        server.0 .0.notify_timeout();
         let err = server.recv(&BytesCodec).await.err().unwrap();
-        assert!(format!("{:?}", err).contains("Keep-alive"));
+        assert!(format!("{:?}", err).contains("Timeout"));
 
         server.0 .0.insert_flags(Flags::DSP_STOP);
         let err = server.recv(&BytesCodec).await.err().unwrap();
         assert!(format!("{:?}", err).contains("Dispatcher stopped"));
 
-        client.write("GET /test HTTP/1");
+        client.write(TEXT);
         server.0 .0.insert_flags(Flags::WR_BACKPRESSURE);
         let item = server.recv(&BytesCodec).await.ok().unwrap().unwrap();
-        assert_eq!(item, "GET /test HTTP/1");
+        assert_eq!(item, TEXT);
+    }
+
+    #[ntex::test]
+    async fn test_send() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let server = Io::new(server);
+        assert!(server.eq(&server));
+
+        server
+            .send(Bytes::from_static(BIN), &BytesCodec)
+            .await
+            .ok()
+            .unwrap();
+        let item = client.read_any();
+        assert_eq!(item, TEXT);
+    }
+
+    #[derive(Debug)]
+    struct DropFilter {
+        p: Rc<Cell<usize>>,
+    }
+
+    impl Drop for DropFilter {
+        fn drop(&mut self) {
+            self.p.set(self.p.get() + 1);
+        }
+    }
+
+    impl FilterLayer for DropFilter {
+        const BUFFERS: bool = false;
+        fn process_read_buf(&self, buf: &ReadBuf<'_>) -> io::Result<usize> {
+            Ok(buf.nbytes())
+        }
+        fn process_write_buf(&self, _: &WriteBuf<'_>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[ntex::test]
+    async fn drop_filter() {
+        let p = Rc::new(Cell::new(0));
+
+        let (client, server) = IoTest::create();
+        let f = DropFilter { p: p.clone() };
+        format!("{:?}", f);
+        let mut io = Io::new(server).add_filter(f);
+
+        client.remote_buffer_cap(1024);
+        client.write(TEXT);
+        let msg = io.recv(&BytesCodec).await.unwrap().unwrap();
+        assert_eq!(msg, Bytes::from_static(BIN));
+
+        io.send(Bytes::from_static(b"test"), &BytesCodec)
+            .await
+            .unwrap();
+        let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"test"));
+
+        let io2 = io.take();
+        let mut io3: crate::IoBoxed = io2.into();
+        let io4 = io3.take();
+
+        drop(io);
+        drop(io3);
+        drop(io4);
+
+        assert_eq!(p.get(), 1);
     }
 }

@@ -1,5 +1,21 @@
 # Changes
 
+## [0.4.13] - 2024-04-04
+
+* Use tokio Handle if available
+
+## [0.4.12] - 2024-03-25
+
+* Relax Arbiter::exec() generic param
+
+## [0.4.11] - 2023-11-22
+
+* Replace async-oneshot with oneshot
+
+## [0.4.10] - 2023-11-02
+
+* Upgrade async-channel to 2.0
+
 ## [0.4.9] - 2023-04-11
 
 * Chore upgrade glommio to 0.8

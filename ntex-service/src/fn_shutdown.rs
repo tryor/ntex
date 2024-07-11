@@ -1,5 +1,4 @@
-use std::task::{Context, Poll};
-use std::{cell::Cell, fmt, future::ready, future::Ready, marker::PhantomData};
+use std::{cell::Cell, fmt, marker::PhantomData};
 
 use crate::{Service, ServiceCtx};
 
@@ -55,26 +54,23 @@ where
 {
     type Response = Req;
     type Error = Err;
-    type Future<'f> = Ready<Result<Req, Err>> where Self: 'f, Req: 'f;
 
     #[inline]
-    fn poll_shutdown(&self, _: &mut Context<'_>) -> Poll<()> {
+    async fn shutdown(&self) {
         if let Some(f) = self.f_shutdown.take() {
             (f)()
         }
-        Poll::Ready(())
     }
 
     #[inline]
-    fn call<'a>(&'a self, req: Req, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-        ready(Ok(req))
+    async fn call(&self, req: Req, _: ServiceCtx<'_, Self>) -> Result<Req, Err> {
+        Ok(req)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ntex_util::future::lazy;
-    use std::{rc::Rc, task::Poll};
+    use std::rc::Rc;
 
     use crate::{chain, fn_service, Pipeline};
 
@@ -92,10 +88,10 @@ mod tests {
         let pipe = Pipeline::new(chain(srv).and_then(on_shutdown).clone());
 
         let res = pipe.call(()).await;
-        assert_eq!(lazy(|cx| pipe.poll_ready(cx)).await, Poll::Ready(Ok(())));
+        assert_eq!(pipe.ready().await, Ok(()));
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "pipe");
-        assert_eq!(lazy(|cx| pipe.poll_shutdown(cx)).await, Poll::Ready(()));
+        pipe.shutdown().await;
         assert!(is_called.get());
 
         format!("{:?}", pipe);

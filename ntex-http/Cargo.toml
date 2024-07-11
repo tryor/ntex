@@ -1,6 +1,6 @@
 [package]
 name = "ntex-http"
-version = "0.1.10"
+version = "0.1.12"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Http types for ntex framework"
 keywords = ["network", "framework", "async", "futures"]
@@ -8,7 +8,7 @@ homepage = "https://ntex.rs"
 repository = "https://github.com/ntex-rs/ntex.git"
 documentation = "https://docs.rs/ntex-http/"
 categories = ["network-programming", "asynchronous"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 [lib]
@@ -16,8 +16,13 @@ name = "ntex_http"
 path = "src/lib.rs"
 
 [dependencies]
-http = "0.2"
+http = "1"
 log = "0.4"
 fxhash = "0.2.1"
 itoa = "1.0.4"
-ntex-bytes = "0.1.19"
+ntex-bytes = "0.1.21"
+serde = "1"
+
+[dev-dependencies]
+bincode = "1"
+serde_json = "1"

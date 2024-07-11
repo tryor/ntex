@@ -1,11 +1,9 @@
-use std::{cell::Cell, ptr::copy_nonoverlapping, rc::Rc, time, time::Duration};
+use std::{cell::Cell, ptr::copy_nonoverlapping, rc::Rc, time};
 
 use ntex_h2::{self as h2};
 
-use crate::http::{Request, Response};
-use crate::service::{boxed::BoxService, Pipeline};
 use crate::time::{sleep, Millis, Seconds};
-use crate::{io::IoRef, util::BytesMut};
+use crate::{service::Pipeline, util::BytesMut};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 /// Server keep-alive setting
@@ -40,24 +38,33 @@ impl From<Option<usize>> for KeepAlive {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Http service configuration
-pub struct ServiceConfig(pub(super) Rc<Inner>);
-
-#[derive(Debug)]
-pub(super) struct Inner {
-    pub(super) keep_alive: Millis,
-    pub(super) client_timeout: Millis,
+pub struct ServiceConfig {
+    pub(super) keep_alive: Seconds,
     pub(super) client_disconnect: Seconds,
     pub(super) ka_enabled: bool,
-    pub(super) timer: DateService,
     pub(super) ssl_handshake_timeout: Millis,
     pub(super) h2config: h2::Config,
+    pub(super) headers_read_rate: Option<ReadRate>,
+    pub(super) payload_read_rate: Option<ReadRate>,
+    pub(super) timer: DateService,
 }
 
-impl Clone for ServiceConfig {
-    fn clone(&self) -> Self {
-        ServiceConfig(self.0.clone())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReadRate {
+    pub(super) rate: u16,
+    pub(super) timeout: Seconds,
+    pub(super) max_timeout: Seconds,
+}
+
+impl Default for ReadRate {
+    fn default() -> Self {
+        ReadRate {
+            rate: 256,
+            timeout: Seconds(5),
+            max_timeout: Seconds(15),
+        }
     }
 }
 
@@ -65,7 +72,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self::new(
             KeepAlive::Timeout(Seconds(5)),
-            Millis(1_000),
+            Seconds::ONE,
             Seconds::ONE,
             Millis(5_000),
             h2::Config::server(),
@@ -77,70 +84,190 @@ impl ServiceConfig {
     /// Create instance of `ServiceConfig`
     pub fn new(
         keep_alive: KeepAlive,
-        client_timeout: Millis,
+        client_timeout: Seconds,
         client_disconnect: Seconds,
         ssl_handshake_timeout: Millis,
         h2config: h2::Config,
     ) -> ServiceConfig {
         let (keep_alive, ka_enabled) = match keep_alive {
-            KeepAlive::Timeout(val) => (Millis::from(val), true),
-            KeepAlive::Os => (Millis::ZERO, true),
-            KeepAlive::Disabled => (Millis::ZERO, false),
+            KeepAlive::Timeout(val) => (val, true),
+            KeepAlive::Os => (Seconds::ZERO, true),
+            KeepAlive::Disabled => (Seconds::ZERO, false),
         };
-        let keep_alive = if ka_enabled { keep_alive } else { Millis::ZERO };
+        let keep_alive = if ka_enabled {
+            keep_alive
+        } else {
+            Seconds::ZERO
+        };
 
-        ServiceConfig(Rc::new(Inner {
-            keep_alive,
-            ka_enabled,
-            client_timeout,
+        ServiceConfig {
             client_disconnect,
             ssl_handshake_timeout,
             h2config,
+            keep_alive,
+            ka_enabled,
             timer: DateService::new(),
-        }))
+            headers_read_rate: Some(ReadRate {
+                rate: 256,
+                timeout: client_timeout,
+                max_timeout: client_timeout + Seconds(15),
+            }),
+            payload_read_rate: None,
+        }
+    }
+
+    pub(crate) fn client_timeout(&mut self, timeout: Seconds) {
+        if timeout.is_zero() {
+            self.headers_read_rate = None;
+        } else {
+            let mut rate = self.headers_read_rate.unwrap_or_default();
+            rate.timeout = timeout;
+            self.headers_read_rate = Some(rate);
+        }
+    }
+
+    /// Set server keep-alive setting
+    ///
+    /// By default keep alive is set to a 5 seconds.
+    pub fn keepalive<W: Into<KeepAlive>>(&mut self, val: W) -> &mut Self {
+        let (keep_alive, ka_enabled) = match val.into() {
+            KeepAlive::Timeout(val) => (val, true),
+            KeepAlive::Os => (Seconds::ZERO, true),
+            KeepAlive::Disabled => (Seconds::ZERO, false),
+        };
+        let keep_alive = if ka_enabled {
+            keep_alive
+        } else {
+            Seconds::ZERO
+        };
+
+        self.keep_alive = keep_alive;
+        self.ka_enabled = ka_enabled;
+        self
+    }
+
+    /// Set keep-alive timeout in seconds.
+    ///
+    /// To disable timeout set value to 0.
+    ///
+    /// By default keep-alive timeout is set to 30 seconds.
+    pub fn keepalive_timeout(&mut self, timeout: Seconds) -> &mut Self {
+        self.keep_alive = timeout;
+        self.ka_enabled = !timeout.is_zero();
+        self
+    }
+
+    /// Set connection disconnect timeout.
+    ///
+    /// Defines a timeout for disconnect connection. If a disconnect procedure does not complete
+    /// within this time, the connection get dropped.
+    ///
+    /// To disable timeout set value to 0.
+    ///
+    /// By default disconnect timeout is set to 1 seconds.
+    pub fn disconnect_timeout(&mut self, timeout: Seconds) -> &mut Self {
+        self.client_disconnect = timeout;
+        self.h2config.disconnect_timeout(timeout);
+        self
+    }
+
+    /// Set server ssl handshake timeout.
+    ///
+    /// Defines a timeout for connection ssl handshake negotiation.
+    /// To disable timeout set value to 0.
+    ///
+    /// By default handshake timeout is set to 5 seconds.
+    pub fn ssl_handshake_timeout(&mut self, timeout: Seconds) -> &mut Self {
+        self.ssl_handshake_timeout = timeout.into();
+        self.h2config.handshake_timeout(timeout);
+        self
+    }
+
+    /// Set read rate parameters for request headers.
+    ///
+    /// Set read timeout, max timeout and rate for reading request headers. If the client
+    /// sends `rate` amount of data within `timeout` period of time, extend timeout by `timeout` seconds.
+    /// But no more than `max_timeout` timeout.
+    ///
+    /// By default headers read rate is set to 1sec with max timeout 5sec.
+    pub fn headers_read_rate(
+        &mut self,
+        timeout: Seconds,
+        max_timeout: Seconds,
+        rate: u16,
+    ) -> &mut Self {
+        if !timeout.is_zero() {
+            self.headers_read_rate = Some(ReadRate {
+                rate,
+                timeout,
+                max_timeout,
+            });
+        } else {
+            self.headers_read_rate = None;
+        }
+        self
+    }
+
+    /// Set read rate parameters for request's payload.
+    ///
+    /// Set read timeout, max timeout and rate for reading payload. If the client
+    /// sends `rate` amount of data within `timeout` period of time, extend timeout by `timeout` seconds.
+    /// But no more than `max_timeout` timeout.
+    ///
+    /// By default payload read rate is disabled.
+    pub fn payload_read_rate(
+        &mut self,
+        timeout: Seconds,
+        max_timeout: Seconds,
+        rate: u16,
+    ) -> &mut Self {
+        if !timeout.is_zero() {
+            self.payload_read_rate = Some(ReadRate {
+                rate,
+                timeout,
+                max_timeout,
+            });
+        } else {
+            self.payload_read_rate = None;
+        }
+        self
     }
 }
 
-pub(super) type OnRequest = BoxService<(Request, IoRef), Request, Response>;
-
-pub(super) struct DispatcherConfig<S, X, U> {
+pub(super) struct DispatcherConfig<S, C> {
     pub(super) service: Pipeline<S>,
-    pub(super) expect: Pipeline<X>,
-    pub(super) upgrade: Option<Pipeline<U>>,
-    pub(super) keep_alive: Duration,
-    pub(super) client_timeout: Duration,
+    pub(super) control: Pipeline<C>,
+    pub(super) keep_alive: Seconds,
     pub(super) client_disconnect: Seconds,
     pub(super) h2config: h2::Config,
     pub(super) ka_enabled: bool,
+    pub(super) headers_read_rate: Option<ReadRate>,
+    pub(super) payload_read_rate: Option<ReadRate>,
     pub(super) timer: DateService,
-    pub(super) on_request: Option<Pipeline<OnRequest>>,
 }
 
-impl<S, X, U> DispatcherConfig<S, X, U> {
-    pub(super) fn new(
-        cfg: ServiceConfig,
-        service: S,
-        expect: X,
-        upgrade: Option<U>,
-        on_request: Option<OnRequest>,
-    ) -> Self {
+impl<S, C> DispatcherConfig<S, C> {
+    pub(super) fn new(cfg: ServiceConfig, service: S, control: C) -> Self {
         DispatcherConfig {
             service: service.into(),
-            expect: expect.into(),
-            upgrade: upgrade.map(|v| v.into()),
-            on_request: on_request.map(|v| v.into()),
-            keep_alive: Duration::from(cfg.0.keep_alive),
-            client_timeout: Duration::from(cfg.0.client_timeout),
-            client_disconnect: cfg.0.client_disconnect,
-            ka_enabled: cfg.0.ka_enabled,
-            h2config: cfg.0.h2config.clone(),
-            timer: cfg.0.timer.clone(),
+            control: control.into(),
+            keep_alive: cfg.keep_alive,
+            client_disconnect: cfg.client_disconnect,
+            ka_enabled: cfg.ka_enabled,
+            headers_read_rate: cfg.headers_read_rate,
+            payload_read_rate: cfg.payload_read_rate,
+            h2config: cfg.h2config.clone(),
+            timer: cfg.timer.clone(),
         }
     }
 
     /// Return state of connection keep-alive functionality
     pub(super) fn keep_alive_enabled(&self) -> bool {
         self.ka_enabled
+    }
+
+    pub(super) fn headers_read_rate(&self) -> Option<&ReadRate> {
+        self.headers_read_rate.as_ref()
     }
 }
 
@@ -198,7 +325,7 @@ impl DateService {
 
             // periodic date update
             let s = self.clone();
-            crate::rt::spawn(async move {
+            let _ = crate::rt::spawn(async move {
                 sleep(Millis(500)).await;
                 s.0.current.set(false);
             });

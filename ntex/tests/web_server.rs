@@ -18,6 +18,9 @@ use ntex::util::{ready, Bytes, Ready, Stream};
 use ntex::web::{self, middleware::Compress, test};
 use ntex::web::{App, BodyEncoding, HttpRequest, HttpResponse, WebResponseError};
 
+#[cfg(feature = "rustls")]
+mod rustls_utils;
+
 const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
                    Hello World Hello World Hello World Hello World Hello World \
                    Hello World Hello World Hello World Hello World Hello World \
@@ -842,39 +845,20 @@ async fn test_brotli_encoding_large_openssl_h2() {
 #[cfg(all(feature = "rustls", feature = "openssl"))]
 #[ntex::test]
 async fn test_reading_deflate_encoding_large_random_rustls() {
-    use std::{fs::File, io::BufReader};
-
-    use rustls_pemfile::{certs, pkcs8_private_keys};
-    use tls_rustls::{Certificate, PrivateKey, ServerConfig};
-
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(160_000)
         .map(char::from)
         .collect::<String>();
 
-    // load ssl keys
-    let cert_file = &mut BufReader::new(File::open("tests/cert.pem").unwrap());
-    let key_file = &mut BufReader::new(File::open("tests/key.pem").unwrap());
-    let cert_chain = certs(cert_file)
-        .unwrap()
-        .iter()
-        .map(|c| Certificate(c.to_vec()))
-        .collect();
-    let keys = PrivateKey(pkcs8_private_keys(key_file).unwrap().remove(0));
-    let config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, keys)
-        .unwrap();
-
-    let srv = test::server_with(test::config().rustls(config), || {
-        App::new().service(web::resource("/").route(web::to(|bytes: Bytes| async {
-            HttpResponse::Ok()
-                .encoding(ContentEncoding::Identity)
-                .body(bytes)
-        })))
-    });
+    let srv =
+        test::server_with(test::config().rustls(rustls_utils::tls_acceptor()), || {
+            App::new().service(web::resource("/").route(web::to(|bytes: Bytes| async {
+                HttpResponse::Ok()
+                    .encoding(ContentEncoding::Identity)
+                    .body(bytes)
+            })))
+        });
 
     // encode data
     let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -900,39 +884,22 @@ async fn test_reading_deflate_encoding_large_random_rustls() {
 #[cfg(all(feature = "rustls", feature = "openssl"))]
 #[ntex::test]
 async fn test_reading_deflate_encoding_large_random_rustls_h1() {
-    use rustls_pemfile::{certs, pkcs8_private_keys};
-    use std::fs::File;
-    use std::io::BufReader;
-    use tls_rustls::{Certificate, PrivateKey, ServerConfig};
-
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(160_000)
         .map(char::from)
         .collect::<String>();
 
-    // load ssl keys
-    let cert_file = &mut BufReader::new(File::open("tests/cert.pem").unwrap());
-    let key_file = &mut BufReader::new(File::open("tests/key.pem").unwrap());
-    let cert_chain = certs(cert_file)
-        .unwrap()
-        .iter()
-        .map(|c| Certificate(c.to_vec()))
-        .collect();
-    let keys = PrivateKey(pkcs8_private_keys(key_file).unwrap().remove(0));
-    let config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, keys)
-        .unwrap();
-
-    let srv = test::server_with(test::config().rustls(config).h1(), || {
-        App::new().service(web::resource("/").route(web::to(|bytes: Bytes| async {
-            HttpResponse::Ok()
-                .encoding(ContentEncoding::Identity)
-                .body(bytes)
-        })))
-    });
+    let srv = test::server_with(
+        test::config().rustls(rustls_utils::tls_acceptor()).h1(),
+        || {
+            App::new().service(web::resource("/").route(web::to(|bytes: Bytes| async {
+                HttpResponse::Ok()
+                    .encoding(ContentEncoding::Identity)
+                    .body(bytes)
+            })))
+        },
+    );
 
     // encode data
     let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -958,39 +925,22 @@ async fn test_reading_deflate_encoding_large_random_rustls_h1() {
 #[cfg(all(feature = "rustls", feature = "openssl"))]
 #[ntex::test]
 async fn test_reading_deflate_encoding_large_random_rustls_h2() {
-    use std::{fs::File, io::BufReader};
-
-    use rustls_pemfile::{certs, pkcs8_private_keys};
-    use tls_rustls::{Certificate, PrivateKey, ServerConfig};
-
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(160_000)
         .map(char::from)
         .collect::<String>();
 
-    // load ssl keys
-    let cert_file = &mut BufReader::new(File::open("tests/cert.pem").unwrap());
-    let key_file = &mut BufReader::new(File::open("tests/key.pem").unwrap());
-    let cert_chain = certs(cert_file)
-        .unwrap()
-        .iter()
-        .map(|c| Certificate(c.to_vec()))
-        .collect();
-    let keys = PrivateKey(pkcs8_private_keys(key_file).unwrap().remove(0));
-    let config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, keys)
-        .unwrap();
-
-    let srv = test::server_with(test::config().rustls(config).h2(), || {
-        App::new().service(web::resource("/").route(web::to(|bytes: Bytes| async {
-            HttpResponse::Ok()
-                .encoding(ContentEncoding::Identity)
-                .body(bytes)
-        })))
-    });
+    let srv = test::server_with(
+        test::config().rustls(rustls_utils::tls_acceptor()).h2(),
+        || {
+            App::new().service(web::resource("/").route(web::to(|bytes: Bytes| async {
+                HttpResponse::Ok()
+                    .encoding(ContentEncoding::Identity)
+                    .body(bytes)
+            })))
+        },
+    );
 
     // encode data
     let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -1021,20 +971,14 @@ async fn test_server_cookies() {
     let srv = test::server(|| {
         App::new().service(web::resource("/").to(|| async {
             HttpResponse::Ok()
-                .cookie(
-                    coo_kie::CookieBuilder::new("first", "first_value")
-                        .http_only(true)
-                        .finish(),
-                )
+                .cookie(coo_kie::Cookie::build(("first", "first_value")).http_only(true))
                 .cookie(coo_kie::Cookie::new("second", "first_value"))
                 .cookie(coo_kie::Cookie::new("second", "second_value"))
                 .finish()
         }))
     });
 
-    let first_cookie = coo_kie::CookieBuilder::new("first", "first_value")
-        .http_only(true)
-        .finish();
+    let first_cookie = coo_kie::Cookie::build(("first", "first_value")).http_only(true);
     let second_cookie = coo_kie::Cookie::new("second", "second_value");
 
     let response = srv.get("/").send().await.unwrap();
@@ -1174,7 +1118,7 @@ async fn test_web_server() {
                         .route(web::to(|| async { HttpResponse::Ok().body(STR) })),
                 )
             })
-            .client_timeout(Seconds(1))
+            .headers_read_rate(Seconds(1), Seconds(5), 128)
             .disconnect_timeout(Seconds(1))
             .memory_pool(ntex_bytes::PoolId::P1)
             .listen(tcp)

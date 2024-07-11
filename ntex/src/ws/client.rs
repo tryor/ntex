@@ -13,10 +13,12 @@ use nanorand::{Rng, WyRand};
 
 use crate::connect::{Connect, ConnectError, Connector};
 use crate::http::header::{self, HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
-use crate::http::{body::BodySize, client::ClientResponse, error::HttpError, h1};
+use crate::http::{body::BodySize, client, client::ClientResponse, error::HttpError, h1};
 use crate::http::{ConnectionType, RequestHead, RequestHeadType, StatusCode, Uri};
-use crate::io::{Base, DispatchItem, Dispatcher, Filter, Io, Layer, Sealed};
-use crate::service::{apply_fn, into_service, IntoService, Pipeline, Service};
+use crate::io::{
+    Base, DispatchItem, Dispatcher, DispatcherConfig, Filter, Io, Layer, Sealed,
+};
+use crate::service::{apply_fn, fn_service, IntoService, Pipeline, Service};
 use crate::time::{timeout, Millis, Seconds};
 use crate::{channel::mpsc, rt, util::Ready, ws};
 
@@ -31,8 +33,9 @@ pub struct WsClient<F, T> {
     max_size: usize,
     server_mode: bool,
     timeout: Millis,
-    keepalive_timeout: Seconds,
     extra_headers: RefCell<Option<HeaderMap>>,
+    config: DispatcherConfig,
+    client_cfg: Rc<client::ClientConfig>,
     _t: marker::PhantomData<F>,
 }
 
@@ -53,7 +56,7 @@ struct Inner<F, T> {
     max_size: usize,
     server_mode: bool,
     timeout: Millis,
-    keepalive_timeout: Seconds,
+    config: DispatcherConfig,
     _t: marker::PhantomData<F>,
 }
 
@@ -136,12 +139,7 @@ where
         let max_size = self.max_size;
         let server_mode = self.server_mode;
         let to = self.timeout;
-        let keepalive_timeout = self.keepalive_timeout;
-        let mut headers = self
-            .extra_headers
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(HeaderMap::new);
+        let mut headers = self.extra_headers.borrow_mut().take().unwrap_or_default();
 
         // Generate a random key for the `Sec-WebSocket-Key` header.
         // a base64-encoded (see Section 4 of [RFC4648]) value that,
@@ -159,19 +157,20 @@ where
         log::trace!("Open ws connection to {:?} addr: {:?}", head.uri, self.addr);
 
         let io = self.connector.call(msg).await?;
+        let tag = io.tag();
 
         // create Framed and send request
         let codec = h1::ClientCodec::default();
 
         // send request and read response
         let fut = async {
-            log::trace!("Sending ws handshake http message");
+            log::trace!("{}: Sending ws handshake http message", tag);
             io.send(
                 (RequestHeadType::Rc(head, Some(headers)), BodySize::None).into(),
                 &codec,
             )
             .await?;
-            log::trace!("Waiting for ws handshake response");
+            log::trace!("{}: Waiting for ws handshake response", tag);
             io.recv(&codec)
                 .await?
                 .ok_or(WsClientError::Disconnected(None))
@@ -186,7 +185,7 @@ where
         } else {
             fut.await?
         };
-        log::trace!("Ws handshake response is received {:?}", response);
+        log::trace!("{}: Ws handshake response is received {:?}", tag, response);
 
         // verify response
         if response.status != StatusCode::SWITCHING_PROTOCOLS {
@@ -204,7 +203,7 @@ where
             false
         };
         if !has_hdr {
-            log::trace!("Invalid upgrade header");
+            log::trace!("{}: Invalid upgrade header", tag);
             return Err(WsClientError::InvalidUpgradeHeader);
         }
 
@@ -212,15 +211,15 @@ where
         if let Some(conn) = response.headers.get(&header::CONNECTION) {
             if let Ok(s) = conn.to_str() {
                 if !s.to_ascii_lowercase().contains("upgrade") {
-                    log::trace!("Invalid connection header: {}", s);
+                    log::trace!("{}: Invalid connection header: {}", tag, s);
                     return Err(WsClientError::InvalidConnectionHeader(conn.clone()));
                 }
             } else {
-                log::trace!("Invalid connection header: {:?}", conn);
+                log::trace!("{}: Invalid connection header: {:?}", tag, conn);
                 return Err(WsClientError::InvalidConnectionHeader(conn.clone()));
             }
         } else {
-            log::trace!("Missing connection header");
+            log::trace!("{}: Missing connection header", tag);
             return Err(WsClientError::MissingConnectionHeader);
         }
 
@@ -228,7 +227,8 @@ where
             let encoded = ws::hash_key(key.as_ref());
             if hdr_key.as_bytes() != encoded.as_bytes() {
                 log::trace!(
-                    "Invalid challenge response: expected: {} received: {:?}",
+                    "{}: Invalid challenge response: expected: {} received: {:?}",
+                    tag,
                     encoded,
                     key
                 );
@@ -238,21 +238,21 @@ where
                 ));
             }
         } else {
-            log::trace!("Missing SEC-WEBSOCKET-ACCEPT header");
+            log::trace!("{}: Missing SEC-WEBSOCKET-ACCEPT header", tag);
             return Err(WsClientError::MissingWebSocketAcceptHeader);
         };
-        log::trace!("Ws handshake response verification is completed");
+        log::trace!("{}: Ws handshake response verification is completed", tag);
 
         // response and ws io
         Ok(WsConnection::new(
             io,
-            ClientResponse::with_empty_payload(response),
+            ClientResponse::with_empty_payload(response, self.client_cfg.clone()),
             if server_mode {
                 ws::Codec::new().max_size(max_size)
             } else {
                 ws::Codec::new().max_size(max_size).client_mode()
             },
-            keepalive_timeout,
+            self.config.clone(),
         ))
     }
 }
@@ -286,18 +286,22 @@ impl WsClientBuilder<Base, ()> {
             Err(e) => (Default::default(), Some(e.into())),
         };
 
+        let config = DispatcherConfig::default()
+            .set_keepalive_timeout(Seconds(600))
+            .clone();
+
         WsClientBuilder {
             err,
             origin: None,
             protocols: None,
             inner: Some(Inner {
                 head,
-                connector: Connector::<Uri>::default(),
+                config,
+                connector: Connector::<Uri>::default().tag("WS-CLIENT"),
                 addr: None,
                 max_size: 65_536,
                 server_mode: false,
                 timeout: Millis(5_000),
-                keepalive_timeout: Seconds(600),
                 _t: marker::PhantomData,
             }),
             #[cfg(feature = "cookie")]
@@ -337,13 +341,16 @@ where
 
     #[cfg(feature = "cookie")]
     /// Set a cookie
-    pub fn cookie(&mut self, cookie: Cookie<'_>) -> &mut Self {
+    pub fn cookie<C>(&mut self, cookie: C) -> &mut Self
+    where
+        C: Into<Cookie<'static>>,
+    {
         if self.cookies.is_none() {
             let mut jar = CookieJar::new();
-            jar.add(cookie.into_owned());
+            jar.add(cookie.into());
             self.cookies = Some(jar)
         } else {
-            self.cookies.as_mut().unwrap().add(cookie.into_owned());
+            self.cookies.as_mut().unwrap().add(cookie.into());
         }
         self
     }
@@ -490,7 +497,7 @@ where
     /// By default keep-alive timeout is set to 600 seconds.
     pub fn keepalive_timeout(&mut self, timeout: Seconds) -> &mut Self {
         if let Some(parts) = parts(&mut self.inner, &self.err) {
-            parts.keepalive_timeout = timeout;
+            parts.config.set_keepalive_timeout(timeout);
         }
         self
     }
@@ -511,7 +518,7 @@ where
                 max_size: inner.max_size,
                 server_mode: inner.server_mode,
                 timeout: inner.timeout,
-                keepalive_timeout: inner.keepalive_timeout,
+                config: inner.config,
                 _t: marker::PhantomData,
             }),
             err: self.err.take(),
@@ -526,18 +533,18 @@ where
     /// Use openssl connector.
     pub fn openssl(
         &mut self,
-        connector: openssl::SslConnector,
-    ) -> WsClientBuilder<Layer<openssl::SslFilter>, openssl::Connector<Uri>> {
-        self.connector(openssl::Connector::new(connector))
+        connector: tls_openssl::ssl::SslConnector,
+    ) -> WsClientBuilder<Layer<openssl::SslFilter>, openssl::SslConnector<Uri>> {
+        self.connector(openssl::SslConnector::new(connector))
     }
 
     #[cfg(feature = "rustls")]
     /// Use rustls connector.
     pub fn rustls(
         &mut self,
-        config: std::sync::Arc<rustls::ClientConfig>,
-    ) -> WsClientBuilder<Layer<rustls::TlsFilter>, rustls::Connector<Uri>> {
-        self.connector(rustls::Connector::from(config))
+        config: std::sync::Arc<tls_rustls::ClientConfig>,
+    ) -> WsClientBuilder<Layer<rustls::TlsClientFilter>, rustls::TlsConnector<Uri>> {
+        self.connector(rustls::TlsConnector::from(config))
     }
 
     /// This method construct new `WsClientBuilder`
@@ -558,7 +565,6 @@ where
             return Err(WsClientBuilderError::Http(e));
         }
 
-        // #[allow(unused_mut)]
         let mut inner = self.inner.take().expect("cannot reuse WsClient builder");
 
         // validate uri
@@ -636,8 +642,9 @@ where
             max_size: inner.max_size,
             server_mode: inner.server_mode,
             timeout: inner.timeout,
-            keepalive_timeout: inner.keepalive_timeout,
+            config: inner.config,
             extra_headers: RefCell::new(None),
+            client_cfg: Default::default(),
             _t: marker::PhantomData,
         })
     }
@@ -677,7 +684,7 @@ pub struct WsConnection<F> {
     io: Io<F>,
     codec: ws::Codec,
     res: ClientResponse,
-    keepalive_timeout: Seconds,
+    config: DispatcherConfig,
 }
 
 impl<F> WsConnection<F> {
@@ -685,13 +692,13 @@ impl<F> WsConnection<F> {
         io: Io<F>,
         res: ClientResponse,
         codec: ws::Codec,
-        keepalive_timeout: Seconds,
+        config: DispatcherConfig,
     ) -> Self {
         Self {
             io,
             codec,
             res,
-            keepalive_timeout,
+            config,
         }
     }
 
@@ -725,12 +732,12 @@ impl WsConnection<Sealed> {
     pub fn receiver(self) -> mpsc::Receiver<Result<ws::Frame, WsError<()>>> {
         let (tx, rx): (_, mpsc::Receiver<Result<ws::Frame, WsError<()>>>) = mpsc::channel();
 
-        rt::spawn(async move {
+        let _ = rt::spawn(async move {
             let tx2 = tx.clone();
             let io = self.io.get_ref();
 
             let result = self
-                .start(into_service(move |item: ws::Frame| {
+                .start(fn_service(move |item: ws::Frame| {
                     match tx.send(Ok(item)) {
                         Ok(()) => (),
                         Err(_) => io.close(),
@@ -754,13 +761,14 @@ impl WsConnection<Sealed> {
         U: IntoService<T, ws::Frame>,
     {
         let service = apply_fn(
-            service.into_chain().map_err(WsError::Service),
+            service.into_service().map_err(WsError::Service),
             |req, svc| async move {
                 match req {
                     DispatchItem::<ws::Codec>::Item(item) => svc.call(item).await,
                     DispatchItem::WBackPressureEnabled
                     | DispatchItem::WBackPressureDisabled => Ok(None),
                     DispatchItem::KeepAliveTimeout => Err(WsError::KeepAlive),
+                    DispatchItem::ReadTimeout => Err(WsError::ReadTimeout),
                     DispatchItem::DecoderError(e) | DispatchItem::EncoderError(e) => {
                         Err(WsError::Protocol(e))
                     }
@@ -769,9 +777,7 @@ impl WsConnection<Sealed> {
             },
         );
 
-        Dispatcher::new(self.io, self.codec, service)
-            .keepalive_timeout(self.keepalive_timeout)
-            .await
+        Dispatcher::new(self.io, self.codec, service, &self.config).await
     }
 }
 
@@ -782,7 +788,7 @@ impl<F: Filter> WsConnection<F> {
             io: self.io.seal(),
             codec: self.codec,
             res: self.res,
-            keepalive_timeout: self.keepalive_timeout,
+            config: self.config,
         }
     }
 
@@ -899,6 +905,7 @@ mod tests {
     }
 
     #[crate::rt_test]
+    #[allow(clippy::let_underscore_future)]
     async fn bearer_auth() {
         let client = WsClient::build("http://localhost")
             .bearer_auth("someS3cr3tAutht0k3n")
@@ -942,7 +949,7 @@ mod tests {
             .protocols(["v1", "v2"])
             .set_header_if_none(header::CONTENT_TYPE, "json")
             .set_header_if_none(header::CONTENT_TYPE, "text")
-            .cookie(Cookie::build("cookie1", "value1").finish())
+            .cookie(Cookie::build(("cookie1", "value1")))
             .take();
         assert_eq!(
             builder.origin.as_ref().unwrap().to_str().unwrap(),

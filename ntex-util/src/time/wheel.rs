@@ -1,7 +1,7 @@
 //! Time wheel based timer service.
 //!
 //! Inspired by linux kernel timers system
-#![allow(arithmetic_overflow)]
+#![allow(arithmetic_overflow, clippy::let_underscore_future)]
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant, SystemTime};
 use std::{cmp::max, future::Future, mem, pin::Pin, rc::Rc, task, task::Poll};
@@ -131,6 +131,7 @@ impl Drop for TimerHandle {
 }
 
 bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     pub struct Flags: u8 {
         const DRIVER_STARTED = 0b0000_0001;
         const DRIVER_RECALC  = 0b0000_0010;
@@ -610,7 +611,7 @@ impl TimerDriver {
         timer.inner.borrow_mut().driver_sleep =
             Delay::new(Duration::from_millis(timer.next_expiry_ms()));
 
-        crate::spawn(TimerDriver(timer));
+        let _ = crate::spawn(TimerDriver(timer));
     }
 }
 
@@ -675,7 +676,7 @@ impl LowresTimerDriver {
         timer.flags.set(flags);
         timer.inner.borrow_mut().lowres_driver_sleep = Delay::new(LOWRES_RESOLUTION);
 
-        crate::spawn(LowresTimerDriver(timer));
+        let _ = crate::spawn(LowresTimerDriver(timer));
     }
 }
 

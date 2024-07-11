@@ -4,9 +4,12 @@ use std::{net, str::FromStr, sync::mpsc, thread};
 #[cfg(feature = "cookie")]
 use coo_kie::{Cookie, CookieJar};
 
-use crate::io::{Filter, Io};
+#[cfg(feature = "ws")]
+use crate::io::Filter;
+use crate::io::Io;
+#[cfg(feature = "ws")]
 use crate::ws::{error::WsClientError, WsClient, WsConnection};
-use crate::{rt::System, server::Server, service::ServiceFactory};
+use crate::{rt::System, service::ServiceFactory};
 use crate::{time::Millis, time::Seconds, util::Bytes};
 
 use super::client::{Client, ClientRequest, ClientResponse, Connector};
@@ -117,8 +120,11 @@ impl TestRequest {
 
     #[cfg(feature = "cookie")]
     /// Set cookie for this request
-    pub fn cookie(&mut self, cookie: Cookie<'_>) -> &mut Self {
-        parts(&mut self.0).cookies.add(cookie.into_owned());
+    pub fn cookie<C>(&mut self, cookie: C) -> &mut Self
+    where
+        C: Into<Cookie<'static>>,
+    {
+        parts(&mut self.0).cookies.add(cookie.into());
         self
     }
 
@@ -219,7 +225,7 @@ fn parts(parts: &mut Option<Inner>) -> &mut Inner {
 pub fn server<F, R>(factory: F) -> TestServer
 where
     F: Fn() -> R + Send + Clone + 'static,
-    R: ServiceFactory<Io>,
+    R: ServiceFactory<Io> + 'static,
 {
     let (tx, rx) = mpsc::channel();
 
@@ -229,14 +235,14 @@ where
         let tcp = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local_addr = tcp.local_addr().unwrap();
 
-        tx.send((sys.system(), local_addr)).unwrap();
-
-        sys.run(|| {
-            Server::build()
+        let system = sys.system();
+        sys.run(move || {
+            crate::server::build()
                 .listen("test", tcp, move |_| factory())?
                 .workers(1)
                 .disable_signals()
                 .run();
+            tx.send((system, local_addr)).unwrap();
             Ok(())
         })
     });
@@ -257,6 +263,10 @@ where
                 Connector::default()
                     .timeout(Millis(30_000))
                     .openssl(builder.build())
+                    .configure_http2(|cfg| {
+                        cfg.max_header_list_size(256 * 1024);
+                        cfg.max_header_continuation_frames(96);
+                    })
                     .finish()
             }
             #[cfg(not(feature = "openssl"))]
@@ -330,11 +340,13 @@ impl TestServer {
         response.body().limit(10_485_760).await
     }
 
+    #[cfg(feature = "ws")]
     /// Connect to a websocket server
     pub async fn ws(&mut self) -> Result<WsConnection<impl Filter>, WsClientError> {
         self.ws_at("/").await
     }
 
+    #[cfg(feature = "ws")]
     /// Connect to websocket server at a given path
     pub async fn ws_at(
         &mut self,
@@ -349,7 +361,7 @@ impl TestServer {
             .await
     }
 
-    #[cfg(feature = "openssl")]
+    #[cfg(all(feature = "openssl", feature = "ws"))]
     /// Connect to a websocket server
     pub async fn wss(
         &mut self,
@@ -360,7 +372,7 @@ impl TestServer {
         self.wss_at("/").await
     }
 
-    #[cfg(feature = "openssl")]
+    #[cfg(all(feature = "openssl", feature = "ws"))]
     /// Connect to secure websocket server at a given path
     pub async fn wss_at(
         &mut self,

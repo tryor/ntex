@@ -1,10 +1,9 @@
 //! `Middleware` for compressing response body.
-use std::task::{Context, Poll};
-use std::{cmp, future::Future, marker, pin::Pin, str::FromStr};
+use std::{cmp, str::FromStr};
 
 use crate::http::encoding::Encoder;
 use crate::http::header::{ContentEncoding, ACCEPT_ENCODING};
-use crate::service::{Middleware, Service, ServiceCall, ServiceCtx};
+use crate::service::{Middleware, Service, ServiceCtx};
 use crate::web::{BodyEncoding, ErrorRenderer, WebRequest, WebResponse};
 
 #[derive(Debug, Clone)]
@@ -67,16 +66,15 @@ where
 {
     type Response = WebResponse;
     type Error = S::Error;
-    type Future<'f> = CompressResponse<'f, S, E> where S: 'f;
 
-    crate::forward_poll_ready!(service);
-    crate::forward_poll_shutdown!(service);
+    crate::forward_ready!(service);
+    crate::forward_shutdown!(service);
 
-    fn call<'a>(
-        &'a self,
+    async fn call(
+        &self,
         req: WebRequest<E>,
-        ctx: ServiceCtx<'a, Self>,
-    ) -> Self::Future<'a> {
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<WebResponse, S::Error> {
         // negotiate content-encoding
         let encoding = if let Some(val) = req.headers().get(&ACCEPT_ENCODING) {
             if let Ok(enc) = val.to_str() {
@@ -88,50 +86,15 @@ where
             ContentEncoding::Identity
         };
 
-        CompressResponse {
-            encoding,
-            fut: ctx.call(&self.service, req),
-            _t: marker::PhantomData,
-        }
-    }
-}
+        let resp = ctx.call(&self.service, req).await?;
 
-pin_project_lite::pin_project! {
-    #[doc(hidden)]
-    pub struct CompressResponse<'f, S: Service<WebRequest<E>>, E>
-    where S: 'f, E: 'f
-    {
-        #[pin]
-        fut: ServiceCall<'f, S, WebRequest<E>>,
-        encoding: ContentEncoding,
-        _t: marker::PhantomData<E>,
-    }
-}
+        let enc = if let Some(enc) = resp.response().get_encoding() {
+            enc
+        } else {
+            encoding
+        };
 
-impl<'f, S, E> Future for CompressResponse<'f, S, E>
-where
-    S: Service<WebRequest<E>, Response = WebResponse>,
-    E: ErrorRenderer,
-{
-    type Output = Result<WebResponse, S::Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        match this.fut.poll(cx)? {
-            Poll::Ready(resp) => {
-                let enc = if let Some(enc) = resp.response().get_encoding() {
-                    enc
-                } else {
-                    *this.encoding
-                };
-
-                Poll::Ready(Ok(
-                    resp.map_body(move |head, body| Encoder::response(enc, head, body))
-                ))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        Ok(resp.map_body(move |head, body| Encoder::response(enc, head, body)))
     }
 }
 
@@ -198,5 +161,76 @@ impl AcceptEncoding {
             }
         }
         ContentEncoding::Identity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use super::*;
+
+    #[test]
+    fn test_accepting_encodings_equal() {
+        let accepting_encoding = AcceptEncoding {
+            encoding: ContentEncoding::Auto,
+            quality: 0.0,
+        };
+        let accepting_encoding2 = AcceptEncoding {
+            encoding: ContentEncoding::Br,
+            quality: 0.0,
+        };
+
+        assert!(accepting_encoding == accepting_encoding2);
+    }
+
+    #[test]
+    fn test_accepting_encodings_not_equal() {
+        let accepting_encoding = AcceptEncoding {
+            encoding: ContentEncoding::Auto,
+            quality: 1.0,
+        };
+        let accepting_encoding2 = AcceptEncoding {
+            encoding: ContentEncoding::Br,
+            quality: 0.0,
+        };
+
+        assert!(accepting_encoding != accepting_encoding2);
+    }
+
+    #[test]
+    fn test_accepting_encodings_cmp_order_less() {
+        let accepting_encoding = AcceptEncoding {
+            encoding: ContentEncoding::Auto,
+            quality: 1.0,
+        };
+        let accepting_encoding2 = AcceptEncoding {
+            encoding: ContentEncoding::Br,
+            quality: 0.0,
+        };
+
+        assert_eq!(accepting_encoding.cmp(&accepting_encoding2), Ordering::Less);
+    }
+
+    #[test]
+    fn test_accepting_encodings_cmp_order_equal() {
+        let accepting_encoding = AcceptEncoding {
+            encoding: ContentEncoding::Auto,
+            quality: 1.0,
+        };
+
+        assert_eq!(accepting_encoding.cmp(&accepting_encoding), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_accepting_encoding_from_tag_with_valid_quality() {
+        let accepting_encoding = AcceptEncoding::new("gzip;0.8").unwrap();
+        assert_eq!(accepting_encoding.quality, 0.8);
+    }
+
+    #[test]
+    fn test_accepting_encoding_from_tag_with_invalid_quality() {
+        let accepting_encoding = AcceptEncoding::new("gzip;q=abc").unwrap();
+        assert_eq!(accepting_encoding.quality, 0.0);
     }
 }

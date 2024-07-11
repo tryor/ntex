@@ -2,7 +2,7 @@ use std::borrow::{Borrow, BorrowMut};
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{self, AtomicUsize};
-use std::{cmp, fmt, hash, mem, ptr, ptr::NonNull, slice, usize};
+use std::{cmp, fmt, hash, mem, ptr, ptr::NonNull, slice};
 
 use crate::pool::{PoolId, PoolRef};
 use crate::{buf::IntoIter, buf::UninitSlice, debug, Buf, BufMut};
@@ -24,12 +24,12 @@ use crate::{buf::IntoIter, buf::UninitSlice, debug, Buf, BufMut};
 /// let mut mem = Bytes::from(&b"Hello world"[..]);
 /// let a = mem.slice(0..5);
 ///
-/// assert_eq!(&a[..], b"Hello");
+/// assert_eq!(a, b"Hello");
 ///
 /// let b = mem.split_to(6);
 ///
-/// assert_eq!(&mem[..], b"world");
-/// assert_eq!(&b[..], b"Hello ");
+/// assert_eq!(mem, b"world");
+/// assert_eq!(b, b"Hello ");
 /// ```
 ///
 /// # Memory layout
@@ -135,7 +135,7 @@ pub struct Bytes {
 /// buf.put_u8(b'e');
 /// buf.put("llo");
 ///
-/// assert_eq!(&buf[..], b"hello");
+/// assert_eq!(buf, b"hello");
 ///
 /// // Freeze the buffer so that it can be shared
 /// let a = buf.freeze();
@@ -143,8 +143,8 @@ pub struct Bytes {
 /// // This does not allocate, instead `b` points to the same memory.
 /// let b = a.clone();
 ///
-/// assert_eq!(&a[..], b"hello");
-/// assert_eq!(&b[..], b"hello");
+/// assert_eq!(a, b"hello");
+/// assert_eq!(b, b"hello");
 /// ```
 pub struct BytesMut {
     inner: Inner,
@@ -189,8 +189,8 @@ pub struct BytesMut {
 /// // This does not allocate, instead `b` points to the same memory.
 /// let b = a.clone();
 ///
-/// assert_eq!(&a[..], b"hello");
-/// assert_eq!(&b[..], b"hello");
+/// assert_eq!(a, b"hello");
+/// assert_eq!(b, b"hello");
 /// ```
 pub struct BytesVec {
     inner: InnerVec,
@@ -536,7 +536,7 @@ impl Bytes {
     /// ```
     /// use ntex_bytes::Bytes;
     ///
-    /// let a = Bytes::from(&b"hello world"[..]);
+    /// let a = Bytes::from(b"hello world");
     /// let b = a.slice(2..5);
     ///
     /// assert_eq!(&b[..], b"llo");
@@ -549,6 +549,14 @@ impl Bytes {
     /// Requires that `begin <= end` and `end <= self.len()`, otherwise slicing
     /// will panic.
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Bytes {
+        self.slice_checked(range)
+            .expect("Requires that `begin <= end` and `end <= self.len()`")
+    }
+
+    /// Returns a slice of self for the provided range.
+    ///
+    /// Does nothing if `begin <= end` or `end <= self.len()`
+    pub fn slice_checked(&self, range: impl RangeBounds<usize>) -> Option<Bytes> {
         use std::ops::Bound;
 
         let len = self.len();
@@ -565,21 +573,21 @@ impl Bytes {
             Bound::Unbounded => len,
         };
 
-        assert!(begin <= end);
-        assert!(end <= len);
-
-        if end - begin <= INLINE_CAP {
-            Bytes {
-                inner: Inner::from_slice_inline(&self[begin..end]),
+        if begin <= end && end <= len {
+            if end - begin <= INLINE_CAP {
+                Some(Bytes {
+                    inner: Inner::from_slice_inline(&self[begin..end]),
+                })
+            } else {
+                let mut ret = self.clone();
+                unsafe {
+                    ret.inner.set_end(end);
+                    ret.inner.set_start(begin);
+                }
+                Some(ret)
             }
         } else {
-            let mut ret = self.clone();
-
-            unsafe {
-                ret.inner.set_end(end);
-                ret.inner.set_start(begin);
-            }
-            ret
+            None
         }
     }
 
@@ -601,7 +609,7 @@ impl Bytes {
     /// let as_slice = bytes.as_ref();
     /// let subset = &as_slice[2..6];
     /// let subslice = bytes.slice_ref(&subset);
-    /// assert_eq!(&subslice[..], b"2345");
+    /// assert_eq!(subslice, b"2345");
     /// ```
     ///
     /// # Panics
@@ -609,18 +617,24 @@ impl Bytes {
     /// Requires that the given `sub` slice is in fact contained within the
     /// `Bytes` buffer; otherwise this function will panic.
     pub fn slice_ref(&self, subset: &[u8]) -> Bytes {
+        self.slice_ref_checked(subset)
+            .expect("Given `sub` slice is not contained within the `Bytes` buffer")
+    }
+
+    /// Returns a slice of self that is equivalent to the given `subset`.
+    pub fn slice_ref_checked(&self, subset: &[u8]) -> Option<Bytes> {
         let bytes_p = self.as_ptr() as usize;
         let bytes_len = self.len();
 
         let sub_p = subset.as_ptr() as usize;
         let sub_len = subset.len();
 
-        assert!(sub_p >= bytes_p);
-        assert!(sub_p + sub_len <= bytes_p + bytes_len);
-
-        let sub_offset = sub_p - bytes_p;
-
-        self.slice(sub_offset..(sub_offset + sub_len))
+        if sub_p >= bytes_p && sub_p + sub_len <= bytes_p + bytes_len {
+            let sub_offset = sub_p - bytes_p;
+            Some(self.slice(sub_offset..(sub_offset + sub_len)))
+        } else {
+            None
+        }
     }
 
     /// Splits the bytes into two at the given index.
@@ -639,26 +653,34 @@ impl Bytes {
     /// let mut a = Bytes::from(&b"hello world"[..]);
     /// let b = a.split_off(5);
     ///
-    /// assert_eq!(&a[..], b"hello");
-    /// assert_eq!(&b[..], b" world");
+    /// assert_eq!(a, b"hello");
+    /// assert_eq!(b, b" world");
     /// ```
     ///
     /// # Panics
     ///
-    /// Panics if `at > len`.
+    /// Panics if `at > self.len()`.
     pub fn split_off(&mut self, at: usize) -> Bytes {
-        assert!(at <= self.len());
+        self.split_off_checked(at)
+            .expect("at value must be <= self.len()`")
+    }
 
-        if at == self.len() {
-            return Bytes::new();
-        }
-
-        if at == 0 {
-            mem::replace(self, Bytes::new())
-        } else {
-            Bytes {
-                inner: self.inner.split_off(at, true),
+    /// Splits the bytes into two at the given index.
+    ///
+    /// Does nothing if `at > self.len()`
+    pub fn split_off_checked(&mut self, at: usize) -> Option<Bytes> {
+        if at <= self.len() {
+            if at == self.len() {
+                Some(Bytes::new())
+            } else if at == 0 {
+                Some(mem::replace(self, Bytes::new()))
+            } else {
+                Some(Bytes {
+                    inner: self.inner.split_off(at, true),
+                })
             }
+        } else {
+            None
         }
     }
 
@@ -678,26 +700,34 @@ impl Bytes {
     /// let mut a = Bytes::from(&b"hello world"[..]);
     /// let b = a.split_to(5);
     ///
-    /// assert_eq!(&a[..], b" world");
-    /// assert_eq!(&b[..], b"hello");
+    /// assert_eq!(a, b" world");
+    /// assert_eq!(b, b"hello");
     /// ```
     ///
     /// # Panics
     ///
     /// Panics if `at > len`.
     pub fn split_to(&mut self, at: usize) -> Bytes {
-        assert!(at <= self.len());
+        self.split_to_checked(at)
+            .expect("at value must be <= self.len()`")
+    }
 
-        if at == self.len() {
-            return mem::replace(self, Bytes::new());
-        }
-
-        if at == 0 {
-            Bytes::new()
-        } else {
-            Bytes {
-                inner: self.inner.split_to(at, true),
+    /// Splits the bytes into two at the given index.
+    ///
+    /// Does nothing if `at > len`.
+    pub fn split_to_checked(&mut self, at: usize) -> Option<Bytes> {
+        if at <= self.len() {
+            if at == self.len() {
+                Some(mem::replace(self, Bytes::new()))
+            } else if at == 0 {
+                Some(Bytes::new())
+            } else {
+                Some(Bytes {
+                    inner: self.inner.split_to(at, true),
+                })
             }
+        } else {
+            None
         }
     }
 
@@ -957,6 +987,12 @@ impl From<&'static str> for Bytes {
     }
 }
 
+impl<'a, const N: usize> From<&'a [u8; N]> for Bytes {
+    fn from(src: &'a [u8; N]) -> Bytes {
+        Bytes::copy_from_slice(src)
+    }
+}
+
 impl FromIterator<u8> for Bytes {
     fn from_iter<T: IntoIterator<Item = u8>>(into_iter: T) -> Self {
         BytesMut::from_iter(into_iter).freeze()
@@ -979,7 +1015,7 @@ impl PartialEq for Bytes {
 
 impl PartialOrd for Bytes {
     fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
-        self.inner.as_ref().partial_cmp(other.inner.as_ref())
+        Some(self.cmp(other))
     }
 }
 
@@ -1218,17 +1254,17 @@ impl BytesMut {
     /// let b2 = b1.clone();
     ///
     /// let th = thread::spawn(move || {
-    ///     assert_eq!(&b1[..], b"hello world");
+    ///     assert_eq!(b1, b"hello world");
     /// });
     ///
-    /// assert_eq!(&b2[..], b"hello world");
+    /// assert_eq!(b2, b"hello world");
     /// th.join().unwrap();
     /// ```
     #[inline]
     pub fn freeze(self) -> Bytes {
         if self.inner.len() <= INLINE_CAP {
             Bytes {
-                inner: self.inner.to_inline(),
+                inner: Inner::from_slice_inline(self.inner.as_ref()),
             }
         } else {
             Bytes { inner: self.inner }
@@ -1293,8 +1329,7 @@ impl BytesMut {
     /// assert_eq!(other, b"hello world"[..]);
     /// ```
     pub fn split(&mut self) -> BytesMut {
-        let len = self.len();
-        self.split_to(len)
+        self.split_to(self.len())
     }
 
     /// Splits the buffer into two at the given index.
@@ -1324,10 +1359,20 @@ impl BytesMut {
     ///
     /// Panics if `at > len`.
     pub fn split_to(&mut self, at: usize) -> BytesMut {
-        assert!(at <= self.len());
+        self.split_to_checked(at)
+            .expect("at value must be <= self.len()`")
+    }
 
-        BytesMut {
-            inner: self.inner.split_to(at, false),
+    /// Splits the bytes into two at the given index.
+    ///
+    /// Does nothing if `at > len`.
+    pub fn split_to_checked(&mut self, at: usize) -> Option<BytesMut> {
+        if at <= self.len() {
+            Some(BytesMut {
+                inner: self.inner.split_to(at, false),
+            })
+        } else {
+            None
         }
     }
 
@@ -1547,6 +1592,7 @@ impl BytesMut {
         self.chunk().iter()
     }
 
+    #[cfg(feature = "mpool")]
     pub(crate) fn move_to_pool(&mut self, pool: PoolRef) {
         self.inner.move_to_pool(pool);
     }
@@ -1733,13 +1779,23 @@ impl From<String> for BytesMut {
 
 impl<'a> From<&'a [u8]> for BytesMut {
     fn from(src: &'a [u8]) -> BytesMut {
-        let len = src.len();
-
-        if len == 0 {
+        if src.is_empty() {
             BytesMut::new()
         } else {
             BytesMut::copy_from_slice_in(src, PoolId::DEFAULT.pool_ref())
         }
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for BytesMut {
+    fn from(src: [u8; N]) -> BytesMut {
+        BytesMut::copy_from_slice_in(src, PoolId::DEFAULT.pool_ref())
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for BytesMut {
+    fn from(src: &'a [u8; N]) -> BytesMut {
+        BytesMut::copy_from_slice_in(src, PoolId::DEFAULT.pool_ref())
     }
 }
 
@@ -1814,9 +1870,7 @@ impl fmt::Write for BytesMut {
 impl Clone for BytesMut {
     #[inline]
     fn clone(&self) -> BytesMut {
-        BytesMut {
-            inner: unsafe { self.inner.shallow_clone() },
-        }
+        BytesMut::from(&self[..])
     }
 }
 
@@ -2054,10 +2108,10 @@ impl BytesVec {
     /// let b2 = b1.clone();
     ///
     /// let th = thread::spawn(move || {
-    ///     assert_eq!(&b1[..], b"hello world");
+    ///     assert_eq!(b1, b"hello world");
     /// });
     ///
-    /// assert_eq!(&b2[..], b"hello world");
+    /// assert_eq!(b2, b"hello world");
     /// th.join().unwrap();
     /// ```
     #[inline]
@@ -2122,10 +2176,20 @@ impl BytesVec {
     ///
     /// Panics if `at > len`.
     pub fn split_to(&mut self, at: usize) -> BytesMut {
-        assert!(at <= self.len());
+        self.split_to_checked(at)
+            .expect("at value must be <= self.len()`")
+    }
 
-        BytesMut {
-            inner: self.inner.split_to(at, false),
+    /// Splits the bytes into two at the given index.
+    ///
+    /// Does nothing if `at > len`.
+    pub fn split_to_checked(&mut self, at: usize) -> Option<BytesMut> {
+        if at <= self.len() {
+            Some(BytesMut {
+                inner: self.inner.split_to(at, false),
+            })
+        } else {
+            None
         }
     }
 
@@ -2354,6 +2418,7 @@ impl BytesVec {
         self.chunk().iter()
     }
 
+    #[cfg(feature = "mpool")]
     pub(crate) fn move_to_pool(&mut self, pool: PoolRef) {
         self.inner.move_to_pool(pool);
     }
@@ -2590,10 +2655,11 @@ impl InnerVec {
     #[inline]
     fn from_slice(cap: usize, src: &[u8], pool: PoolRef) -> InnerVec {
         // vec must be aligned to SharedVec instead of u8
-        let mut vec_cap = (cap / SHARED_VEC_SIZE) + 1;
-        if cap % SHARED_VEC_SIZE != 0 {
-            vec_cap += 1;
-        }
+        let vec_cap = if cap % SHARED_VEC_SIZE != 0 {
+            (cap / SHARED_VEC_SIZE) + 2
+        } else {
+            (cap / SHARED_VEC_SIZE) + 1
+        };
         let mut vec = Vec::<SharedVec>::with_capacity(vec_cap);
         unsafe {
             // Store data in vec
@@ -2622,6 +2688,7 @@ impl InnerVec {
         }
     }
 
+    #[cfg(feature = "mpool")]
     #[inline]
     fn move_to_pool(&mut self, pool: PoolRef) {
         unsafe {
@@ -2976,38 +3043,33 @@ impl Inner {
             vec_cap += 1;
         }
         let mut vec = Vec::<SharedVec>::with_capacity(vec_cap);
-        unsafe {
-            // Store data in vec
-            let len = src.len();
-            let full_cap = vec.capacity() * SHARED_VEC_SIZE;
-            let cap = full_cap - SHARED_VEC_SIZE;
-            let shared_ptr = vec.as_mut_ptr();
-            mem::forget(vec);
-            pool.acquire(full_cap);
 
+        // Store data in vec
+        let len = src.len();
+        let full_cap = vec.capacity() * SHARED_VEC_SIZE;
+        let cap = full_cap - SHARED_VEC_SIZE;
+        vec.push(SharedVec {
+            pool,
+            cap: full_cap,
+            ref_count: AtomicUsize::new(1),
+            len: 0,
+            offset: 0,
+        });
+        pool.acquire(full_cap);
+
+        let shared_ptr = vec.as_mut_ptr();
+        mem::forget(vec);
+
+        let (ptr, arc) = unsafe {
             let ptr = shared_ptr.add(1) as *mut u8;
             ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
-            ptr::write(
-                shared_ptr,
-                SharedVec {
-                    pool,
-                    cap: full_cap,
-                    ref_count: AtomicUsize::new(1),
-                    len: 0,
-                    offset: 0,
-                },
-            );
+            let arc =
+                NonNull::new_unchecked((shared_ptr as usize ^ KIND_VEC) as *mut Shared);
+            (ptr, arc)
+        };
 
-            // Create new arc, so atomic operations can be avoided.
-            Inner {
-                len,
-                cap,
-                ptr,
-                arc: NonNull::new_unchecked(
-                    (shared_ptr as usize ^ KIND_VEC) as *mut Shared,
-                ),
-            }
-        }
+        // Create new arc, so atomic operations can be avoided.
+        Inner { len, cap, ptr, arc }
     }
 
     #[inline]
@@ -3043,6 +3105,7 @@ impl Inner {
         }
     }
 
+    #[cfg(feature = "mpool")]
     #[inline]
     fn move_to_pool(&mut self, pool: PoolRef) {
         let kind = self.kind();
@@ -3071,7 +3134,7 @@ impl Inner {
     fn as_ref(&self) -> &[u8] {
         unsafe {
             if self.is_inline() {
-                slice::from_raw_parts(self.inline_ptr(), self.inline_len())
+                slice::from_raw_parts(self.inline_ptr_ro(), self.inline_len())
             } else {
                 slice::from_raw_parts(self.ptr, self.len)
             }
@@ -3145,24 +3208,14 @@ impl Inner {
 
     /// Pointer to the start of the inline buffer
     #[inline]
-    unsafe fn inline_ptr(&self) -> *mut u8 {
-        (self as *const Inner as *mut Inner as *mut u8).offset(INLINE_DATA_OFFSET)
+    unsafe fn inline_ptr(&mut self) -> *mut u8 {
+        (self as *mut Inner as *mut u8).offset(INLINE_DATA_OFFSET)
     }
 
+    /// Pointer to the start of the inline buffer
     #[inline]
-    fn to_inline(&self) -> Inner {
-        unsafe {
-            let mut inner = Inner {
-                arc: NonNull::new_unchecked(KIND_INLINE as *mut Shared),
-                ptr: ptr::null_mut(),
-                cap: 0,
-                len: 0,
-            };
-            let len = self.len();
-            inner.as_raw()[..len].copy_from_slice(self.as_ref());
-            inner.set_inline_len(len);
-            inner
-        }
+    unsafe fn inline_ptr_ro(&self) -> *const u8 {
+        (self as *const Inner as *const u8).offset(INLINE_DATA_OFFSET)
     }
 
     #[inline]
@@ -3708,7 +3761,25 @@ impl PartialEq<[u8]> for BytesMut {
     }
 }
 
+impl<const N: usize> PartialEq<[u8; N]> for BytesMut {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        &**self == other
+    }
+}
+
 impl PartialEq<BytesMut> for [u8] {
+    fn eq(&self, other: &BytesMut) -> bool {
+        *other == *self
+    }
+}
+
+impl<const N: usize> PartialEq<BytesMut> for [u8; N] {
+    fn eq(&self, other: &BytesMut) -> bool {
+        *other == *self
+    }
+}
+
+impl<'a, const N: usize> PartialEq<BytesMut> for &'a [u8; N] {
     fn eq(&self, other: &BytesMut) -> bool {
         *other == *self
     }
@@ -3777,9 +3848,21 @@ impl PartialEq<[u8]> for Bytes {
     }
 }
 
+impl<const N: usize> PartialEq<[u8; N]> for Bytes {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.inner.as_ref() == other.as_ref()
+    }
+}
+
 impl PartialOrd<[u8]> for Bytes {
     fn partial_cmp(&self, other: &[u8]) -> Option<cmp::Ordering> {
         self.inner.as_ref().partial_cmp(other)
+    }
+}
+
+impl<const N: usize> PartialOrd<[u8; N]> for Bytes {
+    fn partial_cmp(&self, other: &[u8; N]) -> Option<cmp::Ordering> {
+        self.inner.as_ref().partial_cmp(other.as_ref())
     }
 }
 
@@ -3789,7 +3872,25 @@ impl PartialEq<Bytes> for [u8] {
     }
 }
 
+impl<const N: usize> PartialEq<Bytes> for [u8; N] {
+    fn eq(&self, other: &Bytes) -> bool {
+        *other == *self
+    }
+}
+
+impl<'a, const N: usize> PartialEq<Bytes> for &'a [u8; N] {
+    fn eq(&self, other: &Bytes) -> bool {
+        *other == *self
+    }
+}
+
 impl PartialOrd<Bytes> for [u8] {
+    fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
+        other.partial_cmp(self)
+    }
+}
+
+impl<const N: usize> PartialOrd<Bytes> for [u8; N] {
     fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
@@ -3957,7 +4058,25 @@ impl PartialEq<[u8]> for BytesVec {
     }
 }
 
+impl<const N: usize> PartialEq<[u8; N]> for BytesVec {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        &**self == other
+    }
+}
+
 impl PartialEq<BytesVec> for [u8] {
+    fn eq(&self, other: &BytesVec) -> bool {
+        *other == *self
+    }
+}
+
+impl<const N: usize> PartialEq<BytesVec> for [u8; N] {
+    fn eq(&self, other: &BytesVec) -> bool {
+        *other == *self
+    }
+}
+
+impl<'a, const N: usize> PartialEq<BytesVec> for &'a [u8; N] {
     fn eq(&self, other: &BytesVec) -> bool {
         *other == *self
     }
@@ -4064,7 +4183,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::len_zero)]
+    #[allow(
+        clippy::len_zero,
+        clippy::nonminimal_bool,
+        clippy::unnecessary_fallible_conversions
+    )]
     fn bytes() {
         let mut b = Bytes::from(LONG.to_vec());
         b.clear();
@@ -4111,6 +4234,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_fallible_conversions)]
     fn bytes_vec() {
         let bv = BytesVec::copy_from_slice(LONG);
         // SharedVec size is 32

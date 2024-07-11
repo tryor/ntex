@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, marker, pin::Pin, rc::Rc, task::Context, task::Poll};
+use std::{fmt, marker::PhantomData, rc::Rc};
 
 use crate::{IntoServiceFactory, Service, ServiceFactory};
 
@@ -21,29 +21,35 @@ where
 ///
 /// For example, timeout middleware:
 ///
-/// ```rust,ignore
+/// ```rust
+/// use ntex_service::{Service, ServiceCtx};
+/// use ntex_util::{time::sleep, future::Either, future::select};
+///
 /// pub struct Timeout<S> {
 ///     service: S,
-///     timeout: Duration,
+///     timeout: std::time::Duration,
 /// }
 ///
-/// impl<S> Service for Timeout<S>
+/// pub enum TimeoutError<E> {
+///    Service(E),
+///    Timeout,
+/// }
+///
+/// impl<S, R> Service<R> for Timeout<S>
 /// where
-///     S: Service,
+///     S: Service<R>,
 /// {
-///     type Request = S::Request;
 ///     type Response = S::Response;
 ///     type Error = TimeoutError<S::Error>;
-///     type Future = TimeoutResponse<S>;
 ///
-///     fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-///         ready!(self.service.poll_ready(cx)).map_err(TimeoutError::Service)
+///     async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+///         ctx.ready(&self.service).await.map_err(TimeoutError::Service)
 ///     }
 ///
-///     fn call(&self, req: S::Request) -> Self::Future {
-///         TimeoutServiceResponse {
-///             fut: self.service.call(req),
-///             sleep: Delay::new(clock::now() + self.timeout),
+///     async fn call(&self, req: R, ctx: ServiceCtx<'_, Self>) -> Result<Self::Response, Self::Error> {
+///         match select(sleep(self.timeout), ctx.call(&self.service, req)).await {
+///             Either::Left(_) => Err(TimeoutError::Timeout),
+///             Either::Right(res) => res.map_err(TimeoutError::Service),
 ///         }
 ///     }
 /// }
@@ -61,20 +67,18 @@ where
 ///
 /// ```rust,ignore
 /// pub struct TimeoutMiddleware {
-///     timeout: Duration,
+///     timeout: std::time::Duration,
 /// }
 ///
-/// impl<S> Middleware<S> for TimeoutMiddleware<E>
-/// where
-///     S: Service,
+/// impl<S> Middleware<S> for TimeoutMiddleware
 /// {
 ///     type Service = Timeout<S>;
 ///
 ///     fn create(&self, service: S) -> Self::Service {
-///         ok(Timeout {
+///         Timeout {
 ///             service,
 ///             timeout: self.timeout,
-///         })
+///         }
 ///     }
 /// }
 /// ```
@@ -98,18 +102,18 @@ where
 }
 
 /// `Apply` middleware to a service factory.
-pub struct ApplyMiddleware<T, S, C>(Rc<(T, S)>, marker::PhantomData<C>);
+pub struct ApplyMiddleware<T, S, C>(Rc<(T, S)>, PhantomData<C>);
 
 impl<T, S, C> ApplyMiddleware<T, S, C> {
     /// Create new `ApplyMiddleware` service factory instance
     pub(crate) fn new(mw: T, svc: S) -> Self {
-        Self(Rc::new((mw, svc)), marker::PhantomData)
+        Self(Rc::new((mw, svc)), PhantomData)
     }
 }
 
 impl<T, S, C> Clone for ApplyMiddleware<T, S, C> {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), marker::PhantomData)
+        Self(self.0.clone(), PhantomData)
     }
 }
 
@@ -137,46 +141,10 @@ where
 
     type Service = T::Service;
     type InitError = S::InitError;
-    type Future<'f> = ApplyMiddlewareFuture<'f, T, S, R, C> where Self: 'f, C: 'f;
 
     #[inline]
-    fn create(&self, cfg: C) -> Self::Future<'_> {
-        ApplyMiddlewareFuture {
-            slf: self.0.clone(),
-            fut: self.0 .1.create(cfg),
-        }
-    }
-}
-
-pin_project_lite::pin_project! {
-    #[must_use = "futures do nothing unless polled"]
-    pub struct ApplyMiddlewareFuture<'f, T, S, R, C>
-    where
-        S: ServiceFactory<R, C>,
-        S: 'f,
-        T: Middleware<S::Service>,
-        C: 'f,
-    {
-        slf: Rc<(T, S)>,
-        #[pin]
-        fut: S::Future<'f>,
-    }
-}
-
-impl<'f, T, S, R, C> Future for ApplyMiddlewareFuture<'f, T, S, R, C>
-where
-    S: ServiceFactory<R, C>,
-    T: Middleware<S::Service>,
-{
-    type Output = Result<T::Service, S::InitError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_mut().project();
-
-        match this.fut.poll(cx)? {
-            Poll::Ready(srv) => Poll::Ready(Ok(this.slf.0.create(srv))),
-            Poll::Pending => Poll::Pending,
-        }
+    async fn create(&self, cfg: C) -> Result<Self::Service, Self::InitError> {
+        Ok(self.0 .0.create(self.0 .1.create(cfg).await?))
     }
 }
 
@@ -223,45 +191,52 @@ where
 #[cfg(test)]
 #[allow(clippy::redundant_clone)]
 mod tests {
-    use ntex_util::future::{lazy, Ready};
-    use std::marker;
+    use std::{cell::Cell, rc::Rc};
 
     use super::*;
-    use crate::{fn_service, Pipeline, Service, ServiceCall, ServiceCtx, ServiceFactory};
+    use crate::{fn_service, Pipeline, ServiceCtx};
 
     #[derive(Debug, Clone)]
-    struct Tr<R>(marker::PhantomData<R>);
+    struct Tr<R>(PhantomData<R>, Rc<Cell<usize>>);
 
     impl<S, R> Middleware<S> for Tr<R> {
         type Service = Srv<S, R>;
 
         fn create(&self, service: S) -> Self::Service {
-            Srv(service, marker::PhantomData)
+            Srv(service, PhantomData, self.1.clone())
         }
     }
 
     #[derive(Debug, Clone)]
-    struct Srv<S, R>(S, marker::PhantomData<R>);
+    struct Srv<S, R>(S, PhantomData<R>, Rc<Cell<usize>>);
 
     impl<S: Service<R>, R> Service<R> for Srv<S, R> {
         type Response = S::Response;
         type Error = S::Error;
-        type Future<'f> = ServiceCall<'f, S, R> where Self: 'f, R: 'f;
 
-        fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.0.poll_ready(cx)
+        async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+            ctx.ready(&self.0).await
         }
 
-        fn call<'a>(&'a self, req: R, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-            ctx.call(&self.0, req)
+        async fn call(
+            &self,
+            req: R,
+            ctx: ServiceCtx<'_, Self>,
+        ) -> Result<S::Response, S::Error> {
+            ctx.call(&self.0, req).await
+        }
+
+        async fn shutdown(&self) {
+            self.2.set(self.2.get() + 1);
         }
     }
 
     #[ntex::test]
     async fn middleware() {
+        let cnt_sht = Rc::new(Cell::new(0));
         let factory = apply(
-            Rc::new(Tr(marker::PhantomData).clone()),
-            fn_service(|i: usize| Ready::<_, ()>::Ok(i * 2)),
+            Rc::new(Tr(PhantomData, cnt_sht.clone()).clone()),
+            fn_service(|i: usize| async move { Ok::<_, ()>(i * 2) }),
         )
         .clone();
 
@@ -271,15 +246,13 @@ mod tests {
         assert_eq!(res.unwrap(), 20);
         format!("{:?} {:?}", factory, srv);
 
-        let res = lazy(|cx| srv.poll_ready(cx)).await;
-        assert_eq!(res, Poll::Ready(Ok(())));
-
-        let res = lazy(|cx| srv.poll_shutdown(cx)).await;
-        assert_eq!(res, Poll::Ready(()));
+        assert_eq!(srv.ready().await, Ok(()));
+        srv.shutdown().await;
+        assert_eq!(cnt_sht.get(), 1);
 
         let factory =
-            crate::chain_factory(fn_service(|i: usize| Ready::<_, ()>::Ok(i * 2)))
-                .apply(Rc::new(Tr(marker::PhantomData).clone()))
+            crate::chain_factory(fn_service(|i: usize| async move { Ok::<_, ()>(i * 2) }))
+                .apply(Rc::new(Tr(PhantomData, Rc::new(Cell::new(0))).clone()))
                 .clone();
 
         let srv = Pipeline::new(factory.create(&()).await.unwrap().clone());
@@ -288,10 +261,6 @@ mod tests {
         assert_eq!(res.unwrap(), 20);
         format!("{:?} {:?}", factory, srv);
 
-        let res = lazy(|cx| srv.poll_ready(cx)).await;
-        assert_eq!(res, Poll::Ready(Ok(())));
-
-        let res = lazy(|cx| srv.poll_shutdown(cx)).await;
-        assert_eq!(res, Poll::Ready(()));
+        assert_eq!(srv.ready().await, Ok(()));
     }
 }

@@ -1,11 +1,11 @@
-use std::{cell::Cell, fmt, io};
+use std::{cell::Cell, fmt};
 
 use bitflags::bitflags;
 
 use crate::codec::{Decoder, Encoder};
 use crate::http::body::BodySize;
 use crate::http::config::DateService;
-use crate::http::error::ParseError;
+use crate::http::error::{DecodeError, EncodeError};
 use crate::http::message::ConnectionType;
 use crate::http::request::Request;
 use crate::http::response::Response;
@@ -15,6 +15,7 @@ use crate::util::BytesMut;
 use super::{decoder, decoder::PayloadType, encoder, Message};
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct Flags: u8 {
         const HEAD              = 0b0000_0001;
         const STREAM            = 0b0000_0010;
@@ -81,7 +82,7 @@ impl Codec {
             flags: Cell::new(flags),
             decoder: decoder::MessageDecoder::default(),
             version: Cell::new(Version::HTTP_11),
-            ctype: Cell::new(ConnectionType::Close),
+            ctype: Cell::new(ConnectionType::KeepAlive),
             encoder: encoder::MessageEncoder::default(),
         }
     }
@@ -96,12 +97,6 @@ impl Codec {
     /// Check if last response is keep-alive
     pub fn keepalive(&self) -> bool {
         self.ctype.get() == ConnectionType::KeepAlive
-    }
-
-    #[inline]
-    /// Check if keep-alive enabled on server level
-    pub fn keepalive_enabled(&self) -> bool {
-        self.flags.get().contains(Flags::KEEPALIVE_ENABLED)
     }
 
     pub(super) fn set_ctype(&self, ctype: ConnectionType) {
@@ -129,7 +124,7 @@ impl Codec {
 
 impl Decoder for Codec {
     type Item = (Request, PayloadType);
-    type Error = ParseError;
+    type Error = DecodeError;
 
     fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if let Some((req, payload)) = self.decoder.decode(src)? {
@@ -138,11 +133,14 @@ impl Decoder for Codec {
             flags.set(Flags::HEAD, head.method == Method::HEAD);
             self.flags.set(flags);
             self.version.set(head.version);
-            self.ctype.set(head.connection_type());
-            if self.ctype.get() == ConnectionType::KeepAlive
+
+            let ctype = head.connection_type();
+            if ctype == ConnectionType::KeepAlive
                 && !flags.contains(Flags::KEEPALIVE_ENABLED)
             {
                 self.ctype.set(ConnectionType::Close)
+            } else {
+                self.ctype.set(ctype)
             }
 
             if let PayloadType::Stream(_) = payload {
@@ -157,7 +155,7 @@ impl Decoder for Codec {
 
 impl Encoder for Codec {
     type Item = Message<(Response<()>, BodySize)>;
-    type Error = io::Error;
+    type Error = EncodeError;
 
     fn encode(&self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
         match item {
@@ -199,8 +197,8 @@ impl Encoder for Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{h1::PayloadItem, HttpMessage, Method};
-    use crate::util::{Bytes, BytesMut};
+    use crate::http::{h1::PayloadItem, HttpMessage};
+    use crate::util::Bytes;
 
     #[test]
     fn test_http_request_chunked_payload_and_next_message() {
@@ -248,6 +246,6 @@ mod tests {
         );
         let _item = codec.decode(&mut buf).unwrap().unwrap();
         assert!(codec.upgrade());
-        assert!(!codec.keepalive_enabled());
+        assert!(!codec.keepalive());
     }
 }

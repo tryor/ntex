@@ -1,9 +1,16 @@
-use std::{fmt, marker::PhantomData};
-
-use ntex_service::{chain_factory, fn_service, Service, ServiceCtx, ServiceFactory};
+use ntex_service::{chain_factory, fn_service, ServiceFactory};
 use ntex_util::future::Ready;
 
-use crate::{Filter, FilterFactory, Io, IoBoxed, Layer};
+use crate::{Filter, Io, IoBoxed};
+
+/// Decoded item from buffer
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Decoded<T> {
+    pub item: Option<T>,
+    pub remains: usize,
+    pub consumed: usize,
+}
 
 /// Service that converts any Io<F> stream to IoBoxed stream
 pub fn seal<F, S, C>(
@@ -25,87 +32,13 @@ where
         .and_then(srv)
 }
 
-/// Create filter factory service
-pub fn filter<T, F>(filter: T) -> FilterServiceFactory<T, F>
-where
-    T: FilterFactory<F> + Clone,
-{
-    FilterServiceFactory {
-        filter,
-        _t: PhantomData,
-    }
-}
-
-pub struct FilterServiceFactory<T, F> {
-    filter: T,
-    _t: PhantomData<F>,
-}
-
-impl<T: FilterFactory<F> + fmt::Debug, F> fmt::Debug for FilterServiceFactory<T, F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FilterServiceFactory")
-            .field("filter_factory", &self.filter)
-            .finish()
-    }
-}
-
-impl<T, F> ServiceFactory<Io<F>> for FilterServiceFactory<T, F>
-where
-    T: FilterFactory<F> + Clone,
-{
-    type Response = Io<Layer<T::Filter, F>>;
-    type Error = T::Error;
-    type Service = FilterService<T, F>;
-    type InitError = ();
-    type Future<'f> = Ready<Self::Service, Self::InitError> where Self: 'f;
-
-    #[inline]
-    fn create(&self, _: ()) -> Self::Future<'_> {
-        Ready::Ok(FilterService {
-            filter: self.filter.clone(),
-            _t: PhantomData,
-        })
-    }
-}
-
-pub struct FilterService<T, F> {
-    filter: T,
-    _t: PhantomData<F>,
-}
-
-impl<T: FilterFactory<F> + fmt::Debug, F> fmt::Debug for FilterService<T, F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FilterService")
-            .field("filter_factory", &self.filter)
-            .finish()
-    }
-}
-
-impl<T, F> Service<Io<F>> for FilterService<T, F>
-where
-    T: FilterFactory<F> + Clone,
-{
-    type Response = Io<Layer<T::Filter, F>>;
-    type Error = T::Error;
-    type Future<'f> = T::Future where T: 'f, F: 'f;
-
-    #[inline]
-    fn call<'a>(&'a self, req: Io<F>, _: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-        self.filter.clone().create(req)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io;
-
     use ntex_bytes::Bytes;
     use ntex_codec::BytesCodec;
 
     use super::*;
-    use crate::{
-        buf::Stack, filter::NullFilter, testing::IoTest, FilterLayer, ReadBuf, WriteBuf,
-    };
+    use crate::{buf::Stack, filter::NullFilter, testing::IoTest};
 
     #[ntex::test]
     async fn test_utils() {
@@ -130,50 +63,6 @@ mod tests {
         assert_eq!(buf, b"RES".as_ref());
     }
 
-    #[derive(Debug)]
-    pub(crate) struct TestFilter;
-
-    impl FilterLayer for TestFilter {
-        fn process_read_buf(&self, buf: &ReadBuf<'_>) -> io::Result<usize> {
-            Ok(buf.nbytes())
-        }
-
-        fn process_write_buf(&self, _: &WriteBuf<'_>) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Copy, Clone, Debug)]
-    struct TestFilterFactory;
-
-    impl<F: Filter> FilterFactory<F> for TestFilterFactory {
-        type Filter = TestFilter;
-        type Error = std::convert::Infallible;
-        type Future = Ready<Io<Layer<TestFilter, F>>, Self::Error>;
-
-        fn create(self, st: Io<F>) -> Self::Future {
-            Ready::Ok(st.add_filter(TestFilter))
-        }
-    }
-
-    #[ntex::test]
-    async fn test_utils_filter() {
-        let (_, server) = IoTest::create();
-        let svc = chain_factory(
-            filter::<_, crate::filter::Base>(TestFilterFactory)
-                .map_err(|_| ())
-                .map_init_err(|_| ()),
-        )
-        .and_then(seal(fn_service(|io: IoBoxed| async move {
-            let _ = io.recv(&BytesCodec).await;
-            Ok::<_, ()>(())
-        })))
-        .pipeline(())
-        .await
-        .unwrap();
-        let _ = svc.call(Io::new(server)).await;
-    }
-
     #[ntex::test]
     async fn test_null_filter() {
         let (_, server) = IoTest::create();
@@ -183,11 +72,11 @@ mod tests {
         assert!(NullFilter.query(std::any::TypeId::of::<()>()).is_none());
         assert!(NullFilter.shutdown(&ioref, &stack, 0).unwrap().is_ready());
         assert_eq!(
-            ntex_util::future::poll_fn(|cx| NullFilter.poll_read_ready(cx)).await,
+            std::future::poll_fn(|cx| NullFilter.poll_read_ready(cx)).await,
             crate::ReadStatus::Terminate
         );
         assert_eq!(
-            ntex_util::future::poll_fn(|cx| NullFilter.poll_write_ready(cx)).await,
+            std::future::poll_fn(|cx| NullFilter.poll_write_ready(cx)).await,
             crate::WriteStatus::Terminate
         );
         assert!(NullFilter.process_write_buf(&ioref, &stack, 0).is_ok());

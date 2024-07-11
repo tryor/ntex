@@ -78,15 +78,15 @@ impl Filter for Base {
 
         if flags.intersects(Flags::IO_STOPPING | Flags::IO_STOPPED) {
             Poll::Ready(ReadStatus::Terminate)
-        } else if flags.intersects(Flags::IO_STOPPING_FILTERS) {
-            self.0 .0.read_task.register(cx.waker());
-            Poll::Ready(ReadStatus::Ready)
-        } else if flags.intersects(Flags::RD_PAUSED | Flags::RD_BUF_FULL) {
-            self.0 .0.read_task.register(cx.waker());
-            Poll::Pending
         } else {
             self.0 .0.read_task.register(cx.waker());
-            Poll::Ready(ReadStatus::Ready)
+            if flags.intersects(Flags::IO_STOPPING_FILTERS) {
+                Poll::Ready(ReadStatus::Ready)
+            } else if flags.intersects(Flags::RD_PAUSED | Flags::RD_BUF_FULL) {
+                Poll::Pending
+            } else {
+                Poll::Ready(ReadStatus::Ready)
+            }
         }
     }
 
@@ -97,14 +97,18 @@ impl Filter for Base {
         if flags.contains(Flags::IO_STOPPED) {
             Poll::Ready(WriteStatus::Terminate)
         } else if flags.intersects(Flags::IO_STOPPING) {
-            Poll::Ready(WriteStatus::Shutdown(self.0 .0.disconnect_timeout.get()))
+            Poll::Ready(WriteStatus::Shutdown(
+                self.0 .0.disconnect_timeout.get().into(),
+            ))
         } else if flags.contains(Flags::IO_STOPPING_FILTERS)
             && !flags.contains(Flags::IO_FILTERS_TIMEOUT)
         {
             flags.insert(Flags::IO_FILTERS_TIMEOUT);
             self.0.set_flags(flags);
             self.0 .0.write_task.register(cx.waker());
-            Poll::Ready(WriteStatus::Timeout(self.0 .0.disconnect_timeout.get()))
+            Poll::Ready(WriteStatus::Timeout(
+                self.0 .0.disconnect_timeout.get().into(),
+            ))
         } else {
             self.0 .0.write_task.register(cx.waker());
             Poll::Ready(WriteStatus::Ready)
@@ -130,12 +134,16 @@ impl Filter for Base {
         s.with_write_destination(io, |buf| {
             if let Some(buf) = buf {
                 let len = buf.len();
-                if len > 0 && self.0.flags().contains(Flags::WR_PAUSED) {
+                let flags = self.0.flags();
+                if len > 0 && flags.contains(Flags::WR_PAUSED) {
                     self.0 .0.remove_flags(Flags::WR_PAUSED);
                     self.0 .0.write_task.wake();
                 }
-                if len >= self.0.memory_pool().write_params_high() {
+                if len >= self.0.memory_pool().write_params_high()
+                    && !flags.contains(Flags::WR_BACKPRESSURE)
+                {
                     self.0 .0.insert_flags(Flags::WR_BACKPRESSURE);
+                    self.0 .0.dispatch_task.wake();
                 }
             }
         });

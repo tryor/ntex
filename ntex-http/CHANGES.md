@@ -1,5 +1,13 @@
 # Changes
 
+## [0.1.12] - 2024-01-16
+
+* Update http dependency
+
+## [0.1.11] - 2023-11-21
+
+* Implement serde::Serialize/Deserialize for HeaderMap
+
 ## [0.1.10] - 2023-09-11
 
 * Add missing fmt::Debug impls

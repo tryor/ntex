@@ -1,5 +1,35 @@
 # Changes
 
+## [2.0.0] - 2024-05-28
+
+* Use async fn for Service::ready() and Service::shutdown()
+
+## [1.1.0] - 2024-03-24
+
+* Move tls connectors from ntex-connect
+
+* Upgrade to rustls 0.23
+
+## [1.0.0] - 2024-01-09
+
+* Release
+
+## [1.0.0-b.1] - 2024-01-08
+
+* Refactor io tls filters
+
+## [1.0.0-b.0] - 2024-01-07
+
+* Use "async fn" in trait for Service definition
+
+## [0.3.3] - 2023-11-12
+
+* Attempt to fix #190
+
+## [0.3.2] - 2023-11-03
+
+* Improve implementation
+
 ## [0.3.1] - 2023-09-11
 
 * Add missing fmt::Debug impls

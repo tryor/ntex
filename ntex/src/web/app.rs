@@ -7,7 +7,7 @@ use crate::service::{
     chain_factory, dev::ServiceChainFactory, map_config, IntoServiceFactory,
 };
 use crate::service::{Identity, Middleware, Service, ServiceCtx, ServiceFactory, Stack};
-use crate::util::{BoxFuture, Extensions, Ready};
+use crate::util::{BoxFuture, Extensions};
 
 use super::app_service::{AppFactory, AppService};
 use super::config::{AppConfig, ServiceConfig};
@@ -269,9 +269,9 @@ where
         U::InitError: fmt::Debug,
     {
         // create and configure default resource
-        self.default = Some(Rc::new(boxed::factory(f.chain().map_init_err(|e| {
-            log::error!("Cannot construct default service: {:?}", e)
-        }))));
+        self.default = Some(Rc::new(boxed::factory(chain_factory(f).map_init_err(
+            |e| log::error!("Cannot construct default service: {:?}", e),
+        ))));
 
         self
     }
@@ -352,12 +352,13 @@ where
             WebRequest<Err>,
             Response = WebRequest<Err>,
             Error = Err::Container,
-            InitError = (),
         >,
         U: IntoServiceFactory<S, WebRequest<Err>>,
     {
         App {
-            filter: self.filter.and_then(filter.into_factory()),
+            filter: self
+                .filter
+                .and_then(filter.into_factory().map_init_err(|_| ())),
             middleware: self.middleware,
             state_factories: self.state_factories,
             services: self.services,
@@ -569,41 +570,32 @@ impl<Err: ErrorRenderer> ServiceFactory<WebRequest<Err>> for Filter<Err> {
     type Error = Err::Container;
     type InitError = ();
     type Service = Filter<Err>;
-    type Future<'f> = Ready<Filter<Err>, ()>;
 
-    #[inline]
-    fn create(&self, _: ()) -> Self::Future<'_> {
-        Ready::Ok(Filter(PhantomData))
+    async fn create(&self, _: ()) -> Result<Self::Service, Self::InitError> {
+        Ok(Filter(PhantomData))
     }
 }
 
 impl<Err: ErrorRenderer> Service<WebRequest<Err>> for Filter<Err> {
     type Response = WebRequest<Err>;
     type Error = Err::Container;
-    type Future<'f> = Ready<WebRequest<Err>, Err::Container>;
 
-    #[inline]
-    fn call<'a>(
-        &'a self,
+    async fn call(
+        &self,
         req: WebRequest<Err>,
-        _: ServiceCtx<'a, Self>,
-    ) -> Self::Future<'a> {
-        Ready::Ok(req)
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<WebRequest<Err>, Err::Container> {
+        Ok(req)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::header::{self, HeaderValue};
-    use crate::http::{Method, StatusCode};
-    use crate::service::fn_service;
-    use crate::util::{Bytes, Ready};
+    use crate::http::{header, header::HeaderValue, Method, StatusCode};
     use crate::web::test::{call_service, init_service, read_body, TestRequest};
-    use crate::web::{
-        self, middleware::DefaultHeaders, DefaultError, HttpRequest, HttpResponse,
-        WebRequest,
-    };
+    use crate::web::{self, middleware::DefaultHeaders, HttpRequest, HttpResponse};
+    use crate::{service::fn_service, util::Ready};
 
     #[crate::rt_test]
     async fn test_default_resource() {
@@ -781,6 +773,8 @@ mod tests {
     #[cfg(feature = "url")]
     #[crate::rt_test]
     async fn test_external_resource() {
+        use crate::util::Bytes;
+
         let srv = init_service(
             App::new()
                 .external_resource("youtube", "https://youtube.com/watch/{video_id}")

@@ -246,16 +246,12 @@ impl WebServiceAdapter {
     pub fn finish<T, F, Err>(self, service: F) -> impl WebServiceFactory<Err>
     where
         F: IntoServiceFactory<T, WebRequest<Err>>,
-        T: ServiceFactory<
-                WebRequest<Err>,
-                Response = WebResponse,
-                Error = Err::Container,
-                InitError = (),
-            > + 'static,
+        T: ServiceFactory<WebRequest<Err>, Response = WebResponse, Error = Err::Container>
+            + 'static,
         Err: ErrorRenderer,
     {
         WebServiceImpl {
-            srv: service.into_factory(),
+            srv: service.into_factory().map_init_err(|_| ()),
             rdef: self.rdef,
             name: self.name,
             guards: self.guards,
@@ -293,7 +289,7 @@ where
             ResourceDef::new(self.rdef)
         };
         if let Some(ref name) = self.name {
-            *rdef.name_mut() = name.clone();
+            rdef.name_mut().clone_from(name);
         }
         config.register_service(rdef, guards, self.srv, None)
     }

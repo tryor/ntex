@@ -1,5 +1,17 @@
 # Changes
 
+## [0.4.0] - 2024-01-09
+
+* Log io tags
+
+## [0.4.0-b.0] - 2024-01-07
+
+* Use "async fn" in trait for Service definition
+
+## [0.3.1] - 2023-11-12
+
+* Optimize io read task
+
 ## [0.3.0] - 2023-06-22
 
 * Release v0.3.0

@@ -1,20 +1,17 @@
 //! An implementation of SSL streams for ntex backed by OpenSSL
 use std::io::{self, Read as IoRead, Write as IoWrite};
-use std::{any, cell::Cell, cell::RefCell, sync::Arc, task::Poll};
+use std::{any, cell::RefCell, future::poll_fn, sync::Arc, task::Poll};
 
 use ntex_bytes::BufMut;
 use ntex_io::{types, Filter, FilterLayer, Io, Layer, ReadBuf, WriteBuf};
-use ntex_util::{future::poll_fn, ready};
-use tls_rust::{ClientConfig, ClientConnection, ServerName};
+use ntex_util::ready;
+use tls_rust::{pki_types::ServerName, ClientConfig, ClientConnection};
 
-use crate::rustls::{IoInner, TlsFilter, Wrapper};
-
-use super::{PeerCert, PeerCertChain};
+use super::{PeerCert, PeerCertChain, Wrapper};
 
 #[derive(Debug)]
 /// An implementation of SSL streams
-pub(crate) struct TlsClientFilter {
-    inner: IoInner,
+pub struct TlsClientFilter {
     session: RefCell<ClientConnection>,
 }
 
@@ -36,7 +33,7 @@ impl FilterLayer for TlsClientFilter {
                 types::HttpProtocol::Http1
             };
             Some(Box::new(proto))
-        } else if id == any::TypeId::of::<PeerCert>() {
+        } else if id == any::TypeId::of::<PeerCert<'_>>() {
             if let Some(cert_chain) = self.session.borrow().peer_certificates() {
                 if let Some(cert) = cert_chain.first() {
                     Some(Box::new(PeerCert(cert.to_owned())))
@@ -46,7 +43,7 @@ impl FilterLayer for TlsClientFilter {
             } else {
                 None
             }
-        } else if id == any::TypeId::of::<PeerCertChain>() {
+        } else if id == any::TypeId::of::<PeerCertChain<'_>>() {
             if let Some(cert_chain) = self.session.borrow().peer_certificates() {
                 Some(Box::new(PeerCertChain(cert_chain.to_vec())))
             } else {
@@ -59,7 +56,7 @@ impl FilterLayer for TlsClientFilter {
 
     fn process_read_buf(&self, buf: &ReadBuf<'_>) -> io::Result<usize> {
         let mut session = self.session.borrow_mut();
-        let mut new_bytes = usize::from(self.inner.handshake.get());
+        let mut new_bytes = 0;
 
         // get processed buffer
         buf.with_src(|src| {
@@ -67,11 +64,17 @@ impl FilterLayer for TlsClientFilter {
                 buf.with_dst(|dst| {
                     loop {
                         let mut cursor = io::Cursor::new(&src);
-                        let n = session.read_tls(&mut cursor)?;
+                        let n = match session.read_tls(&mut cursor) {
+                            Ok(n) => n,
+                            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                break
+                            }
+                            Err(err) => return Err(err),
+                        };
                         src.split_to(n);
                         let state = session
                             .process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
                         let new_b = state.plaintext_bytes_to_read();
                         if new_b > 0 {
@@ -95,18 +98,26 @@ impl FilterLayer for TlsClientFilter {
     fn process_write_buf(&self, buf: &WriteBuf<'_>) -> io::Result<()> {
         buf.with_src(|src| {
             if let Some(src) = src {
+                let mut io = Wrapper(buf);
                 let mut session = self.session.borrow_mut();
-                let mut io = Wrapper(&self.inner, buf);
 
-                loop {
+                'outer: loop {
                     if !src.is_empty() {
                         src.split_to(session.writer().write(src)?);
-                    }
-                    if session.wants_write() {
-                        session.complete_io(&mut io)?;
                     } else {
                         break;
                     }
+                    while session.wants_write() {
+                        match session.write_tls(&mut io) {
+                            Ok(0) => continue 'outer,
+                            Ok(_) => continue,
+                            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                break
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    break;
                 }
             }
             Ok(())
@@ -115,54 +126,46 @@ impl FilterLayer for TlsClientFilter {
 }
 
 impl TlsClientFilter {
-    pub(crate) async fn create<F: Filter>(
+    pub async fn create<F: Filter>(
         io: Io<F>,
         cfg: Arc<ClientConfig>,
-        domain: ServerName,
-    ) -> Result<Io<Layer<TlsFilter, F>>, io::Error> {
+        domain: ServerName<'static>,
+    ) -> Result<Io<Layer<TlsClientFilter, F>>, io::Error> {
         let session = ClientConnection::new(cfg, domain)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        let filter = TlsFilter::new_client(TlsClientFilter {
-            inner: IoInner {
-                handshake: Cell::new(true),
-            },
+        let filter = TlsClientFilter {
             session: RefCell::new(session),
-        });
+        };
         let io = io.add_filter(filter);
 
         let filter = io.filter();
         loop {
             let (result, wants_read, handshaking) = io.with_buf(|buf| {
-                let mut session = filter.client().session.borrow_mut();
-                let mut wrp = Wrapper(&filter.client().inner, buf);
+                let mut session = filter.session.borrow_mut();
+                let mut wrp = Wrapper(buf);
                 let mut result = (
                     session.complete_io(&mut wrp),
                     session.wants_read(),
                     session.is_handshaking(),
                 );
 
-                while session.wants_write() {
+                if result.0.is_ok() && session.wants_write() {
                     result.0 = session.complete_io(&mut wrp);
-                    if result.0.is_err() {
-                        break;
-                    }
                 }
                 result
             })?;
 
             match result {
                 Ok(_) => {
-                    filter.client().inner.handshake.set(false);
                     return Ok(io);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if !handshaking {
-                        filter.client().inner.handshake.set(false);
                         return Ok(io);
                     }
                     poll_fn(|cx| {
                         let read_ready = if wants_read {
-                            match ready!(io.poll_read_ready(cx))? {
+                            match ready!(io.poll_force_read_ready(cx))? {
                                 Some(_) => Ok(true),
                                 None => Err(io::Error::new(
                                     io::ErrorKind::Other,

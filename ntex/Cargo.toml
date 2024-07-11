@@ -1,36 +1,39 @@
 [package]
 name = "ntex"
-version = "0.7.4"
+version = "2.0.3"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Framework for composable network services"
 readme = "README.md"
 keywords = ["ntex", "networking", "framework", "async", "futures"]
-repository = "https://github.com/ntex-rs/ntex.git"
+repository = "https://github.com/ntex-rs/ntex"
 documentation = "https://docs.rs/ntex/"
-categories = ["network-programming", "asynchronous",
-              "web-programming::http-server",
-              "web-programming::websocket"]
-license = "MIT"
+categories = [
+    "network-programming",
+    "asynchronous",
+    "web-programming::http-server",
+    "web-programming::websocket",
+]
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 [package.metadata.docs.rs]
-features = ["tokio", "openssl", "rustls", "compress", "cookie"]
+features = ["tokio", "openssl", "rustls", "compress", "cookie", "ws", "brotli"]
 
 [lib]
 name = "ntex"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["ws"]
 
 # openssl
-openssl = ["tls-openssl", "ntex-tls/openssl", "ntex-connect/openssl"]
+openssl = ["tls-openssl", "ntex-tls/openssl"]
 
 # rustls support
-rustls = ["tls-rustls", "webpki-roots", "ntex-tls/rustls", "ntex-connect/rustls"]
+rustls = ["tls-rustls", "webpki-roots", "ntex-tls/rustls"]
 
 # enable compressison support
-compress = ["flate2", "brotli2"]
+compress = ["flate2"]
 
 # enable cookie support
 cookie = ["coo-kie", "coo-kie/percent-encode"]
@@ -39,74 +42,76 @@ cookie = ["coo-kie", "coo-kie/percent-encode"]
 url = ["url-pkg"]
 
 # tokio runtime
-tokio = ["ntex-rt/tokio", "ntex-tokio", "ntex-connect/tokio"]
+tokio = ["ntex-net/tokio"]
 
 # glommio runtime
-glommio = ["ntex-rt/glommio", "ntex-glommio", "ntex-connect/glommio"]
+glommio = ["ntex-net/glommio"]
 
 # async-std runtime
-async-std = ["ntex-rt/async-std", "ntex-async-std", "ntex-connect/async-std"]
+async-std = ["ntex-net/async-std"]
+
+# websocket support
+ws = ["dep:sha-1"]
+
+# brotli2 support
+brotli = ["dep:brotli2"]
 
 [dependencies]
 ntex-codec = "0.6.2"
-ntex-connect = "0.3.1"
-ntex-http = "0.1.10"
-ntex-router = "0.5.2"
-ntex-service = "1.2.6"
+ntex-http = "0.1.12"
+ntex-router = "0.5.3"
+ntex-service = "3.0"
 ntex-macros = "0.1.3"
-ntex-util = "0.3.2"
-ntex-bytes = "0.1.19"
-ntex-h2 = "0.3.2"
-ntex-rt = "0.4.9"
-ntex-io = "0.3.4"
-ntex-tls = "0.3.1"
-ntex-tokio = { version = "0.3.0", optional = true }
-ntex-glommio = { version = "0.3.0", optional = true }
-ntex-async-std = { version = "0.3.0", optional = true }
+ntex-util = "2"
+ntex-bytes = "0.1.27"
+ntex-server = "2.1"
+ntex-h2 = "1.0"
+ntex-rt = "0.4.13"
+ntex-io = "2.0"
+ntex-net = "2.0"
+ntex-tls = "2.0"
 
-async-oneshot = "0.5.0"
-async-channel = "1.8.0"
-base64 = "0.21"
-bitflags = "1.3"
+base64 = "0.22"
+bitflags = "2"
 log = "0.4"
-num_cpus = "1.13"
-nanorand = { version = "0.7.0", default-features = false, features = ["std", "wyrand"] }
-polling = "2.5.1"
 pin-project-lite = "0.2"
-regex = { version = "1.7.0", default-features = false, features = ["std"] }
-sha-1 = "0.10"
-serde = { version = "1.0", features=["derive"] }
-socket2 = "0.5"
+regex = { version = "1.10", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+sha-1 = { version = "0.10", optional = true }
 thiserror = "1.0"
+nanorand = { version = "0.7", default-features = false, features = [
+    "std",
+    "wyrand",
+] }
 
 # http/web framework
-httparse = "1.6.0"
+httparse = "1.8"
 httpdate = "1.0"
 encoding_rs = "0.8"
 mime = "0.3"
-percent-encoding = "2.1"
+percent-encoding = "2.3"
 serde_json = "1.0"
 serde_urlencoded = "0.7"
-url-pkg = { version = "2.1", package = "url", optional = true }
-coo-kie = { version = "0.17", package = "cookie", optional = true }
+url-pkg = { version = "2.4", package = "url", optional = true }
+coo-kie = { version = "0.18", package = "cookie", optional = true }
 
 # openssl
-tls-openssl = { version="0.10", package = "openssl", optional = true }
+tls-openssl = { version = "0.10", package = "openssl", optional = true }
 
 # rustls
-tls-rustls = { version = "0.21", package = "rustls", optional = true }
-webpki-roots = { version = "0.23", optional = true }
+tls-rustls = { version = "0.23", package = "rustls", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 # compression
-brotli2 = { version="0.3.2", optional = true }
+brotli2 = { version = "0.3.2", optional = true }
 flate2 = { version = "1.0.22", optional = true }
 
 [dev-dependencies]
-env_logger = "0.10"
+env_logger = "0.11"
 rand = "0.8"
 time = "0.3"
 futures-util = "0.3"
-tls-openssl = { version="0.10", package = "openssl" }
-tls-rustls = { version = "0.21", package="rustls", features = ["dangerous_configuration"]  }
-rustls-pemfile = "1.0"
-webpki-roots = "0.23"
+tls-openssl = { version = "0.10", package = "openssl" }
+tls-rustls = { version = "0.23", package = "rustls" }
+rustls-pemfile = "2"
+webpki-roots = "0.26"

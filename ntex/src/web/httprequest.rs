@@ -5,7 +5,7 @@ use crate::http::{
 };
 use crate::io::{types, IoRef};
 use crate::router::Path;
-use crate::util::{Extensions, Ready};
+use crate::util::Extensions;
 
 use super::config::AppConfig;
 use super::error::ErrorRenderer;
@@ -97,11 +97,7 @@ impl HttpRequest {
     /// E.g., id=10
     #[inline]
     pub fn query_string(&self) -> &str {
-        if let Some(query) = self.uri().query().as_ref() {
-            query
-        } else {
-            ""
-        }
+        self.uri().query().unwrap_or_default()
     }
 
     /// Io reference for current connection
@@ -249,9 +245,10 @@ impl HttpMessage for HttpRequest {
 
 impl Drop for HttpRequest {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.0) == 1 {
-            let v = &mut self.0.pool.0.borrow_mut();
+        if let Some(inner) = Rc::get_mut(&mut self.0) {
+            let v = &mut inner.pool.0.borrow_mut();
             if v.len() < 128 {
+                inner.head.remove_io();
                 self.extensions_mut().clear();
                 v.push(self.0.clone());
             }
@@ -280,11 +277,10 @@ impl Drop for HttpRequest {
 /// ```
 impl<Err: ErrorRenderer> FromRequest<Err> for HttpRequest {
     type Error = Err::Container;
-    type Future = Ready<Self, Self::Error>;
 
     #[inline]
-    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
-        Ok(req.clone()).into()
+    async fn from_request(req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
+        Ok(req.clone())
     }
 }
 

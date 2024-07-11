@@ -9,8 +9,8 @@
 #![warn(
     rust_2018_idioms,
     unreachable_pub,
-    missing_debug_implementations,
-    // missing_docs,
+    // missing_debug_implementations,
+    // missing_docs
 )]
 #![allow(
     type_alias_bounds,
@@ -18,11 +18,9 @@
     clippy::borrow_interior_mutable_const,
     clippy::needless_doctest_main,
     clippy::too_many_arguments,
-    clippy::new_without_default
+    clippy::new_without_default,
+    clippy::let_underscore_future
 )]
-
-#[macro_use]
-extern crate log;
 
 #[cfg(not(test))] // Work around for rust-lang/rust#62127
 pub use ntex_macros::{rt_main as main, rt_test as test};
@@ -30,16 +28,17 @@ pub use ntex_macros::{rt_main as main, rt_test as test};
 #[cfg(test)]
 pub(crate) use ntex_macros::rt_test2 as rt_test;
 
-pub use ntex_service::{forward_poll_ready, forward_poll_shutdown};
+pub use ntex_service::{forward_ready, forward_shutdown};
 
 pub mod http;
-pub mod server;
 pub mod web;
+
+#[cfg(feature = "ws")]
 pub mod ws;
 
 pub use self::service::{
-    chain, chain_factory, fn_service, into_service, IntoService, IntoServiceFactory,
-    Middleware, Pipeline, Service, ServiceCall, ServiceCtx, ServiceFactory,
+    chain, chain_factory, fn_service, IntoService, IntoServiceFactory, Middleware,
+    Pipeline, Service, ServiceCtx, ServiceFactory,
 };
 
 pub use ntex_util::{channel, task};
@@ -51,7 +50,17 @@ pub mod codec {
 
 pub mod connect {
     //! Tcp connector service
-    pub use ntex_connect::*;
+    pub use ntex_net::connect::*;
+
+    #[cfg(feature = "openssl")]
+    pub mod openssl {
+        pub use ntex_tls::openssl::{SslConnector, SslFilter};
+    }
+
+    #[cfg(feature = "rustls")]
+    pub mod rustls {
+        pub use ntex_tls::rustls::{TlsClientFilter, TlsConnector};
+    }
 }
 
 pub mod router {
@@ -63,26 +72,24 @@ pub mod rt {
     //! A runtime implementation that runs everything on the current thread.
     pub use ntex_rt::*;
 
-    #[cfg(feature = "tokio")]
-    pub use ntex_tokio::*;
-
-    #[cfg(all(
-        feature = "async-std",
-        not(feature = "tokio"),
-        not(feature = "glommio")
-    ))]
-    pub use ntex_async_std::*;
-
-    #[cfg(all(
-        feature = "glommio",
-        not(feature = "tokio"),
-        not(feature = "async-std")
-    ))]
-    pub use ntex_glommio::*;
+    pub use ntex_net::*;
 }
 
 pub mod service {
     pub use ntex_service::*;
+}
+
+pub mod server {
+    //! General purpose tcp server
+    pub use ntex_server::net::*;
+
+    pub use ntex_server::{signal, Signal};
+
+    #[cfg(feature = "openssl")]
+    pub use ntex_tls::openssl;
+
+    #[cfg(feature = "rustls")]
+    pub use ntex_tls::rustls;
 }
 
 pub mod time {

@@ -5,7 +5,7 @@ pub use crate::ws::{CloseCode, CloseReason, Frame, Message, WsSink};
 
 use crate::http::{body::BodySize, h1, StatusCode};
 use crate::service::{
-    apply_fn, fn_factory_with_config, IntoServiceFactory, ServiceFactory,
+    apply_fn, chain_factory, fn_factory_with_config, IntoServiceFactory, ServiceFactory,
 };
 use crate::web::{HttpRequest, HttpResponse};
 use crate::ws::{self, error::HandshakeError, error::WsError, handshake};
@@ -19,7 +19,7 @@ where
     F: IntoServiceFactory<T, Frame, WsSink>,
     Err: From<T::InitError> + From<HandshakeError>,
 {
-    let inner_factory = Rc::new(factory.chain().map_err(WsError::Service));
+    let inner_factory = Rc::new(chain_factory(factory).map_err(WsError::Service));
 
     let factory = fn_factory_with_config(move |sink: WsSink| {
         let factory = inner_factory.clone();
@@ -38,7 +38,7 @@ where
                     Either::Left(async move {
                         let result = srv.call(item).await;
                         if let Some(s) = s {
-                            rt::spawn(async move { s.io().close() });
+                            let _ = rt::spawn(async move { s.io().close() });
                         }
                         result
                     })
@@ -47,6 +47,9 @@ where
                 | DispatchItem::WBackPressureDisabled => Either::Right(Ready::Ok(None)),
                 DispatchItem::KeepAliveTimeout => {
                     Either::Right(Ready::Err(WsError::KeepAlive))
+                }
+                DispatchItem::ReadTimeout => {
+                    Either::Right(Ready::Err(WsError::ReadTimeout))
                 }
                 DispatchItem::DecoderError(e) | DispatchItem::EncoderError(e) => {
                     Either::Right(Ready::Err(WsError::Protocol(e)))
@@ -97,11 +100,12 @@ where
     // create ws service
     let srv = factory.into_factory().create(sink.clone()).await?;
 
+    let cfg = crate::io::DispatcherConfig::default();
+    cfg.set_keepalive_timeout(Seconds::ZERO);
+
     // start websockets service dispatcher
-    rt::spawn(async move {
-        let res = crate::io::Dispatcher::new(io, codec, srv)
-            .keepalive_timeout(Seconds::ZERO)
-            .await;
+    let _ = rt::spawn(async move {
+        let res = crate::io::Dispatcher::new(io, codec, srv, &cfg).await;
         log::trace!("Ws handler is terminated: {:?}", res);
     });
 

@@ -1,64 +1,150 @@
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration, time::Instant};
+#![allow(clippy::mutable_key_type)]
+use std::collections::{BTreeMap, VecDeque};
+use std::{cell::Cell, cell::RefCell, ops, rc::Rc, time::Duration, time::Instant};
 
-use ntex_util::time::{now, sleep, Millis};
+use ntex_util::time::{now, sleep, Seconds};
 use ntex_util::{spawn, HashSet};
 
 use crate::{io::IoState, IoRef};
 
+const CAP: usize = 64;
+const SEC: Duration = Duration::from_secs(1);
+
 thread_local! {
-    static TIMER: Rc<RefCell<Inner>> = Rc::new(RefCell::new(
-        Inner {
-            running: false,
+    static TIMER: Inner = Inner {
+        running: Cell::new(false),
+        base: Cell::new(Instant::now()),
+        current: Cell::new(0),
+        storage: RefCell::new(InnerMut {
+            cache: VecDeque::with_capacity(CAP),
             notifications: BTreeMap::default(),
-        }));
+        })
+    }
+}
+
+#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TimerHandle(u32);
+
+impl TimerHandle {
+    pub const ZERO: TimerHandle = TimerHandle(0);
+
+    pub fn is_set(&self) -> bool {
+        self.0 != 0
+    }
+
+    pub fn remains(&self) -> Seconds {
+        TIMER.with(|timer| {
+            let cur = timer.current.get();
+            if self.0 <= cur {
+                Seconds::ZERO
+            } else {
+                Seconds((self.0 - cur) as u16)
+            }
+        })
+    }
+
+    pub fn instant(&self) -> Instant {
+        TIMER.with(|timer| timer.base.get() + Duration::from_secs(self.0 as u64))
+    }
+}
+
+impl ops::Add<Seconds> for TimerHandle {
+    type Output = TimerHandle;
+
+    #[inline]
+    fn add(self, other: Seconds) -> TimerHandle {
+        TimerHandle(self.0 + other.0 as u32)
+    }
 }
 
 struct Inner {
-    running: bool,
-    notifications: BTreeMap<Instant, HashSet<Rc<IoState>>>,
+    running: Cell<bool>,
+    base: Cell<Instant>,
+    current: Cell<u32>,
+    storage: RefCell<InnerMut>,
 }
 
-impl Inner {
-    fn unregister(&mut self, expire: Instant, io: &IoRef) {
-        if let Some(states) = self.notifications.get_mut(&expire) {
+struct InnerMut {
+    cache: VecDeque<HashSet<Rc<IoState>>>,
+    notifications: BTreeMap<u32, HashSet<Rc<IoState>>>,
+}
+
+impl InnerMut {
+    fn unregister(&mut self, hnd: TimerHandle, io: &IoRef) {
+        if let Some(states) = self.notifications.get_mut(&hnd.0) {
             states.remove(&io.0);
-            if states.is_empty() {
-                self.notifications.remove(&expire);
-            }
         }
     }
 }
 
-pub(crate) fn register(timeout: Duration, io: &IoRef) -> Instant {
-    let expire = now() + timeout;
-
+pub(crate) fn unregister(hnd: TimerHandle, io: &IoRef) {
     TIMER.with(|timer| {
-        let mut inner = timer.borrow_mut();
+        timer.storage.borrow_mut().unregister(hnd, io);
+    })
+}
 
-        inner
-            .notifications
-            .entry(expire)
-            .or_insert_with(HashSet::default)
-            .insert(io.0.clone());
+pub(crate) fn update(hnd: TimerHandle, timeout: Seconds, io: &IoRef) -> TimerHandle {
+    TIMER.with(|timer| {
+        let new_hnd = timer.current.get() + timeout.0 as u32;
+        if hnd.0 == new_hnd || hnd.0 == new_hnd + 1 {
+            hnd
+        } else {
+            timer.storage.borrow_mut().unregister(hnd, io);
+            register(timeout, io)
+        }
+    })
+}
 
-        if !inner.running {
-            inner.running = true;
-            let inner = timer.clone();
+pub(crate) fn register(timeout: Seconds, io: &IoRef) -> TimerHandle {
+    TIMER.with(|timer| {
+        // setup current delta
+        if !timer.running.get() {
+            let current = (now() - timer.base.get()).as_secs() as u32;
+            timer.current.set(current);
+            log::debug!(
+                "{}: Timer driver does not run, current: {}",
+                io.tag(),
+                current
+            );
+        }
 
-            spawn(async move {
-                let guard = TimerGuard(inner.clone());
+        let hnd = {
+            let hnd = timer.current.get() + timeout.0 as u32;
+            let mut inner = timer.storage.borrow_mut();
+
+            // insert key
+            if let Some(item) = inner.notifications.range_mut(hnd..hnd + 1).next() {
+                item.1.insert(io.0.clone());
+                *item.0
+            } else {
+                let mut items = inner.cache.pop_front().unwrap_or_default();
+                items.insert(io.0.clone());
+                inner.notifications.insert(hnd, items);
+                hnd
+            }
+        };
+
+        if !timer.running.get() {
+            timer.running.set(true);
+
+            #[allow(clippy::let_underscore_future)]
+            let _ = spawn(async move {
+                let guard = TimerGuard;
                 loop {
-                    sleep(Millis::ONE_SEC).await;
-                    {
-                        let mut i = inner.borrow_mut();
-                        let now_time = now();
+                    sleep(SEC).await;
+                    let stop = TIMER.with(|timer| {
+                        let current = timer.current.get();
+                        timer.current.set(current + 1);
 
                         // notify io dispatcher
-                        while let Some(key) = i.notifications.keys().next() {
+                        let mut inner = timer.storage.borrow_mut();
+                        while let Some(key) = inner.notifications.keys().next() {
                             let key = *key;
-                            if key <= now_time {
-                                for st in i.notifications.remove(&key).unwrap() {
-                                    st.notify_keepalive();
+                            if key <= current {
+                                let mut items = inner.notifications.remove(&key).unwrap();
+                                items.drain().for_each(|st| st.notify_timeout());
+                                if inner.cache.len() <= CAP {
+                                    inner.cache.push_back(items);
                                 }
                             } else {
                                 break;
@@ -66,30 +152,33 @@ pub(crate) fn register(timeout: Duration, io: &IoRef) -> Instant {
                         }
 
                         // new tick
-                        if i.notifications.is_empty() {
-                            i.running = false;
-                            break;
+                        if inner.notifications.is_empty() {
+                            timer.running.set(false);
+                            true
+                        } else {
+                            false
                         }
+                    });
+
+                    if stop {
+                        break;
                     }
                 }
                 drop(guard);
             });
         }
-    });
 
-    expire
+        TimerHandle(hnd)
+    })
 }
 
-struct TimerGuard(Rc<RefCell<Inner>>);
+struct TimerGuard;
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
-        self.0.borrow_mut().running = false;
+        TIMER.with(|timer| {
+            timer.running.set(false);
+            timer.storage.borrow_mut().notifications.clear();
+        })
     }
-}
-
-pub(crate) fn unregister(expire: Instant, io: &IoRef) {
-    TIMER.with(|timer| {
-        timer.borrow_mut().unregister(expire, io);
-    })
 }

@@ -70,6 +70,15 @@ impl ResponseBody<Body> {
     }
 }
 
+impl From<ResponseBody<Body>> for Body {
+    fn from(b: ResponseBody<Body>) -> Self {
+        match b {
+            ResponseBody::Body(b) => b,
+            ResponseBody::Other(b) => b,
+        }
+    }
+}
+
 impl<B> From<Body> for ResponseBody<B> {
     fn from(b: Body) -> Self {
         ResponseBody::Other(b)
@@ -543,10 +552,10 @@ where
 #[cfg(test)]
 mod tests {
     use futures_util::stream;
-    use std::io;
+    use std::{future::poll_fn, io};
 
     use super::*;
-    use crate::util::{poll_fn, Ready};
+    use crate::util::Ready;
 
     impl Body {
         pub(crate) fn get_ref(&self) -> &[u8] {

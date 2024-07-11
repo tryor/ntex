@@ -1,15 +1,112 @@
 //! Framed transport dispatcher
-use std::{cell::Cell, future, pin::Pin, rc::Rc, task::Context, task::Poll, time};
+#![allow(clippy::let_underscore_future)]
+use std::{cell::Cell, future::Future, pin::Pin, rc::Rc, task::Context, task::Poll};
 
-use ntex_bytes::Pool;
 use ntex_codec::{Decoder, Encoder};
-use ntex_service::{IntoService, Pipeline, Service};
-use ntex_util::time::Seconds;
-use ntex_util::{future::Either, ready, spawn};
+use ntex_service::{IntoService, Pipeline, PipelineBinding, PipelineCall, Service};
+use ntex_util::{future::Either, ready, spawn, time::Seconds};
 
-use crate::{DispatchItem, IoBoxed, IoStatusUpdate, RecvError};
+use crate::{Decoded, DispatchItem, IoBoxed, IoStatusUpdate, RecvError};
 
 type Response<U> = <U as Encoder>::Item;
+
+#[derive(Clone, Debug)]
+/// Shared dispatcher configuration
+pub struct DispatcherConfig(Rc<DispatcherConfigInner>);
+
+#[derive(Debug)]
+struct DispatcherConfigInner {
+    keepalive_timeout: Cell<Seconds>,
+    disconnect_timeout: Cell<Seconds>,
+    frame_read_enabled: Cell<bool>,
+    frame_read_rate: Cell<u16>,
+    frame_read_timeout: Cell<Seconds>,
+    frame_read_max_timeout: Cell<Seconds>,
+}
+
+impl Default for DispatcherConfig {
+    fn default() -> Self {
+        DispatcherConfig(Rc::new(DispatcherConfigInner {
+            keepalive_timeout: Cell::new(Seconds(30)),
+            disconnect_timeout: Cell::new(Seconds(1)),
+            frame_read_rate: Cell::new(0),
+            frame_read_enabled: Cell::new(false),
+            frame_read_timeout: Cell::new(Seconds::ZERO),
+            frame_read_max_timeout: Cell::new(Seconds::ZERO),
+        }))
+    }
+}
+
+impl DispatcherConfig {
+    #[inline]
+    /// Get keep-alive timeout
+    pub fn keepalive_timeout(&self) -> Seconds {
+        self.0.keepalive_timeout.get()
+    }
+
+    #[inline]
+    /// Get disconnect timeout
+    pub fn disconnect_timeout(&self) -> Seconds {
+        self.0.disconnect_timeout.get()
+    }
+
+    #[inline]
+    /// Get frame read rate
+    pub fn frame_read_rate(&self) -> Option<(Seconds, Seconds, u16)> {
+        if self.0.frame_read_enabled.get() {
+            Some((
+                self.0.frame_read_timeout.get(),
+                self.0.frame_read_max_timeout.get(),
+                self.0.frame_read_rate.get(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Set keep-alive timeout in seconds.
+    ///
+    /// To disable timeout set value to 0.
+    ///
+    /// By default keep-alive timeout is set to 30 seconds.
+    pub fn set_keepalive_timeout(&self, timeout: Seconds) -> &Self {
+        self.0.keepalive_timeout.set(timeout);
+        self
+    }
+
+    /// Set connection disconnect timeout.
+    ///
+    /// Defines a timeout for disconnect connection. If a disconnect procedure does not complete
+    /// within this time, the connection get dropped.
+    ///
+    /// To disable timeout set value to 0.
+    ///
+    /// By default disconnect timeout is set to 1 seconds.
+    pub fn set_disconnect_timeout(&self, timeout: Seconds) -> &Self {
+        self.0.disconnect_timeout.set(timeout);
+        self
+    }
+
+    /// Set read rate parameters for single frame.
+    ///
+    /// Set read timeout, max timeout and rate for reading payload. If the client
+    /// sends `rate` amount of data within `timeout` period of time, extend timeout by `timeout` seconds.
+    /// But no more than `max_timeout` timeout.
+    ///
+    /// By default frame read rate is disabled.
+    pub fn set_frame_read_rate(
+        &self,
+        timeout: Seconds,
+        max_timeout: Seconds,
+        rate: u16,
+    ) -> &Self {
+        self.0.frame_read_enabled.set(!timeout.is_zero());
+        self.0.frame_read_timeout.set(timeout);
+        self.0.frame_read_max_timeout.set(max_timeout);
+        self.0.frame_read_rate.set(rate);
+        self
+    }
+}
 
 pin_project_lite::pin_project! {
     /// Dispatcher - is a future that reads frames from bytes stream
@@ -19,29 +116,37 @@ pin_project_lite::pin_project! {
         S: Service<DispatchItem<U>, Response = Option<Response<U>>>,
         U: Encoder,
         U: Decoder,
+        U: 'static,
     {
         inner: DispatcherInner<S, U>,
     }
 }
 
 bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct Flags: u8  {
-        const READY_ERR  = 0b0001;
-        const IO_ERR     = 0b0010;
+        const READY_ERR     = 0b00001;
+        const IO_ERR        = 0b00010;
+        const KA_ENABLED    = 0b00100;
+        const KA_TIMEOUT    = 0b01000;
+        const READ_TIMEOUT  = 0b10000;
     }
 }
 
 struct DispatcherInner<S, U>
 where
     S: Service<DispatchItem<U>, Response = Option<Response<U>>>,
-    U: Encoder + Decoder,
+    U: Encoder + Decoder + 'static,
 {
-    st: Cell<DispatcherState>,
-    ka_timeout: Cell<time::Duration>,
-    error: Cell<Option<S::Error>>,
-    flags: Cell<Flags>,
+    st: DispatcherState,
+    error: Option<S::Error>,
+    flags: Flags,
     shared: Rc<DispatcherShared<S, U>>,
-    pool: Pool,
+    response: Option<PipelineCall<S, DispatchItem<U>>>,
+    cfg: DispatcherConfig,
+    read_remains: u32,
+    read_remains_prev: u32,
+    read_max_timeout: Seconds,
 }
 
 pub(crate) struct DispatcherShared<S, U>
@@ -51,7 +156,7 @@ where
 {
     io: IoBoxed,
     codec: U,
-    service: Pipeline<S>,
+    service: PipelineBinding<S, DispatchItem<U>>,
     error: Cell<Option<DispatcherError<S::Error, <U as Encoder>::Error>>>,
     inflight: Cell<usize>,
 }
@@ -87,74 +192,50 @@ impl<S, U> From<Either<S, U>> for DispatcherError<S, U> {
 
 impl<S, U> Dispatcher<S, U>
 where
-    S: Service<DispatchItem<U>, Response = Option<Response<U>>>,
-    U: Decoder + Encoder,
+    S: Service<DispatchItem<U>, Response = Option<Response<U>>> + 'static,
+    U: Decoder + Encoder + 'static,
 {
     /// Construct new `Dispatcher` instance.
-    pub fn new<Io, F>(io: Io, codec: U, service: F) -> Dispatcher<S, U>
+    pub fn new<Io, F>(
+        io: Io,
+        codec: U,
+        service: F,
+        cfg: &DispatcherConfig,
+    ) -> Dispatcher<S, U>
     where
         IoBoxed: From<Io>,
         F: IntoService<S, DispatchItem<U>>,
     {
         let io = IoBoxed::from(io);
-        let ka_timeout = Cell::new(Seconds(30).into());
+        io.set_disconnect_timeout(cfg.disconnect_timeout());
 
-        // register keepalive timer
-        io.start_keepalive_timer(ka_timeout.get());
+        let flags = if cfg.keepalive_timeout().is_zero() {
+            Flags::empty()
+        } else {
+            Flags::KA_ENABLED
+        };
 
-        let pool = io.memory_pool().pool();
         let shared = Rc::new(DispatcherShared {
             io,
             codec,
             error: Cell::new(None),
             inflight: Cell::new(0),
-            service: Pipeline::new(service.into_service()),
+            service: Pipeline::new(service.into_service()).bind(),
         });
 
         Dispatcher {
             inner: DispatcherInner {
-                pool,
                 shared,
-                ka_timeout,
-                error: Cell::new(None),
-                flags: Cell::new(Flags::empty()),
-                st: Cell::new(DispatcherState::Processing),
+                flags,
+                cfg: cfg.clone(),
+                response: None,
+                error: None,
+                read_remains: 0,
+                read_remains_prev: 0,
+                read_max_timeout: Seconds::ZERO,
+                st: DispatcherState::Processing,
             },
         }
-    }
-}
-
-impl<S, U> Dispatcher<S, U>
-where
-    S: Service<DispatchItem<U>, Response = Option<Response<U>>>,
-    U: Decoder + Encoder,
-{
-    /// Set keep-alive timeout.
-    ///
-    /// To disable timeout set value to 0.
-    ///
-    /// By default keep-alive timeout is set to 30 seconds.
-    pub fn keepalive_timeout(self, timeout: Seconds) -> Self {
-        let ka_timeout = time::Duration::from(timeout);
-
-        // register keepalive timer
-        self.inner.shared.io.start_keepalive_timer(ka_timeout);
-        self.inner.ka_timeout.set(ka_timeout);
-
-        self
-    }
-
-    /// Set connection disconnect timeout in seconds.
-    ///
-    /// Defines a timeout for disconnect connection. If a disconnect procedure does not complete
-    /// within this time, the connection get dropped.
-    ///
-    /// To disable timeout set value to 0.
-    ///
-    /// By default disconnect timeout is set to 1 seconds.
-    pub fn disconnect_timeout(self, val: Seconds) -> Self {
-        self.inner.shared.io.set_disconnect_timeout(val.into());
-        self
     }
 }
 
@@ -163,8 +244,7 @@ where
     S: Service<DispatchItem<U>, Response = Option<Response<U>>>,
     U: Encoder + Decoder,
 {
-    fn handle_result(&self, item: Result<S::Response, S::Error>, io: &IoBoxed) {
-        self.inflight.set(self.inflight.get() - 1);
+    fn handle_result(&self, item: Result<S::Response, S::Error>, io: &IoBoxed, wake: bool) {
         match item {
             Ok(Some(val)) => {
                 if let Err(err) = io.encode(val, &self.codec) {
@@ -174,72 +254,84 @@ where
             Err(err) => self.error.set(Some(DispatcherError::Service(err))),
             Ok(None) => (),
         }
-        io.wake();
+        self.inflight.set(self.inflight.get() - 1);
+        if wake {
+            io.wake();
+        }
     }
 }
 
-impl<S, U> future::Future for Dispatcher<S, U>
+impl<S, U> Future for Dispatcher<S, U>
 where
     S: Service<DispatchItem<U>, Response = Option<Response<U>>> + 'static,
     U: Decoder + Encoder + 'static,
 {
     type Output = Result<(), S::Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let slf = &this.inner;
-        let io = &slf.shared.io;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.as_mut().project();
+        let slf = &mut this.inner;
 
-        // handle memory pool pressure
-        if slf.pool.poll_ready(cx).is_pending() {
-            io.pause();
-            return Poll::Pending;
+        // handle service response future
+        if let Some(fut) = slf.response.as_mut() {
+            if let Poll::Ready(item) = Pin::new(fut).poll(cx) {
+                slf.shared.handle_result(item, &slf.shared.io, false);
+                slf.response = None;
+            }
         }
 
         loop {
-            match slf.st.get() {
+            match slf.st {
                 DispatcherState::Processing => {
-                    let item = match ready!(slf.poll_service(
-                        &this.inner.shared.service,
-                        cx,
-                        io
-                    )) {
+                    let item = match ready!(slf.poll_service(cx)) {
                         PollService::Ready => {
                             // decode incoming bytes if buffer is ready
-                            match ready!(io.poll_recv(&slf.shared.codec, cx)) {
-                                Ok(el) => {
-                                    slf.update_keepalive();
-                                    DispatchItem::Item(el)
+                            match slf.shared.io.poll_recv_decode(&slf.shared.codec, cx) {
+                                Ok(decoded) => {
+                                    slf.update_timer(&decoded);
+                                    if let Some(el) = decoded.item {
+                                        DispatchItem::Item(el)
+                                    } else {
+                                        return Poll::Pending;
+                                    }
                                 }
                                 Err(RecvError::KeepAlive) => {
-                                    log::trace!("keep-alive error, stopping dispatcher");
-                                    slf.st.set(DispatcherState::Stop);
-                                    DispatchItem::KeepAliveTimeout
+                                    if let Err(err) = slf.handle_timeout() {
+                                        slf.st = DispatcherState::Stop;
+                                        err
+                                    } else {
+                                        continue;
+                                    }
                                 }
                                 Err(RecvError::Stop) => {
-                                    log::trace!("dispatcher is instructed to stop");
-                                    slf.st.set(DispatcherState::Stop);
+                                    log::trace!(
+                                        "{}: Dispatcher is instructed to stop",
+                                        slf.shared.io.tag()
+                                    );
+                                    slf.st = DispatcherState::Stop;
                                     continue;
                                 }
                                 Err(RecvError::WriteBackpressure) => {
                                     // instruct write task to notify dispatcher when data is flushed
-                                    slf.st.set(DispatcherState::Backpressure);
+                                    slf.st = DispatcherState::Backpressure;
                                     DispatchItem::WBackPressureEnabled
                                 }
                                 Err(RecvError::Decoder(err)) => {
                                     log::trace!(
-                                        "decoder error, stopping dispatcher: {:?}",
+                                        "{}: Decoder error, stopping dispatcher: {:?}",
+                                        slf.shared.io.tag(),
                                         err
                                     );
-                                    slf.st.set(DispatcherState::Stop);
+                                    slf.st = DispatcherState::Stop;
                                     DispatchItem::DecoderError(err)
                                 }
                                 Err(RecvError::PeerGone(err)) => {
                                     log::trace!(
-                                        "peer is gone, stopping dispatcher: {:?}",
+                                        "{}: Peer is gone, stopping dispatcher: {:?}",
+                                        slf.shared.io.tag(),
                                         err
                                     );
-                                    slf.st.set(DispatcherState::Stop);
+                                    slf.st = DispatcherState::Stop;
                                     DispatchItem::Disconnect(err)
                                 }
                             }
@@ -248,77 +340,67 @@ where
                         PollService::Continue => continue,
                     };
 
-                    // call service
-                    let shared = slf.shared.clone();
-                    shared.inflight.set(shared.inflight.get() + 1);
-                    spawn(async move {
-                        let result = shared.service.call(item).await;
-                        shared.handle_result(result, &shared.io);
-                    });
+                    slf.call_service(cx, item);
                 }
                 // handle write back-pressure
                 DispatcherState::Backpressure => {
-                    let result =
-                        ready!(slf.poll_service(&this.inner.shared.service, cx, io));
-                    let item = match result {
-                        PollService::Ready => {
-                            if slf.shared.io.poll_flush(cx, false).is_ready() {
-                                slf.st.set(DispatcherState::Processing);
-                                DispatchItem::WBackPressureDisabled
-                            } else {
-                                return Poll::Pending;
-                            }
-                        }
-                        PollService::Item(item) => item,
+                    match ready!(slf.poll_service(cx)) {
+                        PollService::Ready => (),
+                        PollService::Item(item) => slf.call_service(cx, item),
                         PollService::Continue => continue,
                     };
 
-                    // call service
-                    let shared = slf.shared.clone();
-                    shared.inflight.set(shared.inflight.get() + 1);
-                    spawn(async move {
-                        let result = shared.service.call(item).await;
-                        shared.handle_result(result, &shared.io);
-                    });
+                    let item = if let Err(err) = ready!(slf.shared.io.poll_flush(cx, false))
+                    {
+                        slf.st = DispatcherState::Stop;
+                        DispatchItem::Disconnect(Some(err))
+                    } else {
+                        slf.st = DispatcherState::Processing;
+                        DispatchItem::WBackPressureDisabled
+                    };
+                    slf.call_service(cx, item);
                 }
                 // drain service responses and shutdown io
                 DispatcherState::Stop => {
-                    slf.unregister_keepalive();
+                    slf.shared.io.stop_timer();
 
                     // service may relay on poll_ready for response results
-                    if !slf.flags.get().contains(Flags::READY_ERR) {
-                        let _ = this.inner.shared.service.poll_ready(cx);
+                    if !slf.flags.contains(Flags::READY_ERR) {
+                        let _ = slf.shared.service.poll_ready(cx);
                     }
 
                     if slf.shared.inflight.get() == 0 {
-                        if io.poll_shutdown(cx).is_ready() {
-                            slf.st.set(DispatcherState::Shutdown);
+                        if slf.shared.io.poll_shutdown(cx).is_ready() {
+                            slf.st = DispatcherState::Shutdown;
                             continue;
                         }
-                    } else if !slf.flags.get().contains(Flags::IO_ERR) {
+                    } else if !slf.flags.contains(Flags::IO_ERR) {
                         match ready!(slf.shared.io.poll_status_update(cx)) {
                             IoStatusUpdate::PeerGone(_)
                             | IoStatusUpdate::Stop
                             | IoStatusUpdate::KeepAlive => {
-                                slf.insert_flags(Flags::IO_ERR);
+                                slf.flags.insert(Flags::IO_ERR);
                                 continue;
                             }
                             IoStatusUpdate::WriteBackpressure => {
                                 if ready!(slf.shared.io.poll_flush(cx, true)).is_err() {
-                                    slf.insert_flags(Flags::IO_ERR);
+                                    slf.flags.insert(Flags::IO_ERR);
                                 }
                                 continue;
                             }
                         }
                     } else {
-                        io.poll_dispatch(cx);
+                        slf.shared.io.poll_dispatch(cx);
                     }
                     return Poll::Pending;
                 }
                 // shutdown service
                 DispatcherState::Shutdown => {
-                    return if this.inner.shared.service.poll_shutdown(cx).is_ready() {
-                        log::trace!("service shutdown is completed, stop");
+                    return if slf.shared.service.poll_shutdown(cx).is_ready() {
+                        log::trace!(
+                            "{}: Service shutdown is completed, stop",
+                            slf.shared.io.tag()
+                        );
 
                         Poll::Ready(if let Some(err) = slf.error.take() {
                             Err(err)
@@ -339,25 +421,43 @@ where
     S: Service<DispatchItem<U>, Response = Option<Response<U>>> + 'static,
     U: Decoder + Encoder + 'static,
 {
-    fn poll_service(
-        &self,
-        srv: &Pipeline<S>,
-        cx: &mut Context<'_>,
-        io: &IoBoxed,
-    ) -> Poll<PollService<U>> {
-        match srv.poll_ready(cx) {
+    fn call_service(&mut self, cx: &mut Context<'_>, item: DispatchItem<U>) {
+        let mut fut = self.shared.service.call(item);
+        self.shared.inflight.set(self.shared.inflight.get() + 1);
+
+        // optimize first call
+        if self.response.is_none() {
+            if let Poll::Ready(result) = Pin::new(&mut fut).poll(cx) {
+                self.shared.handle_result(result, &self.shared.io, false);
+            } else {
+                self.response = Some(fut);
+            }
+        } else {
+            let shared = self.shared.clone();
+            let _ = spawn(async move {
+                let result = fut.await;
+                shared.handle_result(result, &shared.io, true);
+            });
+        }
+    }
+
+    fn poll_service(&mut self, cx: &mut Context<'_>) -> Poll<PollService<U>> {
+        match self.shared.service.poll_ready(cx) {
             Poll::Ready(Ok(_)) => {
                 // check for errors
                 Poll::Ready(if let Some(err) = self.shared.error.take() {
-                    log::trace!("error occured, stopping dispatcher");
-                    self.st.set(DispatcherState::Stop);
+                    log::trace!(
+                        "{}: Error occured, stopping dispatcher",
+                        self.shared.io.tag()
+                    );
+                    self.st = DispatcherState::Stop;
 
                     match err {
                         DispatcherError::Encoder(err) => {
                             PollService::Item(DispatchItem::EncoderError(err))
                         }
                         DispatcherError::Service(err) => {
-                            self.error.set(Some(err));
+                            self.error = Some(err);
                             PollService::Continue
                         }
                     }
@@ -367,55 +467,139 @@ where
             }
             // pause io read task
             Poll::Pending => {
-                log::trace!("service is not ready, register dispatch task");
-                match ready!(io.poll_read_pause(cx)) {
+                log::trace!(
+                    "{}: Service is not ready, register dispatch task",
+                    self.shared.io.tag()
+                );
+
+                // remove all timers
+                self.flags.remove(Flags::KA_TIMEOUT | Flags::READ_TIMEOUT);
+                self.shared.io.stop_timer();
+
+                match ready!(self.shared.io.poll_read_pause(cx)) {
                     IoStatusUpdate::KeepAlive => {
-                        log::trace!("keep-alive error, stopping dispatcher during pause");
-                        self.st.set(DispatcherState::Stop);
+                        log::trace!(
+                            "{}: Keep-alive error, stopping dispatcher during pause",
+                            self.shared.io.tag()
+                        );
+                        self.st = DispatcherState::Stop;
                         Poll::Ready(PollService::Item(DispatchItem::KeepAliveTimeout))
                     }
                     IoStatusUpdate::Stop => {
-                        log::trace!("dispatcher is instructed to stop during pause");
-                        self.st.set(DispatcherState::Stop);
+                        log::trace!(
+                            "{}: Dispatcher is instructed to stop during pause",
+                            self.shared.io.tag()
+                        );
+                        self.st = DispatcherState::Stop;
                         Poll::Ready(PollService::Continue)
                     }
                     IoStatusUpdate::PeerGone(err) => {
                         log::trace!(
-                            "peer is gone during pause, stopping dispatcher: {:?}",
+                            "{}: Peer is gone during pause, stopping dispatcher: {:?}",
+                            self.shared.io.tag(),
                             err
                         );
-                        self.st.set(DispatcherState::Stop);
+                        self.st = DispatcherState::Stop;
                         Poll::Ready(PollService::Item(DispatchItem::Disconnect(err)))
                     }
-                    IoStatusUpdate::WriteBackpressure => Poll::Pending,
+                    IoStatusUpdate::WriteBackpressure => {
+                        self.st = DispatcherState::Backpressure;
+                        Poll::Ready(PollService::Item(DispatchItem::WBackPressureEnabled))
+                    }
                 }
             }
             // handle service readiness error
             Poll::Ready(Err(err)) => {
-                log::trace!("service readiness check failed, stopping");
-                self.st.set(DispatcherState::Stop);
-                self.error.set(Some(err));
-                self.insert_flags(Flags::READY_ERR);
+                log::trace!(
+                    "{}: Service readiness check failed, stopping",
+                    self.shared.io.tag()
+                );
+                self.st = DispatcherState::Stop;
+                self.error = Some(err);
+                self.flags.insert(Flags::READY_ERR);
                 Poll::Ready(PollService::Continue)
             }
         }
     }
 
-    fn insert_flags(&self, f: Flags) {
-        let mut flags = self.flags.get();
-        flags.insert(f);
-        self.flags.set(flags)
+    fn update_timer(&mut self, decoded: &Decoded<<U as Decoder>::Item>) {
+        // got parsed frame
+        if decoded.item.is_some() {
+            self.read_remains = 0;
+            self.flags.remove(Flags::KA_TIMEOUT | Flags::READ_TIMEOUT);
+        } else if self.flags.contains(Flags::READ_TIMEOUT) {
+            // received new data but not enough for parsing complete frame
+            self.read_remains = decoded.remains as u32;
+        } else if self.read_remains == 0 && decoded.remains == 0 {
+            // no new data, start keep-alive timer
+            if self.flags.contains(Flags::KA_ENABLED)
+                && !self.flags.contains(Flags::KA_TIMEOUT)
+            {
+                log::debug!(
+                    "{}: Start keep-alive timer {:?}",
+                    self.shared.io.tag(),
+                    self.cfg.keepalive_timeout()
+                );
+                self.flags.insert(Flags::KA_TIMEOUT);
+                self.shared.io.start_timer(self.cfg.keepalive_timeout());
+            }
+        } else if let Some((timeout, max, _)) = self.cfg.frame_read_rate() {
+            // we got new data but not enough to parse single frame
+            // start read timer
+            self.flags.insert(Flags::READ_TIMEOUT);
+
+            self.read_remains = decoded.remains as u32;
+            self.read_remains_prev = 0;
+            self.read_max_timeout = max;
+            self.shared.io.start_timer(timeout);
+        }
     }
 
-    /// update keep-alive timer
-    fn update_keepalive(&self) {
-        self.shared.io.start_keepalive_timer(self.ka_timeout.get());
-    }
+    fn handle_timeout(&mut self) -> Result<(), DispatchItem<U>> {
+        // check read timer
+        if self.flags.contains(Flags::READ_TIMEOUT) {
+            if let Some((timeout, max, rate)) = self.cfg.frame_read_rate() {
+                let total = (self.read_remains - self.read_remains_prev)
+                    .try_into()
+                    .unwrap_or(u16::MAX);
 
-    /// unregister keep-alive timer
-    fn unregister_keepalive(&self) {
-        self.shared.io.stop_keepalive_timer();
-        self.ka_timeout.set(time::Duration::ZERO);
+                // read rate, start timer for next period
+                if total > rate {
+                    self.read_remains_prev = self.read_remains;
+                    self.read_remains = 0;
+
+                    if !max.is_zero() {
+                        self.read_max_timeout =
+                            Seconds(self.read_max_timeout.0.saturating_sub(timeout.0));
+                    }
+
+                    if max.is_zero() || !self.read_max_timeout.is_zero() {
+                        log::trace!(
+                            "{}: Frame read rate {:?}, extend timer",
+                            self.shared.io.tag(),
+                            total
+                        );
+                        self.shared.io.start_timer(timeout);
+                        return Ok(());
+                    }
+                    log::trace!(
+                        "{}: Max payload timeout has been reached",
+                        self.shared.io.tag()
+                    );
+                }
+                Err(DispatchItem::ReadTimeout)
+            } else {
+                Ok(())
+            }
+        } else if self.flags.contains(Flags::KA_TIMEOUT) {
+            log::trace!(
+                "{}: Keep-alive error, stopping dispatcher",
+                self.shared.io.tag()
+            );
+            Err(DispatchItem::KeepAliveTimeout)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -423,12 +607,12 @@ where
 mod tests {
     use rand::Rng;
     use std::sync::{atomic::AtomicBool, atomic::Ordering::Relaxed, Arc, Mutex};
-    use std::{cell::RefCell, time::Duration};
+    use std::{cell::RefCell, io};
 
-    use ntex_bytes::{Bytes, PoolId, PoolRef};
+    use ntex_bytes::{Bytes, BytesMut, PoolId, PoolRef};
     use ntex_codec::BytesCodec;
     use ntex_service::ServiceCtx;
-    use ntex_util::{future::Ready, time::sleep, time::Millis, time::Seconds};
+    use ntex_util::{time::sleep, time::Millis};
 
     use super::*;
     use crate::{io::Flags, testing::IoTest, Io, IoRef, IoStream};
@@ -454,41 +638,85 @@ mod tests {
         }
     }
 
+    #[derive(Copy, Clone)]
+    struct BCodec(usize);
+
+    impl Encoder for BCodec {
+        type Item = Bytes;
+        type Error = io::Error;
+
+        fn encode(&self, item: Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
+            dst.extend_from_slice(&item[..]);
+            Ok(())
+        }
+    }
+
+    impl Decoder for BCodec {
+        type Item = BytesMut;
+        type Error = io::Error;
+
+        fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+            if src.len() < self.0 {
+                Ok(None)
+            } else {
+                Ok(Some(src.split_to(self.0)))
+            }
+        }
+    }
+
     impl<S, U> Dispatcher<S, U>
     where
         S: Service<DispatchItem<U>, Response = Option<Response<U>>> + 'static,
         U: Decoder + Encoder + 'static,
     {
         /// Construct new `Dispatcher` instance
-        pub(crate) fn debug<T: IoStream, F: IntoService<S, DispatchItem<U>>>(
+        pub(crate) fn debug<T: IoStream>(io: T, codec: U, service: S) -> (Self, State) {
+            let cfg = DispatcherConfig::default()
+                .set_keepalive_timeout(Seconds(1))
+                .clone();
+            Self::debug_cfg(io, codec, service, cfg)
+        }
+
+        /// Construct new `Dispatcher` instance
+        pub(crate) fn debug_cfg<T: IoStream>(
             io: T,
             codec: U,
-            service: F,
+            service: S,
+            cfg: DispatcherConfig,
         ) -> (Self, State) {
             let state = Io::new(io);
-            let pool = state.memory_pool().pool();
-            let ka_timeout = Cell::new(Seconds(1).into());
+            state.set_disconnect_timeout(cfg.disconnect_timeout());
+            state.set_tag("DBG");
+
+            let flags = if cfg.keepalive_timeout().is_zero() {
+                super::Flags::empty()
+            } else {
+                super::Flags::KA_ENABLED
+            };
 
             let inner = State(state.get_ref());
-            state.start_keepalive_timer(Duration::from_millis(500));
+            state.start_timer(Seconds::ONE);
 
             let shared = Rc::new(DispatcherShared {
                 codec,
                 io: state.into(),
                 error: Cell::new(None),
                 inflight: Cell::new(0),
-                service: Pipeline::new(service.into_service()),
+                service: Pipeline::new(service).bind(),
             });
 
             (
                 Dispatcher {
                     inner: DispatcherInner {
-                        error: Cell::new(None),
-                        flags: Cell::new(super::Flags::empty()),
-                        st: Cell::new(DispatcherState::Processing),
-                        pool,
+                        error: None,
+                        st: DispatcherState::Processing,
+                        response: None,
+                        read_remains: 0,
+                        read_remains_prev: 0,
+                        read_max_timeout: Seconds::ZERO,
                         shared,
-                        ka_timeout,
+                        cfg,
+                        flags,
                     },
                 },
                 inner,
@@ -498,6 +726,7 @@ mod tests {
 
     #[ntex::test]
     async fn test_basic() {
+        let _ = env_logger::try_init();
         let (client, server) = IoTest::create();
         client.remote_buffer_cap(1024);
         client.write("GET /test HTTP/1\r\n\r\n");
@@ -528,6 +757,8 @@ mod tests {
 
         client.close().await;
         assert!(client.is_server_dropped());
+
+        assert!(format!("{:?}", super::Flags::KA_TIMEOUT.clone()).contains("KA_TIMEOUT"));
     }
 
     #[ntex::test]
@@ -548,7 +779,7 @@ mod tests {
             }),
         );
         spawn(async move {
-            let _ = disp.disconnect_timeout(Seconds(1)).await;
+            let _ = disp.await;
         });
 
         let buf = client.read().await.unwrap();
@@ -562,9 +793,8 @@ mod tests {
         assert_eq!(buf, Bytes::from_static(b"test"));
 
         st.close();
-        // TODO! fix
-        //sleep(Millis(50)).await;
-        //assert!(client.is_server_dropped());
+        sleep(Millis(1500)).await;
+        assert!(client.is_server_dropped());
     }
 
     #[ntex::test]
@@ -599,8 +829,8 @@ mod tests {
         // close read side
         client.close().await;
 
-        // TODO! fix
-        // assert!(client.is_server_dropped());
+        // dispatcher is closed
+        assert!(client.is_server_dropped());
     }
 
     #[ntex::test]
@@ -616,19 +846,18 @@ mod tests {
         impl Service<DispatchItem<BytesCodec>> for Srv {
             type Response = Option<Response<BytesCodec>>;
             type Error = ();
-            type Future<'f> = Ready<Option<Response<BytesCodec>>, ()>;
 
-            fn poll_ready(&self, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), ()> {
                 self.0.set(self.0.get() + 1);
-                Poll::Ready(Err(()))
+                Err(())
             }
 
-            fn call<'a>(
-                &'a self,
+            async fn call(
+                &self,
                 _: DispatchItem<BytesCodec>,
-                _: ServiceCtx<'a, Self>,
-            ) -> Self::Future<'a> {
-                Ready::Ok(None)
+                _: ServiceCtx<'_, Self>,
+            ) -> Result<Self::Response, Self::Error> {
+                Ok(None)
             }
         }
 
@@ -747,7 +976,7 @@ mod tests {
                 }),
             ),
         );
-        let disp = disp.keepalive_timeout(Seconds::ZERO);
+        disp.inner.cfg.set_keepalive_timeout(Seconds::ZERO);
         let pool = PoolId::P10.pool_ref();
         pool.set_read_params(1024, 512);
         state.set_memory_pool(pool);
@@ -782,7 +1011,12 @@ mod tests {
         let data = Arc::new(Mutex::new(RefCell::new(Vec::new())));
         let data2 = data.clone();
 
-        let (disp, state) = Dispatcher::debug(
+        let cfg = DispatcherConfig::default()
+            .set_disconnect_timeout(Seconds(1))
+            .set_keepalive_timeout(Seconds(1))
+            .clone();
+
+        let (disp, state) = Dispatcher::debug_cfg(
             server,
             BytesCodec,
             ntex_service::fn_service(move |msg: DispatchItem<BytesCodec>| {
@@ -801,22 +1035,182 @@ mod tests {
                     Ok(None)
                 }
             }),
+            cfg,
         );
         spawn(async move {
-            let _ = disp
-                .keepalive_timeout(Seconds::ZERO)
-                .keepalive_timeout(Seconds(1))
-                .await;
+            let _ = disp.await;
         });
-        state.0 .0.disconnect_timeout.set(Millis::ONE_SEC);
 
         let buf = client.read().await.unwrap();
         assert_eq!(buf, Bytes::from_static(b"GET /test HTTP/1\r\n\r\n"));
-        sleep(Millis(1500)).await;
+        sleep(Millis(2000)).await;
 
         // write side must be closed, dispatcher should fail with keep-alive
         let flags = state.flags();
         assert!(flags.contains(Flags::IO_STOPPING));
+        assert!(client.is_closed());
+        assert_eq!(&data.lock().unwrap().borrow()[..], &[0, 1]);
+    }
+
+    #[ntex::test]
+    async fn test_keepalive2() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let data = Arc::new(Mutex::new(RefCell::new(Vec::new())));
+        let data2 = data.clone();
+
+        let cfg = DispatcherConfig::default()
+            .set_keepalive_timeout(Seconds(1))
+            .set_frame_read_rate(Seconds(1), Seconds(2), 2)
+            .clone();
+
+        let (disp, state) = Dispatcher::debug_cfg(
+            server,
+            BCodec(8),
+            ntex_service::fn_service(move |msg: DispatchItem<BCodec>| {
+                let data = data2.clone();
+                async move {
+                    match msg {
+                        DispatchItem::Item(bytes) => {
+                            data.lock().unwrap().borrow_mut().push(0);
+                            return Ok::<_, ()>(Some(bytes.freeze()));
+                        }
+                        DispatchItem::KeepAliveTimeout => {
+                            data.lock().unwrap().borrow_mut().push(1);
+                        }
+                        _ => (),
+                    }
+                    Ok(None)
+                }
+            }),
+            cfg,
+        );
+        spawn(async move {
+            let _ = disp.await;
+        });
+
+        client.write("12345678");
+        let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"12345678"));
+        sleep(Millis(2000)).await;
+
+        // write side must be closed, dispatcher should fail with keep-alive
+        let flags = state.flags();
+        assert!(flags.contains(Flags::IO_STOPPING));
+        assert!(client.is_closed());
+        assert_eq!(&data.lock().unwrap().borrow()[..], &[0, 1]);
+    }
+
+    /// Update keep-alive timer after receiving frame
+    #[ntex::test]
+    async fn test_keepalive3() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let data = Arc::new(Mutex::new(RefCell::new(Vec::new())));
+        let data2 = data.clone();
+
+        let cfg = DispatcherConfig::default()
+            .set_keepalive_timeout(Seconds(2))
+            .set_frame_read_rate(Seconds(1), Seconds(2), 2)
+            .clone();
+
+        let (disp, _) = Dispatcher::debug_cfg(
+            server,
+            BCodec(1),
+            ntex_service::fn_service(move |msg: DispatchItem<BCodec>| {
+                let data = data2.clone();
+                async move {
+                    match msg {
+                        DispatchItem::Item(bytes) => {
+                            data.lock().unwrap().borrow_mut().push(0);
+                            return Ok::<_, ()>(Some(bytes.freeze()));
+                        }
+                        DispatchItem::KeepAliveTimeout => {
+                            data.lock().unwrap().borrow_mut().push(1);
+                        }
+                        _ => (),
+                    }
+                    Ok(None)
+                }
+            }),
+            cfg,
+        );
+        spawn(async move {
+            let _ = disp.await;
+        });
+
+        client.write("1");
+        let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"1"));
+        sleep(Millis(750)).await;
+
+        client.write("2");
+        let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"2"));
+
+        sleep(Millis(750)).await;
+        client.write("3");
+        let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"3"));
+
+        sleep(Millis(750)).await;
+        assert!(!client.is_closed());
+        assert_eq!(&data.lock().unwrap().borrow()[..], &[0, 0, 0]);
+    }
+
+    #[ntex::test]
+    async fn test_read_timeout() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+
+        let data = Arc::new(Mutex::new(RefCell::new(Vec::new())));
+        let data2 = data.clone();
+
+        let (disp, state) = Dispatcher::debug(
+            server,
+            BCodec(8),
+            ntex_service::fn_service(move |msg: DispatchItem<BCodec>| {
+                let data = data2.clone();
+                async move {
+                    match msg {
+                        DispatchItem::Item(bytes) => {
+                            data.lock().unwrap().borrow_mut().push(0);
+                            return Ok::<_, ()>(Some(bytes.freeze()));
+                        }
+                        DispatchItem::ReadTimeout => {
+                            data.lock().unwrap().borrow_mut().push(1);
+                        }
+                        _ => (),
+                    }
+                    Ok(None)
+                }
+            }),
+        );
+        spawn(async move {
+            disp.inner
+                .cfg
+                .set_keepalive_timeout(Seconds::ZERO)
+                .set_frame_read_rate(Seconds(1), Seconds(2), 2);
+            let _ = disp.await;
+        });
+
+        client.write("12345678");
+        let buf = client.read().await.unwrap();
+        assert_eq!(buf, Bytes::from_static(b"12345678"));
+
+        client.write("1");
+        sleep(Millis(1000)).await;
+        assert!(!state.flags().contains(Flags::IO_STOPPING));
+        client.write("23");
+        sleep(Millis(1000)).await;
+        assert!(!state.flags().contains(Flags::IO_STOPPING));
+        client.write("4");
+        sleep(Millis(2000)).await;
+
+        // write side must be closed, dispatcher should fail with keep-alive
+        assert!(state.flags().contains(Flags::IO_STOPPING));
         assert!(client.is_closed());
         assert_eq!(&data.lock().unwrap().borrow()[..], &[0, 1]);
     }

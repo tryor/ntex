@@ -1,20 +1,20 @@
-use std::{fmt, task::Context, task::Poll, time::Duration};
+use std::{fmt, time::Duration};
 
 use ntex_h2::{self as h2};
 
 use crate::connect::{Connect as TcpConnect, Connector as TcpConnector};
-use crate::service::{apply_fn, boxed, Service, ServiceCall, ServiceCtx};
+use crate::service::{apply_fn, boxed, Service, ServiceCtx};
 use crate::time::{Millis, Seconds};
-use crate::util::{timeout::TimeoutError, timeout::TimeoutService, Either, Ready};
+use crate::util::{join, timeout::TimeoutError, timeout::TimeoutService};
 use crate::{http::Uri, io::IoBoxed};
 
 use super::{connection::Connection, error::ConnectError, pool::ConnectionPool, Connect};
 
 #[cfg(feature = "openssl")]
-use crate::connect::openssl::SslConnector;
+use tls_openssl::ssl::SslConnector as OpensslConnector;
 
 #[cfg(feature = "rustls")]
-use crate::connect::rustls::ClientConfig;
+use tls_rustls::ClientConfig;
 
 type BoxedConnector = boxed::BoxService<TcpConnect<Uri>, IoBoxed, ConnectError>;
 
@@ -36,7 +36,7 @@ pub struct Connector {
     timeout: Millis,
     conn_lifetime: Duration,
     conn_keep_alive: Duration,
-    disconnect_timeout: Millis,
+    disconnect_timeout: Seconds,
     limit: usize,
     h2config: h2::Config,
     connector: BoxedConnector,
@@ -54,7 +54,6 @@ impl Connector {
         let conn = Connector {
             connector: boxed::service(
                 TcpConnector::new()
-                    .chain()
                     .map(IoBoxed::from)
                     .map_err(ConnectError::from),
             ),
@@ -62,19 +61,19 @@ impl Connector {
             timeout: Millis(1_000),
             conn_lifetime: Duration::from_secs(75),
             conn_keep_alive: Duration::from_secs(15),
-            disconnect_timeout: Millis(3_000),
+            disconnect_timeout: Seconds(3),
             limit: 100,
             h2config: h2::Config::client(),
         };
 
         #[cfg(feature = "openssl")]
         {
-            use crate::connect::openssl::SslMethod;
+            use tls_openssl::ssl::SslMethod;
 
-            let mut ssl = SslConnector::builder(SslMethod::tls()).unwrap();
+            let mut ssl = OpensslConnector::builder(SslMethod::tls()).unwrap();
             let _ = ssl
                 .set_alpn_protos(b"\x02h2\x08http/1.1")
-                .map_err(|e| error!("Cannot set ALPN protocol: {:?}", e));
+                .map_err(|e| log::error!("Cannot set ALPN protocol: {:?}", e));
 
             ssl.set_verify(tls_openssl::ssl::SslVerifyMode::NONE);
 
@@ -82,21 +81,12 @@ impl Connector {
         }
         #[cfg(all(not(feature = "openssl"), feature = "rustls"))]
         {
-            use tls_rustls::{OwnedTrustAnchor, RootCertStore};
+            use tls_rustls::RootCertStore;
 
             let protos = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            let mut cert_store = RootCertStore::empty();
-            cert_store.add_server_trust_anchors(
-                webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-                    OwnedTrustAnchor::from_subject_spki_name_constraints(
-                        ta.subject,
-                        ta.spki,
-                        ta.name_constraints,
-                    )
-                }),
-            );
+            let cert_store =
+                RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let mut config = ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(cert_store)
                 .with_no_client_auth();
             config.alpn_protocols = protos;
@@ -121,18 +111,18 @@ impl Connector {
 
     #[cfg(feature = "openssl")]
     /// Use openssl connector for secured connections.
-    pub fn openssl(self, connector: SslConnector) -> Self {
-        use crate::connect::openssl::Connector;
+    pub fn openssl(self, connector: OpensslConnector) -> Self {
+        use crate::connect::openssl::SslConnector;
 
-        self.secure_connector(Connector::new(connector))
+        self.secure_connector(SslConnector::new(connector))
     }
 
     #[cfg(feature = "rustls")]
     /// Use rustls connector for secured connections.
     pub fn rustls(self, connector: ClientConfig) -> Self {
-        use crate::connect::rustls::Connector;
+        use crate::connect::rustls::TlsConnector;
 
-        self.secure_connector(Connector::new(connector))
+        self.secure_connector(TlsConnector::new(connector))
     }
 
     /// Set total number of simultaneous connections per type of scheme.
@@ -173,7 +163,7 @@ impl Connector {
     /// To disable timeout set value to 0.
     ///
     /// By default disconnect timeout is set to 3 seconds.
-    pub fn disconnect_timeout<T: Into<Millis>>(mut self, timeout: T) -> Self {
+    pub fn disconnect_timeout<T: Into<Seconds>>(mut self, timeout: T) -> Self {
         self.disconnect_timeout = timeout.into();
         self
     }
@@ -194,12 +184,8 @@ impl Connector {
         T: Service<TcpConnect<Uri>, Error = crate::connect::ConnectError> + 'static,
         IoBoxed: From<T::Response>,
     {
-        self.connector = boxed::service(
-            connector
-                .chain()
-                .map(IoBoxed::from)
-                .map_err(ConnectError::from),
-        );
+        self.connector =
+            boxed::service(connector.map(IoBoxed::from).map_err(ConnectError::from));
         self
     }
 
@@ -210,10 +196,7 @@ impl Connector {
         IoBoxed: From<T::Response>,
     {
         self.ssl_connector = Some(boxed::service(
-            connector
-                .chain()
-                .map(IoBoxed::from)
-                .map_err(ConnectError::from),
+            connector.map(IoBoxed::from).map_err(ConnectError::from),
         ));
         self
     }
@@ -258,16 +241,13 @@ impl Connector {
 fn connector(
     connector: BoxedConnector,
     timeout: Millis,
-    disconnect_timeout: Millis,
+    disconnect_timeout: Seconds,
 ) -> impl Service<Connect, Response = IoBoxed, Error = ConnectError> + fmt::Debug {
     TimeoutService::new(
         timeout,
-        apply_fn(connector, |msg: Connect, srv| {
-            Box::pin(
-                async move { srv.call(TcpConnect::new(msg.uri).set_addr(msg.addr)).await },
-            )
+        apply_fn(connector, |msg: Connect, svc| async move {
+            svc.call(TcpConnect::new(msg.uri).set_addr(msg.addr)).await
         })
-        .chain()
         .map(move |io: IoBoxed| {
             io.set_disconnect_timeout(disconnect_timeout);
             io
@@ -292,51 +272,38 @@ where
 {
     type Response = <ConnectionPool<T> as Service<Connect>>::Response;
     type Error = ConnectError;
-    type Future<'f> = Either<
-        ServiceCall<'f, ConnectionPool<T>, Connect>,
-        Ready<Self::Response, Self::Error>,
-    >;
 
-    #[inline]
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let ready = self.tcp_pool.poll_ready(cx)?.is_ready();
-        let ready = if let Some(ref ssl_pool) = self.ssl_pool {
-            ssl_pool.poll_ready(cx)?.is_ready() && ready
+    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        if let Some(ref ssl_pool) = self.ssl_pool {
+            let (r1, r2) = join(ctx.ready(&self.tcp_pool), ctx.ready(ssl_pool)).await;
+            r1?;
+            r2
         } else {
-            ready
-        };
-        if ready {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
+            ctx.ready(&self.tcp_pool).await
         }
     }
 
-    #[inline]
-    fn poll_shutdown(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let tcp_ready = self.tcp_pool.poll_shutdown(cx).is_ready();
-        let ssl_ready = self
-            .ssl_pool
-            .as_ref()
-            .map(|pool| pool.poll_shutdown(cx).is_ready())
-            .unwrap_or(true);
-        if tcp_ready && ssl_ready {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+    async fn shutdown(&self) {
+        self.tcp_pool.shutdown().await;
+        if let Some(ref ssl_pool) = self.ssl_pool {
+            ssl_pool.shutdown().await;
         }
     }
 
-    fn call<'a>(&'a self, req: Connect, ctx: ServiceCtx<'a, Self>) -> Self::Future<'_> {
+    async fn call(
+        &self,
+        req: Connect,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
         match req.uri.scheme_str() {
             Some("https") | Some("wss") => {
                 if let Some(ref conn) = self.ssl_pool {
-                    Either::Left(ctx.call(conn, req))
+                    ctx.call(conn, req).await
                 } else {
-                    Either::Right(Ready::Err(ConnectError::SslIsNotSupported))
+                    Err(ConnectError::SslIsNotSupported)
                 }
             }
-            _ => Either::Left(ctx.call(&self.tcp_pool, req)),
+            _ => ctx.call(&self.tcp_pool, req).await,
         }
     }
 }
@@ -344,11 +311,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::lazy;
+    use crate::{service::Pipeline, util::lazy};
 
     #[crate::rt_test]
     async fn test_readiness() {
-        let conn = Connector::default().finish();
+        let conn = Pipeline::new(Connector::default().finish()).bind();
         assert!(lazy(|cx| conn.poll_ready(cx).is_ready()).await);
         assert!(lazy(|cx| conn.poll_shutdown(cx).is_ready()).await);
     }

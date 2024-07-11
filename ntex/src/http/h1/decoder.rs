@@ -4,7 +4,7 @@ use ntex_http::header::{HeaderName, HeaderValue};
 use ntex_http::{header, Method, StatusCode, Uri, Version};
 
 use crate::codec::Decoder;
-use crate::http::error::ParseError;
+use crate::http::error::DecodeError;
 use crate::http::header::HeaderMap;
 use crate::http::message::{ConnectionType, ResponseHead};
 use crate::http::request::Request;
@@ -40,7 +40,7 @@ impl<T: MessageType> Clone for MessageDecoder<T> {
 
 impl<T: MessageType> Decoder for MessageDecoder<T> {
     type Item = (T, PayloadType);
-    type Error = ParseError;
+    type Error = DecodeError;
 
     fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         T::decode(src)
@@ -78,14 +78,14 @@ pub(super) trait MessageType: Sized {
 
     fn headers_mut(&mut self) -> &mut HeaderMap;
 
-    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, ParseError>;
+    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, DecodeError>;
 
     fn set_headers(
         &mut self,
         slice: &Bytes,
         version: Version,
         raw_headers: &[HeaderIndex],
-    ) -> Result<PayloadLength, ParseError> {
+    ) -> Result<PayloadLength, DecodeError> {
         let mut ka = None;
         let mut has_upgrade = false;
         let mut expect = false;
@@ -108,12 +108,12 @@ pub(super) trait MessageType: Sized {
                 match name {
                     header::CONTENT_LENGTH if content_length.is_some() || chunked => {
                         log::debug!("multiple Content-Length not allowed");
-                        return Err(ParseError::Header);
+                        return Err(DecodeError::Header);
                     }
                     header::CONTENT_LENGTH => match value.to_str() {
                         Ok(s) if s.trim_start().starts_with('+') => {
                             log::debug!("illegal Content-Length: {:?}", s);
-                            return Err(ParseError::Header);
+                            return Err(DecodeError::Header);
                         }
                         Ok(s) => {
                             if let Ok(len) = s.parse::<u64>() {
@@ -122,18 +122,18 @@ pub(super) trait MessageType: Sized {
                                 content_length = Some(len);
                             } else {
                                 log::debug!("illegal Content-Length: {:?}", s);
-                                return Err(ParseError::Header);
+                                return Err(DecodeError::Header);
                             }
                         }
                         Err(_) => {
                             log::debug!("illegal Content-Length: {:?}", value);
-                            return Err(ParseError::Header);
+                            return Err(DecodeError::Header);
                         }
                     },
                     // transfer-encoding
                     header::TRANSFER_ENCODING if seen_te => {
                         log::debug!("Transfer-Encoding header usage is not allowed");
-                        return Err(ParseError::Header);
+                        return Err(DecodeError::Header);
                     }
                     header::TRANSFER_ENCODING if version == Version::HTTP_11 => {
                         seen_te = true;
@@ -145,24 +145,16 @@ pub(super) trait MessageType: Sized {
                                 // allow silently since multiple TE headers are already checked
                             } else {
                                 log::debug!("illegal Transfer-Encoding: {:?}", s);
-                                return Err(ParseError::Header);
+                                return Err(DecodeError::Header);
                             }
                         } else {
-                            return Err(ParseError::Header);
+                            return Err(DecodeError::Header);
                         }
                     }
                     // connection keep-alive state
                     header::CONNECTION => {
-                        ka = if let Ok(conn) = value.to_str().map(|conn| conn.trim()) {
-                            if conn.eq_ignore_ascii_case("keep-alive") {
-                                Some(ConnectionType::KeepAlive)
-                            } else if conn.eq_ignore_ascii_case("close") {
-                                Some(ConnectionType::Close)
-                            } else if conn.eq_ignore_ascii_case("upgrade") {
-                                Some(ConnectionType::Upgrade)
-                            } else {
-                                None
-                            }
+                        ka = if let Ok(val) = value.to_str() {
+                            connection_type(val)
                         } else {
                             None
                         };
@@ -228,7 +220,7 @@ impl MessageType for Request {
         &mut self.head_mut().headers
     }
 
-    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, ParseError> {
+    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, DecodeError> {
         let mut headers: [mem::MaybeUninit<HeaderIndex>; MAX_HEADERS] = uninit_array();
 
         let (len, method, uri, ver, headers) = {
@@ -240,7 +232,7 @@ impl MessageType for Request {
             match req.parse_with_uninit_headers(src, &mut parsed)? {
                 httparse::Status::Complete(len) => {
                     let method = Method::from_bytes(req.method.unwrap().as_bytes())
-                        .map_err(|_| ParseError::Method)?;
+                        .map_err(|_| DecodeError::Method)?;
                     let uri = Uri::try_from(req.path.unwrap())?;
                     let version = if req.version.unwrap() == 1 {
                         Version::HTTP_11
@@ -258,8 +250,8 @@ impl MessageType for Request {
                 }
                 httparse::Status::Partial => {
                     if src.len() >= MAX_BUFFER_SIZE {
-                        trace!("MAX_BUFFER_SIZE unprocessed data reached, closing");
-                        return Err(ParseError::TooLarge);
+                        log::trace!("MAX_BUFFER_SIZE unprocessed data reached, closing");
+                        return Err(DecodeError::TooLarge(src.len()));
                     }
                     return Ok(None);
                 }
@@ -274,8 +266,8 @@ impl MessageType for Request {
         // disallow HTTP/1.0 POST requests that do not contain a Content-Length headers
         // see https://datatracker.ietf.org/doc/html/rfc1945#section-7.2.2
         if ver == Version::HTTP_10 && method == Method::POST && length.is_none() {
-            debug!("no Content-Length specified for HTTP/1.0 POST request");
-            return Err(ParseError::Header);
+            log::debug!("no Content-Length specified for HTTP/1.0 POST request");
+            return Err(DecodeError::Header);
         }
 
         // Remove CL value if 0 now that all headers and HTTP/1.0 special cases are processed.
@@ -325,7 +317,7 @@ impl MessageType for ResponseHead {
         &mut self.headers
     }
 
-    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, ParseError> {
+    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, DecodeError> {
         let mut headers: [mem::MaybeUninit<HeaderIndex>; MAX_HEADERS] = uninit_array();
 
         let (len, ver, status, headers) = {
@@ -345,7 +337,7 @@ impl MessageType for ResponseHead {
                         Version::HTTP_10
                     };
                     let status = StatusCode::from_u16(res.code.unwrap())
-                        .map_err(|_| ParseError::Status)?;
+                        .map_err(|_| DecodeError::Status)?;
 
                     (
                         len,
@@ -357,7 +349,7 @@ impl MessageType for ResponseHead {
                 httparse::Status::Partial => {
                     return if src.len() >= MAX_BUFFER_SIZE {
                         log::error!("MAX_BUFFER_SIZE unprocessed data reached, closing");
-                        Err(ParseError::TooLarge)
+                        Err(DecodeError::TooLarge(src.len()))
                     } else {
                         Ok(None)
                     };
@@ -396,6 +388,59 @@ impl MessageType for ResponseHead {
 
         Ok(Some((msg, decoder)))
     }
+}
+
+const S_KEEP_ALIVE: &str = "keep-alive";
+const S_CLOSE: &str = "close";
+const S_UPGRADE: &str = "upgrade";
+
+fn connection_type(val: &str) -> Option<ConnectionType> {
+    let l = val.len();
+    let bytes = val.as_bytes();
+    for i in 0..bytes.len() {
+        if i >= S_CLOSE.len() {
+            return None;
+        }
+        let result = match bytes[i] {
+            b'k' | b'K' => {
+                let pos = i + S_KEEP_ALIVE.len();
+                if l >= pos && val[i..pos].eq_ignore_ascii_case(S_KEEP_ALIVE) {
+                    Some((ConnectionType::KeepAlive, pos))
+                } else {
+                    None
+                }
+            }
+            b'c' | b'C' => {
+                let pos = i + S_CLOSE.len();
+                if l >= pos && val[i..pos].eq_ignore_ascii_case(S_CLOSE) {
+                    Some((ConnectionType::Close, pos))
+                } else {
+                    None
+                }
+            }
+            b'u' | b'U' => {
+                let pos = i + S_UPGRADE.len();
+                if l >= pos && val[i..pos].eq_ignore_ascii_case(S_UPGRADE) {
+                    Some((ConnectionType::Upgrade, pos))
+                } else {
+                    None
+                }
+            }
+            _ => continue,
+        };
+
+        if let Some((t, pos)) = result {
+            let next = pos + 1;
+            if val.len() > next {
+                if matches!(bytes[next], b' ' | b',' | b'\r' | b'\n') {
+                    return Some(t);
+                }
+            } else {
+                return Some(t);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -514,7 +559,7 @@ enum ChunkedState {
 
 impl Decoder for PayloadDecoder {
     type Item = PayloadItem;
-    type Error = ParseError;
+    type Error = DecodeError;
 
     fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let mut kind = self.kind.get();
@@ -595,7 +640,7 @@ impl ChunkedState {
         body: &mut BytesMut,
         size: &mut u64,
         buf: &mut Option<Bytes>,
-    ) -> Poll<Result<ChunkedState, ParseError>> {
+    ) -> Poll<Result<ChunkedState, DecodeError>> {
         use self::ChunkedState::*;
         match *self {
             Size => ChunkedState::read_size(body, size),
@@ -614,7 +659,7 @@ impl ChunkedState {
     fn read_size(
         rdr: &mut BytesMut,
         size: &mut u64,
-    ) -> Poll<Result<ChunkedState, ParseError>> {
+    ) -> Poll<Result<ChunkedState, DecodeError>> {
         let rem = match byte!(rdr) {
             b @ b'0'..=b'9' => b - b'0',
             b @ b'a'..=b'f' => b + 10 - b'a',
@@ -623,7 +668,7 @@ impl ChunkedState {
             b';' => return Poll::Ready(Ok(ChunkedState::Extension)),
             b'\r' => return Poll::Ready(Ok(ChunkedState::SizeLf)),
             _ => {
-                return Poll::Ready(Err(ParseError::InvalidInput(
+                return Poll::Ready(Err(DecodeError::InvalidInput(
                     "Invalid chunk size line: Invalid Size",
                 )));
             }
@@ -638,43 +683,43 @@ impl ChunkedState {
             }
             None => {
                 log::debug!("chunk size would overflow u64");
-                Poll::Ready(Err(ParseError::InvalidInput(
+                Poll::Ready(Err(DecodeError::InvalidInput(
                     "Invalid chunk size line: Size is too big",
                 )))
             }
         }
     }
 
-    fn read_size_lws(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, ParseError>> {
+    fn read_size_lws(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, DecodeError>> {
         log::trace!("read_size_lws");
         match byte!(rdr) {
             // LWS can follow the chunk size, but no more digits can come
             b'\t' | b' ' => Poll::Ready(Ok(ChunkedState::SizeLws)),
             b';' => Poll::Ready(Ok(ChunkedState::Extension)),
             b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
-            _ => Poll::Ready(Err(ParseError::InvalidInput(
+            _ => Poll::Ready(Err(DecodeError::InvalidInput(
                 "Invalid chunk size linear white space",
             ))),
         }
     }
-    fn read_extension(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, ParseError>> {
+    fn read_extension(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, DecodeError>> {
         match byte!(rdr) {
             b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
             // strictly 0x20 (space) should be disallowed but we don't parse quoted strings here
-            0x00..=0x08 | 0x0a..=0x1f | 0x7f => Poll::Ready(Err(ParseError::InvalidInput(
-                "Invalid character in chunk extension",
-            ))),
+            0x00..=0x08 | 0x0a..=0x1f | 0x7f => Poll::Ready(Err(
+                DecodeError::InvalidInput("Invalid character in chunk extension"),
+            )),
             _ => Poll::Ready(Ok(ChunkedState::Extension)), // no supported extensions
         }
     }
     fn read_size_lf(
         rdr: &mut BytesMut,
         size: &mut u64,
-    ) -> Poll<Result<ChunkedState, ParseError>> {
+    ) -> Poll<Result<ChunkedState, DecodeError>> {
         match byte!(rdr) {
             b'\n' if *size > 0 => Poll::Ready(Ok(ChunkedState::Body)),
             b'\n' if *size == 0 => Poll::Ready(Ok(ChunkedState::EndCr)),
-            _ => Poll::Ready(Err(ParseError::InvalidInput("Invalid chunk size LF"))),
+            _ => Poll::Ready(Err(DecodeError::InvalidInput("Invalid chunk size LF"))),
         }
     }
 
@@ -682,7 +727,7 @@ impl ChunkedState {
         rdr: &mut BytesMut,
         rem: &mut u64,
         buf: &mut Option<Bytes>,
-    ) -> Poll<Result<ChunkedState, ParseError>> {
+    ) -> Poll<Result<ChunkedState, DecodeError>> {
         log::trace!("Chunked read, remaining={:?}", rem);
 
         let len = rdr.len() as u64;
@@ -706,28 +751,28 @@ impl ChunkedState {
         }
     }
 
-    fn read_body_cr(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, ParseError>> {
+    fn read_body_cr(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, DecodeError>> {
         match byte!(rdr) {
             b'\r' => Poll::Ready(Ok(ChunkedState::BodyLf)),
-            _ => Poll::Ready(Err(ParseError::InvalidInput("Invalid chunk body CR"))),
+            _ => Poll::Ready(Err(DecodeError::InvalidInput("Invalid chunk body CR"))),
         }
     }
-    fn read_body_lf(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, ParseError>> {
+    fn read_body_lf(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, DecodeError>> {
         match byte!(rdr) {
             b'\n' => Poll::Ready(Ok(ChunkedState::Size)),
-            _ => Poll::Ready(Err(ParseError::InvalidInput("Invalid chunk body LF"))),
+            _ => Poll::Ready(Err(DecodeError::InvalidInput("Invalid chunk body LF"))),
         }
     }
-    fn read_end_cr(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, ParseError>> {
+    fn read_end_cr(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, DecodeError>> {
         match byte!(rdr) {
             b'\r' => Poll::Ready(Ok(ChunkedState::EndLf)),
-            _ => Poll::Ready(Err(ParseError::InvalidInput("Invalid chunk end CR"))),
+            _ => Poll::Ready(Err(DecodeError::InvalidInput("Invalid chunk end CR"))),
         }
     }
-    fn read_end_lf(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, ParseError>> {
+    fn read_end_lf(rdr: &mut BytesMut) -> Poll<Result<ChunkedState, DecodeError>> {
         match byte!(rdr) {
             b'\n' => Poll::Ready(Ok(ChunkedState::End)),
-            _ => Poll::Ready(Err(ParseError::InvalidInput("Invalid chunk end LF"))),
+            _ => Poll::Ready(Err(DecodeError::InvalidInput("Invalid chunk end LF"))),
         }
     }
 }
@@ -740,9 +785,8 @@ fn uninit_array<T, const LEN: usize>() -> [mem::MaybeUninit<T>; LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::header::{HeaderName, SET_COOKIE};
-    use crate::http::{HttpMessage, Method, Version};
-    use crate::util::{Bytes, BytesMut};
+    use crate::http::header::SET_COOKIE;
+    use crate::http::HttpMessage;
 
     impl PayloadType {
         fn unwrap(self) -> PayloadDecoder {
@@ -800,6 +844,22 @@ mod tests {
                 assert_eq!(req.path(), "/test");
             }
             Ok(_) | Err(_) => unreachable!("Error during parsing http request"),
+        }
+    }
+
+    #[test]
+    fn test_connection_type() {
+        for s in &["Close", "Close\r\n", "close,", "close "] {
+            assert_eq!(connection_type(s), Some(ConnectionType::Close));
+        }
+        for s in &["upgrade", "upGrade\r\n", "upgrade,", "upgrade "] {
+            assert_eq!(connection_type(s), Some(ConnectionType::Upgrade));
+        }
+        for s in &["keep-alive", "keep-Alive\r\n", "keep-alive,", "Keep-alive "] {
+            assert_eq!(connection_type(s), Some(ConnectionType::KeepAlive));
+        }
+        for s in &["keep-aliv", "clos\r\n", "clos", "upgrad"] {
+            assert_eq!(connection_type(s), None);
         }
     }
 

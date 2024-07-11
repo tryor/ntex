@@ -10,8 +10,7 @@ use crate::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use crate::http::{HttpMessage, Payload, Response, StatusCode};
 use crate::util::{stream_recv, BoxFuture, BytesMut};
 use crate::web::error::{ErrorRenderer, UrlencodedError, WebResponseError};
-use crate::web::responder::{Ready, Responder};
-use crate::web::{FromRequest, HttpRequest};
+use crate::web::{FromRequest, HttpRequest, Responder};
 
 /// Form data helper (`application/x-www-form-urlencoded`)
 ///
@@ -101,22 +100,20 @@ where
     Err: ErrorRenderer,
 {
     type Error = UrlencodedError;
-    type Future = BoxFuture<'static, Result<Self, Self::Error>>;
 
-    #[inline]
-    fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
+    async fn from_request(
+        req: &HttpRequest,
+        payload: &mut Payload,
+    ) -> Result<Self, Self::Error> {
         let limit = req
             .app_state::<FormConfig>()
             .map(|c| c.limit)
             .unwrap_or(16384);
 
-        let fut = UrlEncoded::new(req, payload).limit(limit);
-        Box::pin(async move {
-            match fut.await {
-                Err(e) => Err(e),
-                Ok(item) => Ok(Form(item)),
-            }
-        })
+        match UrlEncoded::new(req, payload).limit(limit).await {
+            Err(e) => Err(e),
+            Ok(item) => Ok(Form(item)),
+        }
     }
 }
 
@@ -136,18 +133,15 @@ impl<T: Serialize, Err: ErrorRenderer> Responder<Err> for Form<T>
 where
     Err::Container: From<serde_urlencoded::ser::Error>,
 {
-    type Future = Ready<Response>;
-
-    fn respond_to(self, req: &HttpRequest) -> Self::Future {
+    async fn respond_to(self, req: &HttpRequest) -> Response {
         let body = match serde_urlencoded::to_string(&self.0) {
             Ok(body) => body,
-            Err(e) => return e.error_response(req).into(),
+            Err(e) => return e.error_response(req),
         };
 
         Response::build(StatusCode::OK)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body)
-            .into()
     }
 }
 
@@ -339,7 +333,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::http::header::{HeaderValue, CONTENT_TYPE};
+    use crate::http::header::HeaderValue;
     use crate::util::Bytes;
     use crate::web::test::{from_request, respond_to, TestRequest};
 

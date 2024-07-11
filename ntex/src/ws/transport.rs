@@ -2,12 +2,14 @@
 use std::{cell::Cell, cmp, io, task::Poll};
 
 use crate::codec::{Decoder, Encoder};
-use crate::io::{Filter, FilterFactory, FilterLayer, Io, Layer, ReadBuf, WriteBuf};
-use crate::util::{BufMut, PoolRef, Ready};
+use crate::io::{Filter, FilterLayer, Io, Layer, ReadBuf, WriteBuf};
+use crate::service::{Service, ServiceCtx};
+use crate::util::{BufMut, PoolRef};
 
 use super::{CloseCode, CloseReason, Codec, Frame, Item, Message};
 
 bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct Flags: u8  {
         const CLOSED       = 0b0001;
         const CONTINUATION = 0b0010;
@@ -173,25 +175,27 @@ impl FilterLayer for WsTransport {
 }
 
 #[derive(Clone, Debug)]
-/// WebSockets transport factory
-pub struct WsTransportFactory {
+/// WebSockets transport service
+pub struct WsTransportService {
     codec: Codec,
 }
 
-impl WsTransportFactory {
-    /// Create websockets transport factory
+impl WsTransportService {
+    /// Create websockets transport service
     pub fn new(codec: Codec) -> Self {
         Self { codec }
     }
 }
 
-impl<F: Filter> FilterFactory<F> for WsTransportFactory {
-    type Filter = WsTransport;
-
+impl<F: Filter> Service<Io<F>> for WsTransportService {
+    type Response = Io<Layer<WsTransport, F>>;
     type Error = io::Error;
-    type Future = Ready<Io<Layer<Self::Filter, F>>, Self::Error>;
 
-    fn create(self, io: Io<F>) -> Self::Future {
-        Ready::Ok(WsTransport::create(io, self.codec))
+    async fn call(
+        &self,
+        io: Io<F>,
+        _: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        Ok(WsTransport::create(io, self.codec.clone()))
     }
 }

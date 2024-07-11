@@ -100,7 +100,7 @@ impl ResourceDef {
         let mut elements = Vec::new();
 
         for path in set {
-            p = path.clone();
+            p.clone_from(&path);
             let (pelems, elems) = ResourceDef::parse(&path);
             tp.push(pelems);
             elements = elems;
@@ -158,7 +158,7 @@ impl ResourceDef {
         let mut elements = Vec::new();
 
         for path in patterns {
-            p = path.clone();
+            p.clone_from(&path);
             let (pelems, elems) = ResourceDef::parse(&path);
             tp.push(pelems);
             elements = elems;
@@ -754,6 +754,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
     fn test_static_tail() {
         let re = ResourceDef::new("/*".to_string());
         let tree = Tree::new(&re, 1);

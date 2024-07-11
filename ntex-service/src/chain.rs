@@ -3,16 +3,15 @@ use std::{fmt, future::Future, marker::PhantomData};
 
 use crate::and_then::{AndThen, AndThenFactory};
 use crate::apply::{Apply, ApplyFactory};
-use crate::ctx::{ServiceCall, ServiceCtx};
+use crate::ctx::ServiceCtx;
 use crate::map::{Map, MapFactory};
 use crate::map_err::{MapErr, MapErrFactory};
 use crate::map_init_err::MapInitErr;
 use crate::middleware::{ApplyMiddleware, Middleware};
-use crate::pipeline::CreatePipeline;
 use crate::then::{Then, ThenFactory};
 use crate::{IntoService, IntoServiceFactory, Pipeline, Service, ServiceFactory};
 
-/// Constructs new pipeline with one service in pipeline chain.
+/// Constructs new chain with one service.
 pub fn chain<Svc, Req, F>(service: F) -> ServiceChain<Svc, Req>
 where
     Svc: Service<Req>,
@@ -24,7 +23,7 @@ where
     }
 }
 
-/// Constructs new pipeline factory with one service factory.
+/// Constructs new chain factory with one service factory.
 pub fn chain_factory<T, R, C, F>(factory: F) -> ServiceChainFactory<T, R, C>
 where
     T: ServiceFactory<R, C>,
@@ -36,7 +35,7 @@ where
     }
 }
 
-/// Pipeline builder - pipeline allows to compose multiple service into one service.
+/// Chain builder - chain allows to compose multiple service into one service.
 pub struct ServiceChain<Svc, Req> {
     service: Svc,
     _t: PhantomData<Req>,
@@ -130,7 +129,8 @@ impl<Svc: Service<Req>, Req> ServiceChain<Svc, Req> {
     where
         F: Fn(In, Pipeline<Svc>) -> R,
         R: Future<Output = Result<Out, Err>>,
-        Svc: Service<Req, Error = Err>,
+        Svc: Service<Req>,
+        Err: From<Svc::Error>,
     {
         ServiceChain {
             service: Apply::new(self.service, f),
@@ -139,7 +139,7 @@ impl<Svc: Service<Req>, Req> ServiceChain<Svc, Req> {
     }
 
     /// Create service pipeline
-    pub fn pipeline(self) -> Pipeline<Svc> {
+    pub fn into_pipeline(self) -> Pipeline<Svc> {
         Pipeline::new(self.service)
     }
 }
@@ -170,14 +170,17 @@ where
 impl<Svc: Service<Req>, Req> Service<Req> for ServiceChain<Svc, Req> {
     type Response = Svc::Response;
     type Error = Svc::Error;
-    type Future<'f> = ServiceCall<'f, Svc, Req> where Self: 'f, Req: 'f;
 
-    crate::forward_poll_ready!(service);
-    crate::forward_poll_shutdown!(service);
+    crate::forward_ready!(service);
+    crate::forward_shutdown!(service);
 
     #[inline]
-    fn call<'a>(&'a self, req: Req, ctx: ServiceCtx<'a, Self>) -> Self::Future<'a> {
-        ctx.call(&self.service, req)
+    async fn call(
+        &self,
+        req: Req,
+        ctx: ServiceCtx<'_, Self>,
+    ) -> Result<Self::Response, Self::Error> {
+        ctx.call(&self.service, req).await
     }
 }
 
@@ -227,7 +230,8 @@ impl<T: ServiceFactory<Req, C>, Req, C> ServiceChainFactory<T, Req, C> {
     where
         F: Fn(In, Pipeline<T::Service>) -> R + Clone,
         R: Future<Output = Result<Out, Err>>,
-        T: ServiceFactory<Req, C, Error = Err>,
+        T: ServiceFactory<Req, C>,
+        Err: From<T::Error>,
     {
         ServiceChainFactory {
             factory: ApplyFactory::new(self.factory, f),
@@ -235,11 +239,11 @@ impl<T: ServiceFactory<Req, C>, Req, C> ServiceChainFactory<T, Req, C> {
         }
     }
 
-    /// Create `NewService` to chain on a computation for when a call to the
+    /// Create chain factory to chain on a computation for when a call to the
     /// service finished, passing the result of the call to the next
     /// service `U`.
     ///
-    /// Note that this function consumes the receiving pipeline and returns a
+    /// Note that this function consumes the receiving factory and returns a
     /// wrapped version of it.
     pub fn then<F, U>(self, factory: F) -> ServiceChainFactory<ThenFactory<T, U>, Req, C>
     where
@@ -275,7 +279,7 @@ impl<T: ServiceFactory<Req, C>, Req, C> ServiceChainFactory<T, Req, C> {
         }
     }
 
-    /// Map this service's error to a different error, returning a new service.
+    /// Map this service's error to a different error.
     pub fn map_err<F, E>(
         self,
         f: F,
@@ -290,7 +294,7 @@ impl<T: ServiceFactory<Req, C>, Req, C> ServiceChainFactory<T, Req, C> {
         }
     }
 
-    /// Map this factory's init error to a different error, returning a new service.
+    /// Map this factory's init error to a different error, returning a new factory.
     pub fn map_init_err<F, E>(
         self,
         f: F,
@@ -306,11 +310,11 @@ impl<T: ServiceFactory<Req, C>, Req, C> ServiceChainFactory<T, Req, C> {
     }
 
     /// Create and return a new service value asynchronously and wrap into a container
-    pub fn pipeline(&self, cfg: C) -> CreatePipeline<'_, T, Req, C>
+    pub async fn pipeline(&self, cfg: C) -> Result<Pipeline<T::Service>, T::InitError>
     where
         Self: Sized,
     {
-        CreatePipeline::new(self.factory.create(cfg))
+        Ok(Pipeline::new(self.factory.create(cfg).await?))
     }
 }
 
@@ -342,10 +346,9 @@ impl<T: ServiceFactory<R, C>, R, C> ServiceFactory<R, C> for ServiceChainFactory
     type Error = T::Error;
     type Service = T::Service;
     type InitError = T::InitError;
-    type Future<'f> = T::Future<'f> where Self: 'f;
 
     #[inline]
-    fn create(&self, cfg: C) -> Self::Future<'_> {
-        self.factory.create(cfg)
+    async fn create(&self, cfg: C) -> Result<Self::Service, Self::InitError> {
+        self.factory.create(cfg).await
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ntex-async-std"
-version = "0.3.0"
+version = "0.5.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "async-std intergration for ntex framework"
 keywords = ["network", "framework", "async", "futures"]
@@ -8,7 +8,7 @@ homepage = "https://ntex.rs"
 repository = "https://github.com/ntex-rs/ntex.git"
 documentation = "https://docs.rs/ntex-rt-async-std/"
 categories = ["network-programming", "asynchronous"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 [lib]
@@ -16,10 +16,9 @@ name = "ntex_async_std"
 path = "src/lib.rs"
 
 [dependencies]
-ntex-bytes = "0.1.19"
-ntex-io = "0.3.0"
-ntex-util = "0.3.0"
-async-oneshot = "0.5.0"
+ntex-bytes = "0.1"
+ntex-io = "2.0"
+ntex-util = "2.0"
 log = "0.4"
-pin-project-lite = "0.2"
 async-std = { version = "1", features = ["unstable"] }
+oneshot = { version = "0.1", default-features = false, features = ["async"] }

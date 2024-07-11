@@ -1,14 +1,17 @@
 #![allow(clippy::type_complexity)]
-use std::sync::atomic::Ordering::{Relaxed, Release};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::task::{Context, Poll, Waker};
-use std::{cell::Cell, cell::RefCell, fmt, future::Future, mem, pin::Pin, ptr, rc::Rc};
+#[cfg(feature = "mpool")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::task::{Context, Poll};
+use std::{cell::Cell, cell::RefCell, fmt, future::Future, pin::Pin, ptr, rc::Rc};
 
+#[cfg(feature = "mpool")]
 use futures_core::task::__internal::AtomicWaker;
 
 use crate::{BufMut, BytesMut, BytesVec};
 
 pub struct Pool {
+    #[cfg(feature = "mpool")]
     idx: Cell<usize>,
     inner: &'static MemoryPool,
 }
@@ -19,13 +22,14 @@ pub struct PoolRef(&'static MemoryPool);
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PoolId(u8);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct BufParams {
     pub high: u32,
     pub low: u32,
 }
 
 bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct Flags: u8 {
         const SPAWNED    = 0b0000_0001;
         const INCREASED  = 0b0000_0010;
@@ -34,9 +38,12 @@ bitflags::bitflags! {
 
 struct MemoryPool {
     id: PoolId,
+    #[cfg(feature = "mpool")]
     waker: AtomicWaker,
+    #[cfg(feature = "mpool")]
     waker_alive: AtomicBool,
-    waiters: RefCell<Waiters>,
+    #[cfg(feature = "mpool")]
+    waiters: RefCell<mpool::Waiters>,
     flags: Cell<Flags>,
 
     size: AtomicUsize,
@@ -80,7 +87,8 @@ impl PoolId {
     #[inline]
     pub fn pool(self) -> Pool {
         POOLS.with(|pools| Pool {
-            idx: Cell::new(0),
+            #[cfg(feature = "mpool")]
+            idx: Cell::new(usize::MAX),
             inner: pools[self.0 as usize],
         })
     }
@@ -116,8 +124,7 @@ impl PoolId {
     where
         T: Fn(Pin<Box<dyn Future<Output = ()>>>) + 'static,
     {
-        let spawn: Rc<dyn Fn(Pin<Box<dyn Future<Output = ()>>>)> =
-            Rc::new(move |fut| f(fut));
+        let spawn: Rc<dyn Fn(Pin<Box<dyn Future<Output = ()>>>)> = Rc::new(f);
 
         POOLS.with(move |pools| {
             *pools[self.0 as usize].spawn.borrow_mut() = Some(spawn.clone());
@@ -131,8 +138,7 @@ impl PoolId {
     where
         T: Fn(Pin<Box<dyn Future<Output = ()>>>) + 'static,
     {
-        let spawn: Rc<dyn Fn(Pin<Box<dyn Future<Output = ()>>>)> =
-            Rc::new(move |fut| f(fut));
+        let spawn: Rc<dyn Fn(Pin<Box<dyn Future<Output = ()>>>)> = Rc::new(f);
 
         POOLS.with(move |pools| {
             for pool in pools.iter().take(15) {
@@ -174,6 +180,7 @@ impl PoolRef {
     /// Get `Pool` instance for this pool ref.
     pub fn pool(self) -> Pool {
         Pool {
+            #[cfg(feature = "mpool")]
             idx: Cell::new(0),
             inner: self.0,
         }
@@ -186,13 +193,15 @@ impl PoolRef {
     }
 
     #[inline]
-    pub fn move_in(self, buf: &mut BytesMut) {
-        buf.move_to_pool(self);
+    pub fn move_in(self, _buf: &mut BytesMut) {
+        #[cfg(feature = "mpool")]
+        _buf.move_to_pool(self);
     }
 
     #[inline]
-    pub fn move_vec_in(self, buf: &mut BytesVec) {
-        buf.move_to_pool(self);
+    pub fn move_vec_in(self, _buf: &mut BytesVec) {
+        #[cfg(feature = "mpool")]
+        _buf.move_to_pool(self);
     }
 
     #[inline]
@@ -235,9 +244,12 @@ impl PoolRef {
         self.0.windows.set(windows);
 
         // release old waiters
-        let mut waiters = self.0.waiters.borrow_mut();
-        while let Some(waker) = waiters.consume() {
-            waker.wake();
+        #[cfg(feature = "mpool")]
+        {
+            let mut waiters = self.0.waiters.borrow_mut();
+            while let Some(waker) = waiters.consume() {
+                waker.wake();
+            }
         }
 
         self
@@ -356,21 +368,28 @@ impl PoolRef {
     }
 
     #[inline]
-    pub(crate) fn acquire(self, size: usize) {
-        let prev = self.0.size.fetch_add(size, Relaxed);
-        if self.0.waker_alive.load(Relaxed) {
-            self.wake_driver(prev + size)
+    pub(crate) fn acquire(self, _size: usize) {
+        #[cfg(feature = "mpool")]
+        {
+            let prev = self.0.size.fetch_add(_size, Relaxed);
+            if self.0.waker_alive.load(Relaxed) {
+                self.wake_driver(prev + _size)
+            }
         }
     }
 
     #[inline]
-    pub(crate) fn release(self, size: usize) {
-        let prev = self.0.size.fetch_sub(size, Relaxed);
-        if self.0.waker_alive.load(Relaxed) {
-            self.wake_driver(prev - size)
+    pub(crate) fn release(self, _size: usize) {
+        #[cfg(feature = "mpool")]
+        {
+            let prev = self.0.size.fetch_sub(_size, Relaxed);
+            if self.0.waker_alive.load(Relaxed) {
+                self.wake_driver(prev - _size)
+            }
         }
     }
 
+    #[cfg(feature = "mpool")]
     fn wake_driver(self, allocated: usize) {
         let l = self.0.window_l.get();
         let h = self.0.window_h.get();
@@ -423,9 +442,12 @@ impl MemoryPool {
     fn create(id: PoolId) -> &'static MemoryPool {
         Box::leak(Box::new(MemoryPool {
             id,
+            #[cfg(feature = "mpool")]
             waker: AtomicWaker::new(),
+            #[cfg(feature = "mpool")]
             waker_alive: AtomicBool::new(false),
-            waiters: RefCell::new(Waiters::new()),
+            #[cfg(feature = "mpool")]
+            waiters: RefCell::new(mpool::Waiters::new()),
             flags: Cell::new(Flags::empty()),
 
             size: AtomicUsize::new(0),
@@ -463,7 +485,8 @@ impl Clone for Pool {
     #[inline]
     fn clone(&self) -> Pool {
         Pool {
-            idx: Cell::new(0),
+            #[cfg(feature = "mpool")]
+            idx: Cell::new(usize::MAX),
             inner: self.inner,
         }
     }
@@ -483,14 +506,13 @@ impl From<PoolRef> for Pool {
     }
 }
 
+#[cfg(feature = "mpool")]
 impl Drop for Pool {
     fn drop(&mut self) {
+        // cleanup waiter
         let idx = self.idx.get();
-        if idx > 0 {
-            // cleanup waiter
-            let mut waiters = self.inner.waiters.borrow_mut();
-            waiters.remove(idx - 1);
-            waiters.truncate();
+        if idx != usize::MAX {
+            self.inner.waiters.borrow_mut().remove(idx);
         }
     }
 }
@@ -515,12 +537,15 @@ impl Pool {
     #[inline]
     /// Check if pool is ready
     pub fn is_ready(&self) -> bool {
-        let idx = self.idx.get();
-        if idx > 0 {
-            if let Some(Entry::Occupied(_)) =
-                self.inner.waiters.borrow().entries.get(idx - 1)
-            {
-                return false;
+        #[cfg(feature = "mpool")]
+        {
+            let idx = self.idx.get();
+            if idx != usize::MAX {
+                if let Some(mpool::Entry::Occupied(_)) =
+                    self.inner.waiters.borrow().entries.get(idx)
+                {
+                    return false;
+                }
             }
         }
         true
@@ -533,7 +558,8 @@ impl Pool {
     }
 
     #[inline]
-    pub fn poll_ready(&self, ctx: &mut Context<'_>) -> Poll<()> {
+    pub fn poll_ready(&self, _ctx: &mut Context<'_>) -> Poll<()> {
+        #[cfg(feature = "mpool")]
         if self.inner.max_size.get() > 0 {
             let window_l = self.inner.window_l.get();
             if window_l == 0 {
@@ -544,26 +570,26 @@ impl Pool {
             let allocated = self.inner.size.load(Relaxed);
             if allocated < window_l {
                 let idx = self.idx.get();
-                if idx > 0 {
+                if idx != usize::MAX {
                     // cleanup waiter
-                    let mut waiters = self.inner.waiters.borrow_mut();
-                    waiters.remove(idx - 1);
-                    waiters.truncate();
-                    self.idx.set(0);
+                    self.inner.waiters.borrow_mut().remove(idx);
+                    self.idx.set(usize::MAX);
                 }
                 return Poll::Ready(());
             }
 
             // register waiter only if spawn fn is provided
             if let Some(spawn) = &*self.inner.spawn.borrow() {
-                let idx = self.idx.get();
                 let mut flags = self.inner.flags.get();
                 let mut waiters = self.inner.waiters.borrow_mut();
-                let new = if idx == 0 {
-                    self.idx.set(waiters.append(ctx.waker().clone()) + 1);
-                    true
-                } else {
-                    waiters.update(idx - 1, ctx.waker().clone())
+                let new = {
+                    let idx = self.idx.get();
+                    if idx == usize::MAX {
+                        self.idx.set(waiters.append(_ctx.waker().clone()));
+                        true
+                    } else {
+                        waiters.update(idx, _ctx.waker().clone())
+                    }
                 };
 
                 // if memory usage has increased since last window change,
@@ -584,7 +610,7 @@ impl Pool {
                 if !flags.contains(Flags::SPAWNED) {
                     flags.insert(Flags::SPAWNED);
                     self.inner.flags.set(flags);
-                    spawn(Box::pin(Driver { pool: self.inner }))
+                    spawn(Box::pin(mpool::Driver { pool: self.inner }))
                 }
                 return Poll::Pending;
             }
@@ -593,286 +619,291 @@ impl Pool {
     }
 }
 
-struct Driver {
-    pool: &'static MemoryPool,
-}
+#[cfg(feature = "mpool")]
+mod mpool {
+    use std::{mem, sync::atomic::Ordering::Release, task::Waker};
 
-impl Driver {
-    fn release(&self, waiters_num: usize) {
-        let mut waiters = self.pool.waiters.borrow_mut();
+    use super::*;
 
-        let mut to_release = waiters.occupied_len / 100 * 5;
-        if waiters_num > to_release {
-            to_release += waiters_num >> 1;
-        } else {
-            to_release += waiters_num;
-        }
+    pub(super) struct Driver {
+        pub(super) pool: &'static MemoryPool,
+    }
 
-        while to_release > 0 {
-            if let Some(waker) = waiters.consume() {
-                waker.wake();
-                to_release -= 1;
+    impl Driver {
+        pub(super) fn release(&self, waiters_num: usize) {
+            let mut waiters = self.pool.waiters.borrow_mut();
+
+            let mut to_release = waiters.occupied_len >> 4;
+            if waiters_num > to_release {
+                to_release += waiters_num >> 1;
             } else {
-                break;
+                to_release += waiters_num;
             }
-        }
-    }
 
-    fn release_all(&self) {
-        let mut waiters = self.pool.waiters.borrow_mut();
-        while let Some(waker) = waiters.consume() {
-            waker.wake();
-        }
-    }
-}
-
-impl Future for Driver {
-    type Output = ();
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let pool = self.as_ref().pool;
-        let allocated = pool.size.load(Relaxed);
-
-        let win_l = pool.window_l.get();
-        let win_h = pool.window_h.get();
-
-        // allocated size is decreased, release waiters
-        if allocated < win_l {
-            let mut idx = pool.window_idx.get() + 1;
-            let mut waiters = pool.window_waiters.get();
-            let windows = pool.windows.get();
-
-            loop {
-                // allocated size decreased more than 10%, release all
-                if idx == 10 {
-                    self.release_all();
-
-                    pool.window_l.set(windows[0].0);
-                    pool.window_h.set(windows[0].1);
-                    pool.window_idx.set(0);
-                    pool.window_waiters.set(0);
-                    pool.flags.set(Flags::INCREASED);
-                    return Poll::Ready(());
+            while to_release > 0 {
+                if let Some(waker) = waiters.consume() {
+                    waker.wake();
+                    to_release -= 1;
                 } else {
-                    // release 5% of pending waiters
-                    self.release(waiters);
+                    break;
+                }
+            }
+        }
 
-                    if allocated > windows[idx].0 {
-                        pool.window_l.set(windows[idx].0);
-                        pool.window_h.set(windows[idx].1);
-                        pool.window_idx.set(idx);
+        pub(super) fn release_all(&self) {
+            let mut waiters = self.pool.waiters.borrow_mut();
+            while let Some(waker) = waiters.consume() {
+                waker.wake();
+            }
+        }
+    }
+
+    impl Future for Driver {
+        type Output = ();
+
+        #[inline]
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let pool = self.as_ref().pool;
+            let allocated = pool.size.load(Relaxed);
+
+            let win_l = pool.window_l.get();
+            let win_h = pool.window_h.get();
+
+            // allocated size is decreased, release waiters
+            if allocated < win_l {
+                let mut idx = pool.window_idx.get() + 1;
+                let mut waiters = pool.window_waiters.get();
+                let windows = pool.windows.get();
+
+                loop {
+                    // allocated size decreased more than 10%, release all
+                    if idx == 10 {
+                        self.release_all();
+
+                        pool.window_l.set(windows[0].0);
+                        pool.window_h.set(windows[0].1);
+                        pool.window_idx.set(0);
                         pool.window_waiters.set(0);
-                        pool.flags.set(Flags::SPAWNED);
-                        break;
-                    }
-                    idx += 1;
-                    waiters = 0;
-                }
-            }
-        }
-        // allocated size is increased
-        else if allocated > win_h {
-            // reset window
-            let idx = pool.window_idx.get() - 1;
-            let windows = pool.windows.get();
-            pool.window_l.set(windows[idx].0);
-            pool.window_h.set(windows[idx].1);
-            pool.window_idx.set(idx);
-            pool.window_waiters.set(0);
-            pool.flags.set(Flags::SPAWNED | Flags::INCREASED);
-        }
-
-        // register waker
-        pool.waker.register(cx.waker());
-        pool.waker_alive.store(true, Release);
-
-        Poll::Pending
-    }
-}
-
-struct Waiters {
-    entries: Vec<Entry>,
-    root: usize,
-    tail: usize,
-    free: usize,
-    len: usize,
-    occupied_len: usize,
-}
-
-#[derive(Debug)]
-enum Entry {
-    Vacant(usize),
-    Consumed,
-    Occupied(Node),
-}
-
-#[derive(Debug)]
-struct Node {
-    item: Waker,
-    prev: usize,
-    next: usize,
-}
-
-impl Waiters {
-    fn new() -> Waiters {
-        Waiters {
-            entries: Vec::new(),
-            root: usize::MAX,
-            tail: usize::MAX,
-            free: 0,
-            len: 0,
-            occupied_len: 0,
-        }
-    }
-
-    fn truncate(&mut self) {
-        if self.len == 0 {
-            self.entries.truncate(0);
-            self.root = usize::MAX;
-            self.tail = usize::MAX;
-            self.free = 0;
-        }
-    }
-
-    fn get_node(&mut self, key: usize) -> &mut Node {
-        if let Some(Entry::Occupied(ref mut node)) = self.entries.get_mut(key) {
-            return node;
-        }
-        unreachable!()
-    }
-
-    // consume root item
-    fn consume(&mut self) -> Option<Waker> {
-        if self.root != usize::MAX {
-            self.occupied_len -= 1;
-
-            let entry = self.entries.get_mut(self.root).unwrap();
-            let prev = mem::replace(entry, Entry::Consumed);
-
-            match prev {
-                Entry::Occupied(node) => {
-                    debug_assert!(node.prev == usize::MAX);
-
-                    // last item
-                    if self.tail == self.root {
-                        self.tail = usize::MAX;
-                        self.root = usize::MAX;
+                        pool.flags.set(Flags::INCREASED);
+                        return Poll::Ready(());
                     } else {
-                        // remove from root
-                        self.root = node.next;
-                        self.get_node(self.root).prev = usize::MAX;
+                        // release 6% of pending waiters
+                        self.release(waiters);
+
+                        if allocated > windows[idx].0 {
+                            pool.window_l.set(windows[idx].0);
+                            pool.window_h.set(windows[idx].1);
+                            pool.window_idx.set(idx);
+                            pool.window_waiters.set(0);
+                            pool.flags.set(Flags::SPAWNED);
+                            break;
+                        }
+                        idx += 1;
+                        waiters = 0;
                     }
-                    Some(node.item)
-                }
-                _ => {
-                    unreachable!()
                 }
             }
-        } else {
-            None
+            // allocated size is increased
+            else if allocated > win_h {
+                // reset window
+                let idx = pool.window_idx.get() - 1;
+                let windows = pool.windows.get();
+                pool.window_l.set(windows[idx].0);
+                pool.window_h.set(windows[idx].1);
+                pool.window_idx.set(idx);
+                pool.window_waiters.set(0);
+                pool.flags.set(Flags::SPAWNED | Flags::INCREASED);
+            }
+
+            // register waker
+            pool.waker.register(cx.waker());
+            pool.waker_alive.store(true, Release);
+
+            Poll::Pending
         }
     }
 
-    fn update(&mut self, key: usize, val: Waker) -> bool {
-        if let Some(entry) = self.entries.get_mut(key) {
+    pub(super) struct Waiters {
+        pub(super) entries: Vec<Entry>,
+        root: usize,
+        tail: usize,
+        free: usize,
+        len: usize,
+        occupied_len: usize,
+    }
+
+    #[derive(Debug)]
+    pub(super) enum Entry {
+        Vacant(usize),
+        Consumed,
+        Occupied(Node),
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Node {
+        item: Waker,
+        prev: usize,
+        next: usize,
+    }
+
+    impl Waiters {
+        pub(super) fn new() -> Waiters {
+            Waiters {
+                entries: Vec::new(),
+                root: usize::MAX,
+                tail: usize::MAX,
+                free: 0,
+                len: 0,
+                occupied_len: 0,
+            }
+        }
+
+        fn get_node(&mut self, key: usize) -> &mut Node {
+            if let Some(Entry::Occupied(ref mut node)) = self.entries.get_mut(key) {
+                return node;
+            }
+            unreachable!()
+        }
+
+        // consume root item
+        pub(super) fn consume(&mut self) -> Option<Waker> {
+            if self.root != usize::MAX {
+                self.occupied_len -= 1;
+                let entry =
+                    mem::replace(self.entries.get_mut(self.root).unwrap(), Entry::Consumed);
+
+                match entry {
+                    Entry::Occupied(node) => {
+                        debug_assert!(node.prev == usize::MAX);
+
+                        // last item
+                        if self.tail == self.root {
+                            self.tail = usize::MAX;
+                            self.root = usize::MAX;
+                        } else {
+                            // remove from root
+                            self.root = node.next;
+                            if self.root != usize::MAX {
+                                self.get_node(self.root).prev = usize::MAX;
+                            }
+                        }
+                        Some(node.item)
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                None
+            }
+        }
+
+        pub(super) fn update(&mut self, idx: usize, val: Waker) -> bool {
+            let entry = self
+                .entries
+                .get_mut(idx)
+                .expect("Entry is expected to exist");
             match entry {
                 Entry::Occupied(ref mut node) => {
                     node.item = val;
-                    return false;
+                    false
                 }
                 Entry::Consumed => {
+                    // append to the tail
                     *entry = Entry::Occupied(Node {
                         item: val,
                         prev: self.tail,
                         next: usize::MAX,
                     });
+
+                    self.occupied_len += 1;
+                    if self.root == usize::MAX {
+                        self.root = idx;
+                    }
+                    if self.tail != usize::MAX {
+                        self.get_node(self.tail).next = idx;
+                    }
+                    self.tail = idx;
+                    true
                 }
-                _ => unreachable!(),
+                Entry::Vacant(_) => unreachable!(),
             }
         }
-        self.occupied_len += 1;
-        if self.root == usize::MAX {
-            self.root = key;
-        }
-        if self.tail != usize::MAX {
-            self.get_node(self.tail).next = key;
-        }
-        self.tail = key;
-        true
-    }
 
-    fn remove(&mut self, key: usize) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            // Swap the entry at the provided value
-            let prev = mem::replace(entry, Entry::Vacant(self.free));
+        pub(super) fn remove(&mut self, key: usize) {
+            if let Some(entry) = self.entries.get_mut(key) {
+                // Swap the entry at the provided value
+                let entry = mem::replace(entry, Entry::Vacant(self.free));
 
-            match prev {
-                Entry::Occupied(node) => {
-                    self.len -= 1;
-                    self.occupied_len -= 1;
-                    self.free = key;
-                    // remove from root
-                    if self.root == key {
-                        self.root = node.next;
-                        if self.root != usize::MAX {
-                            self.get_node(self.root).prev = usize::MAX;
+                self.len -= 1;
+                self.free = key;
+
+                match entry {
+                    Entry::Occupied(node) => {
+                        self.occupied_len -= 1;
+
+                        // remove from root
+                        if self.root == key {
+                            self.root = node.next;
+                            if self.root != usize::MAX {
+                                self.get_node(self.root).prev = usize::MAX;
+                            }
+                        }
+                        // remove from tail
+                        if self.tail == key {
+                            self.tail = node.prev;
+                            if self.tail != usize::MAX {
+                                self.get_node(self.tail).next = usize::MAX;
+                            }
                         }
                     }
-                    // remove from tail
-                    if self.tail == key {
-                        self.tail = node.prev;
-                        if self.tail != usize::MAX {
-                            self.get_node(self.tail).next = usize::MAX;
-                        }
-                    }
+                    Entry::Consumed => {}
+                    Entry::Vacant(_) => unreachable!(),
                 }
-                Entry::Consumed => {
-                    self.len -= 1;
-                    self.free = key;
-                }
-                _ => {
-                    unreachable!()
+
+                if self.len == 0 {
+                    self.entries.truncate(128);
                 }
             }
         }
-    }
 
-    fn append(&mut self, val: Waker) -> usize {
-        self.len += 1;
-        self.occupied_len += 1;
-        let key = self.free;
+        pub(super) fn append(&mut self, val: Waker) -> usize {
+            let idx = self.free;
 
-        if key == self.entries.len() {
+            self.len += 1;
+            self.occupied_len += 1;
+
+            // root points to first entry, append to empty list
             if self.root == usize::MAX {
-                self.root = key;
+                self.root = idx;
             }
+            // tail points to last entry
             if self.tail != usize::MAX {
-                self.get_node(self.tail).next = key;
+                self.get_node(self.tail).next = idx;
             }
 
-            self.entries.push(Entry::Occupied(Node {
-                item: val,
-                prev: self.tail,
-                next: usize::MAX,
-            }));
-            self.tail = key;
-            self.free = key + 1;
-        } else {
-            self.free = match self.entries.get(key) {
-                Some(&Entry::Vacant(next)) => next,
-                _ => unreachable!(),
-            };
-            if self.tail != usize::MAX {
-                self.get_node(self.tail).next = key;
+            // append item to entries, first free item is not allocated yet
+            if idx == self.entries.len() {
+                self.entries.push(Entry::Occupied(Node {
+                    item: val,
+                    prev: self.tail,
+                    next: usize::MAX,
+                }));
+                self.tail = idx;
+                self.free = idx + 1;
+            } else {
+                // entries has enough capacity
+                self.free = match self.entries.get(idx) {
+                    Some(&Entry::Vacant(next)) => next,
+                    _ => unreachable!(),
+                };
+                self.entries[idx] = Entry::Occupied(Node {
+                    item: val,
+                    prev: self.tail,
+                    next: usize::MAX,
+                });
+                self.tail = idx;
             }
-            self.entries[key] = Entry::Occupied(Node {
-                item: val,
-                prev: self.tail,
-                next: usize::MAX,
-            });
-            self.tail = key;
+
+            idx
         }
-        key
     }
 }

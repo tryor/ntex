@@ -1,5 +1,5 @@
 //! Utilities for tracking time.
-use std::{cmp, future::Future, pin::Pin, task, task::Poll};
+use std::{cmp, future::poll_fn, future::Future, pin::Pin, task, task::Poll};
 
 mod types;
 mod wheel;
@@ -64,7 +64,7 @@ where
     TimeoutChecked::new_with_delay(future, dur.into())
 }
 
-/// Future returned by [`sleep`](sleep).
+/// Future returned by [`sleep`].
 ///
 /// # Examples
 ///
@@ -126,7 +126,7 @@ impl Future for Sleep {
     }
 }
 
-/// Future returned by [`deadline`](deadline).
+/// Future returned by [`deadline`].
 ///
 /// # Examples
 ///
@@ -312,7 +312,7 @@ impl Interval {
 
     #[inline]
     pub async fn tick(&self) {
-        crate::future::poll_fn(|cx| self.poll_tick(cx)).await;
+        poll_fn(|cx| self.poll_tick(cx)).await;
     }
 
     #[inline]
@@ -339,6 +339,7 @@ impl crate::Stream for Interval {
 }
 
 #[cfg(test)]
+#[allow(clippy::let_underscore_future)]
 mod tests {
     use futures_util::StreamExt;
     use std::time;
@@ -452,6 +453,13 @@ mod tests {
         let mut dl = deadline(Millis(1));
         dl.reset(Millis::ZERO);
         assert!(lazy(|cx| dl.poll_elapsed(cx)).await.is_pending());
+
+        let mut dl = deadline(Millis(1));
+        dl.reset(Millis(100));
+        let first_time = now();
+        dl.await;
+        let second_time = now();
+        assert!(second_time - first_time >= time::Duration::from_millis(100));
 
         let mut dl = deadline(Millis(0));
         assert!(dl.is_elapsed());

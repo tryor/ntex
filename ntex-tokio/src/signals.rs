@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use tokio::task::spawn_local;
 
 thread_local! {
-    static SRUN: RefCell<bool> = RefCell::new(false);
+    static SRUN: RefCell<bool> = const { RefCell::new(false) };
     static SHANDLERS: Rc<RefCell<Vec<oneshot::Sender<Signal>>>> = Default::default();
 }
 
@@ -102,7 +102,7 @@ impl Future for Signals {
         {
             if self.signal.as_mut().poll(cx).is_ready() {
                 let handlers = SHANDLERS.with(|h| mem::take(&mut *h.borrow_mut()));
-                for mut sender in handlers {
+                for sender in handlers {
                     let _ = sender.send(Signal::Int);
                 }
             }

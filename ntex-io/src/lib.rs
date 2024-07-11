@@ -2,8 +2,7 @@
 #![deny(rust_2018_idioms, unreachable_pub, missing_debug_implementations)]
 
 use std::{
-    any::Any, any::TypeId, fmt, future::Future, io as sio, io::Error as IoError,
-    task::Context, task::Poll,
+    any::Any, any::TypeId, fmt, io as sio, io::Error as IoError, task::Context, task::Poll,
 };
 
 pub mod testing;
@@ -24,13 +23,17 @@ use ntex_codec::{Decoder, Encoder};
 use ntex_util::time::Millis;
 
 pub use self::buf::{ReadBuf, WriteBuf};
-pub use self::dispatcher::Dispatcher;
+pub use self::dispatcher::{Dispatcher, DispatcherConfig};
 pub use self::filter::{Base, Filter, Layer};
 pub use self::framed::Framed;
 pub use self::io::{Io, IoRef, OnDisconnect};
 pub use self::seal::{IoBoxed, Sealed};
 pub use self::tasks::{ReadContext, WriteContext};
-pub use self::utils::{filter, seal};
+pub use self::timer::TimerHandle;
+pub use self::utils::{seal, Decoded};
+
+#[doc(hidden)]
+pub use self::io::Flags;
 
 /// Status for read task
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -91,19 +94,6 @@ pub trait FilterLayer: fmt::Debug + 'static {
     }
 }
 
-/// Creates new `Filter` values.
-pub trait FilterFactory<F>: Sized {
-    /// The `Filter` value created by this factory
-    type Filter: FilterLayer;
-    /// Errors produced while building a filter.
-    type Error: fmt::Debug;
-    /// The future of the `FilterFactory` instance.
-    type Future: Future<Output = Result<Io<Layer<Self::Filter, F>>, Self::Error>>;
-
-    /// Create and return a new filter value asynchronously.
-    fn create(self, st: Io<F>) -> Self::Future;
-}
-
 pub trait IoStream {
     fn start(self, _: ReadContext, _: WriteContext) -> Option<Box<dyn Handle>>;
 }
@@ -149,6 +139,8 @@ pub enum DispatchItem<U: Encoder + Decoder> {
     WBackPressureDisabled,
     /// Keep alive timeout
     KeepAliveTimeout,
+    /// Frame read timeout
+    ReadTimeout,
     /// Decoder parse error
     DecoderError(<U as Decoder>::Error),
     /// Encoder parse error
@@ -175,6 +167,9 @@ where
             }
             DispatchItem::KeepAliveTimeout => {
                 write!(fmt, "DispatchItem::KeepAliveTimeout")
+            }
+            DispatchItem::ReadTimeout => {
+                write!(fmt, "DispatchItem::ReadTimeout")
             }
             DispatchItem::EncoderError(ref e) => {
                 write!(fmt, "DispatchItem::EncoderError({:?})", e)
@@ -213,5 +208,9 @@ mod tests {
         assert!(
             format!("{:?}", T::KeepAliveTimeout).contains("DispatchItem::KeepAliveTimeout")
         );
+        assert!(format!("{:?}", T::ReadTimeout).contains("DispatchItem::ReadTimeout"));
+
+        assert!(format!("{:?}", IoStatusUpdate::KeepAlive).contains("KeepAlive"));
+        assert!(format!("{:?}", RecvError::<BytesCodec>::KeepAlive).contains("KeepAlive"));
     }
 }

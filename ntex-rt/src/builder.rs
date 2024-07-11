@@ -1,7 +1,7 @@
+#![allow(clippy::let_underscore_future)]
 use std::{cell::RefCell, future::Future, io, rc::Rc};
 
 use async_channel::unbounded;
-use async_oneshot as oneshot;
 
 use crate::arbiter::{Arbiter, ArbiterController, SystemArbiter};
 use crate::System;
@@ -45,7 +45,7 @@ impl Builder {
     ///
     /// This method panics if it can not create tokio runtime
     pub fn finish(self) -> SystemRunner {
-        let (stop_tx, stop) = oneshot::oneshot();
+        let (stop_tx, stop) = oneshot::channel();
         let (sys_sender, sys_receiver) = unbounded();
         let stop_on_panic = self.stop_on_panic;
 
@@ -135,6 +135,29 @@ impl SystemRunner {
             Err(_) => unreachable!(),
         }
     }
+
+    #[cfg(feature = "tokio")]
+    /// Execute a future and wait for result.
+    pub async fn run_local<F, R>(self, fut: F) -> R
+    where
+        F: Future<Output = R> + 'static,
+        R: 'static,
+    {
+        let SystemRunner {
+            arb,
+            arb_controller,
+            ..
+        } = self;
+
+        // run loop
+        tok_io::task::LocalSet::new()
+            .run_until(async move {
+                let _ = crate::spawn(arb);
+                let _ = crate::spawn(arb_controller);
+                fut.await
+            })
+            .await
+    }
 }
 
 pub struct BlockResult<T>(Rc<RefCell<Option<T>>>);
@@ -159,16 +182,16 @@ where
 {
     let result = Rc::new(RefCell::new(None));
     let result_inner = result.clone();
-    crate::block_on(Box::pin(async move {
-        crate::spawn(arb);
-        crate::spawn(arb_controller);
+    crate::block_on(async move {
+        let _ = crate::spawn(arb);
+        let _ = crate::spawn(arb_controller);
         if let Err(e) = f() {
             *result_inner.borrow_mut() = Some(Err(e));
         } else {
             let r = fut.await;
             *result_inner.borrow_mut() = Some(Ok(r));
         }
-    }));
+    });
     BlockResult(result)
 }
 

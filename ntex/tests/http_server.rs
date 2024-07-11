@@ -6,10 +6,8 @@ use futures_util::stream::{once, StreamExt};
 use regex::Regex;
 
 use ntex::http::header::{self, HeaderName, HeaderValue};
-use ntex::http::test::server as test_server;
-use ntex::http::{
-    body, HttpService, KeepAlive, Method, Request, Response, StatusCode, Version,
-};
+use ntex::http::{body, h1::Control, test::server as test_server};
+use ntex::http::{HttpService, KeepAlive, Method, Request, Response, StatusCode, Version};
 use ntex::time::{sleep, timeout, Millis, Seconds};
 use ntex::{service::fn_service, util::Bytes, util::Ready, web::error};
 
@@ -17,8 +15,8 @@ use ntex::{service::fn_service, util::Bytes, util::Ready, web::error};
 async fn test_h1() {
     let srv = test_server(|| {
         HttpService::build()
+            .headers_read_rate(Seconds(1), Seconds::ZERO, 256)
             .keep_alive(KeepAlive::Disabled)
-            .client_timeout(Seconds(1))
             .disconnect_timeout(Seconds(1))
             .h1(|req: Request| {
                 assert!(req.peer_addr().is_some());
@@ -35,8 +33,8 @@ async fn test_h1_2() {
     let srv = test_server(|| {
         HttpService::build()
             .keep_alive(KeepAlive::Disabled)
-            .client_timeout(Seconds(1))
             .disconnect_timeout(Seconds(1))
+            .headers_read_rate(Seconds(1), Seconds::ZERO, 256)
             .finish(|req: Request| {
                 assert!(req.peer_addr().is_some());
                 assert_eq!(req.version(), Version::HTTP_11);
@@ -56,16 +54,21 @@ async fn test_h1_2() {
 async fn test_expect_continue() {
     let srv = test_server(|| {
         HttpService::build()
-            .expect(fn_service(|req: Request| async move {
+            .h1_control(fn_service(|req: Control<_, _>| async move {
                 sleep(Millis(20)).await;
-                if req.head().uri.query() == Some("yes=") {
-                    Ok(req)
+                let ack = if let Control::Expect(exc) = req {
+                    if exc.get_ref().head().uri.query() == Some("yes=") {
+                        exc.ack()
+                    } else {
+                        exc.fail(error::InternalError::default(
+                            "error",
+                            StatusCode::PRECONDITION_FAILED,
+                        ))
+                    }
                 } else {
-                    Err(error::InternalError::default(
-                        "error",
-                        StatusCode::PRECONDITION_FAILED,
-                    ))
-                }
+                    req.ack()
+                };
+                Ok::<_, std::convert::Infallible>(ack)
             }))
             .keep_alive(KeepAlive::Disabled)
             .h1(fn_service(|mut req: Request| async move {
@@ -96,7 +99,7 @@ async fn test_expect_continue() {
 
 #[ntex::test]
 async fn test_chunked_payload() {
-    let chunk_sizes = vec![32768, 32, 32768];
+    let chunk_sizes = [32768, 32, 32768];
     let total_size: usize = chunk_sizes.iter().sum();
 
     let srv = test_server(|| {
@@ -147,14 +150,47 @@ async fn test_chunked_payload() {
 
 #[ntex::test]
 async fn test_slow_request() {
+    const DATA: &[u8] = b"GET /test/tests/test HTTP/1.1\r\n";
+
     let srv = test_server(|| {
         HttpService::build()
-            .client_timeout(Seconds(1))
+            .headers_read_rate(Seconds(1), Seconds(2), 4)
             .finish(|_| Ready::Ok::<_, io::Error>(Response::Ok().finish()))
     });
 
     let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
-    let _ = stream.write_all(b"GET /test/tests/test HTTP/1.1\r\n");
+    let _ = stream.write_all(DATA);
+    let mut data = String::new();
+    let _ = stream.read_to_string(&mut data);
+    assert!(data.starts_with("HTTP/1.1 408 Request Timeout"));
+
+    let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
+    let _ = stream.write_all(&DATA[..5]);
+    sleep(Millis(1100)).await;
+    let _ = stream.write_all(&DATA[5..20]);
+
+    let mut data = String::new();
+    let _ = stream.read_to_string(&mut data);
+    assert!(data.starts_with("HTTP/1.1 408 Request Timeout"));
+}
+
+#[ntex::test]
+async fn test_slow_request2() {
+    const DATA: &[u8] = b"GET /test/tests/test HTTP/1.1\r\n";
+
+    let srv = test_server(|| {
+        HttpService::build()
+            .headers_read_rate(Seconds(1), Seconds(2), 4)
+            .finish(|_| Ready::Ok::<_, io::Error>(Response::Ok().finish()))
+    });
+
+    let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
+    let _ = stream.write_all(b"GET /test/tests/test HTTP/1.1\r\n\r\n");
+    let mut data = vec![0; 1024];
+    let _ = stream.read(&mut data);
+    assert_eq!(&data[..17], b"HTTP/1.1 200 OK\r\n");
+
+    let _ = stream.write_all(DATA);
     let mut data = String::new();
     let _ = stream.read_to_string(&mut data);
     assert!(data.starts_with("HTTP/1.1 408 Request Timeout"));
@@ -216,7 +252,7 @@ async fn test_http1_keepalive_timeout() {
 async fn test_http1_no_keepalive_during_response() {
     let srv = test_server(|| {
         HttpService::build().keep_alive(1).h1(|_| async {
-            sleep(Millis(1100)).await;
+            sleep(Millis(1200)).await;
             Ok::<_, io::Error>(Response::Ok().finish())
         })
     });
@@ -313,6 +349,58 @@ async fn test_http1_keepalive_disabled() {
     let mut data = vec![0; 1024];
     let res = stream.read(&mut data).unwrap();
     assert_eq!(res, 0);
+}
+
+/// Payload timer should not fire aftre dispatcher has read whole payload
+#[ntex::test]
+async fn test_http1_disable_payload_timer_after_whole_pl_has_been_read() {
+    let srv = test_server(|| {
+        HttpService::build()
+            .headers_read_rate(Seconds(1), Seconds(1), 128)
+            .payload_read_rate(Seconds(1), Seconds(1), 512)
+            .keep_alive(1)
+            .h1_control(fn_service(move |msg: Control<_, _>| async move {
+                Ok::<_, io::Error>(msg.ack())
+            }))
+            .h1(|mut req: Request| async move {
+                req.payload().recv().await;
+                sleep(Millis(1500)).await;
+                Ok::<_, io::Error>(Response::Ok().finish())
+            })
+    });
+
+    let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
+    let _ = stream.write_all(b"GET /test/tests/test HTTP/1.1\r\ncontent-length: 4\r\n");
+    sleep(Millis(250)).await;
+    let _ = stream.write_all(b"\r\n");
+    sleep(Millis(250)).await;
+    let _ = stream.write_all(b"1234");
+    let mut data = vec![0; 1024];
+    let _ = stream.read(&mut data);
+    assert_eq!(&data[..17], b"HTTP/1.1 200 OK\r\n");
+}
+
+/// Handle not consumed payload
+#[ntex::test]
+async fn test_http1_handle_not_consumed_payload() {
+    let srv = test_server(|| {
+        HttpService::build()
+            .h1_control(fn_service(move |msg: Control<_, _>| {
+                if matches!(msg, Control::ProtocolError(_)) {
+                    panic!()
+                }
+                async move { Ok::<_, io::Error>(msg.ack()) }
+            }))
+            .h1(|_| async move { Ok::<_, io::Error>(Response::Ok().finish()) })
+    });
+
+    let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
+    let _ = stream.write_all(b"GET /test/tests/test HTTP/1.1\r\ncontent-length: 4\r\n\r\n");
+    sleep(Millis(250)).await;
+    let _ = stream.write_all(b"1234");
+    let mut data = vec![0; 1024];
+    let _ = stream.read(&mut data);
+    assert_eq!(&data[..17], b"HTTP/1.1 200 OK\r\n");
 }
 
 #[ntex::test]

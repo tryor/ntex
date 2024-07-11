@@ -1,5 +1,33 @@
 # Changes
 
+## [0.1.27] (2024-04-08)
+
+* Move more code under mpool feature
+
+## [0.1.26] (2024-04-04)
+
+* Make memory pools optional
+
+## [0.1.25] (2024-04-02)
+
+* Fix pool waiters management
+
+## [0.1.24] (2024-02-01)
+
+* Add `checked` api
+
+## [0.1.23] (2024-01-19)
+
+* Revert changes to release shared_vec
+
+## [0.1.22] (2024-01-16)
+
+* Use const generics for helper traits (From, PartialEq, PartialOrd)
+
+## [0.1.21] (2023-11-1)
+
+* Data race in BytesMut #243
+
 ## [0.1.19] (2023-01-23)
 
 * Add PollRef::resize_read_buf() and PollRef::resize_write_buf() helpers

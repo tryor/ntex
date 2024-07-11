@@ -1,5 +1,29 @@
 # Changes
 
+## [3.0.0] - 2024-05-28
+
+* Use "async fn" for Service::ready() and Service::shutdown() methods
+
+## [2.0.2] - 2024-03-20
+
+* Add boxed rc service factory
+
+## [2.0.1] - 2024-02-07
+
+* Add fmt::Debug impl for PipelineCall
+
+## [2.0.0] - 2024-01-09
+
+* Release
+
+## [2.0.0-b.0] - 2024-01-07
+
+* Use "async fn" in trait for Service definition
+
+## [1.2.7] - 2023-09-19
+
+* Use From<T::Error> for apply_fn util
+
 ## [1.2.6] - 2023-09-11
 
 * Add fmt::Debug impls

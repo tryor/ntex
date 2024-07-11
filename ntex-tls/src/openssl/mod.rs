@@ -1,17 +1,18 @@
 //! An implementation of SSL streams for ntex backed by OpenSSL
-use std::cell::{Cell, RefCell};
-use std::{any, cmp, error::Error, fmt, io, task::Context, task::Poll};
+use std::{any, cell::RefCell, cmp, error::Error, io, task::Poll};
 
 use ntex_bytes::{BufMut, BytesVec};
-use ntex_io::{types, Filter, FilterFactory, FilterLayer, Io, Layer, ReadBuf, WriteBuf};
-use ntex_util::{future::poll_fn, future::BoxFuture, ready, time, time::Millis};
+use ntex_io::{types, Filter, FilterLayer, Io, Layer, ReadBuf, WriteBuf};
 use tls_openssl::ssl::{self, NameType, SslStream};
 use tls_openssl::x509::X509;
 
 use crate::{PskIdentity, Servername};
 
+mod connect;
+pub use self::connect::SslConnector;
+
 mod accept;
-pub use self::accept::{Acceptor, AcceptorService};
+pub use self::accept::{SslAcceptor, SslAcceptorService};
 
 /// Connection's peer cert
 #[derive(Debug)]
@@ -25,7 +26,6 @@ pub struct PeerCertChain(pub Vec<X509>);
 #[derive(Debug)]
 pub struct SslFilter {
     inner: RefCell<SslStream<IoInner>>,
-    handshake: Cell<bool>,
 }
 
 #[derive(Debug)]
@@ -147,7 +147,7 @@ impl FilterLayer for SslFilter {
         buf.with_write_buf(|b| {
             self.with_buffers(b, || {
                 buf.with_dst(|dst| {
-                    let mut new_bytes = usize::from(self.handshake.get());
+                    let mut new_bytes = 0;
                     loop {
                         buf.resize_buf(dst);
 
@@ -212,170 +212,49 @@ impl FilterLayer for SslFilter {
     }
 }
 
-pub struct SslAcceptor {
-    acceptor: ssl::SslAcceptor,
-    timeout: Millis,
-}
-
-impl SslAcceptor {
-    /// Create openssl acceptor filter factory
-    pub fn new(acceptor: ssl::SslAcceptor) -> Self {
-        SslAcceptor {
-            acceptor,
-            timeout: Millis(5_000),
-        }
-    }
-
-    /// Set handshake timeout.
-    ///
-    /// Default is set to 5 seconds.
-    pub fn timeout<U: Into<Millis>>(&mut self, timeout: U) -> &mut Self {
-        self.timeout = timeout.into();
-        self
-    }
-}
-
-impl Clone for SslAcceptor {
-    fn clone(&self) -> Self {
-        Self {
-            acceptor: self.acceptor.clone(),
-            timeout: self.timeout,
-        }
-    }
-}
-
-impl fmt::Debug for SslAcceptor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SslAcceptor")
-            .field("timeout", &self.timeout)
-            .finish()
-    }
-}
-
-impl<F: Filter> FilterFactory<F> for SslAcceptor {
-    type Filter = SslFilter;
-
-    type Error = Box<dyn Error>;
-    type Future = BoxFuture<'static, Result<Io<Layer<Self::Filter, F>>, Self::Error>>;
-
-    fn create(self, io: Io<F>) -> Self::Future {
-        let timeout = self.timeout;
-        let ctx_result = ssl::Ssl::new(self.acceptor.context());
-
-        Box::pin(async move {
-            time::timeout(timeout, async {
-                let ssl = ctx_result.map_err(map_to_ioerr)?;
-                let inner = IoInner {
-                    source: None,
-                    destination: None,
-                };
-                let filter = SslFilter {
-                    handshake: Cell::new(true),
-                    inner: RefCell::new(ssl::SslStream::new(ssl, inner)?),
-                };
-                let io = io.add_filter(filter);
-
-                poll_fn(|cx| {
-                    let result = io
-                        .with_buf(|buf| {
-                            let filter = io.filter();
-                            filter.with_buffers(buf, || filter.inner.borrow_mut().accept())
-                        })
-                        .map_err(|err| {
-                            let err: Box<dyn Error> =
-                                io::Error::new(io::ErrorKind::Other, err).into();
-                            err
-                        })?;
-                    handle_result(result, &io, cx)
-                })
-                .await?;
-
-                io.filter().handshake.set(false);
-                Ok(io)
-            })
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "ssl handshake timeout").into()
-            })
-            .and_then(|item| item)
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct SslConnector {
+/// Create openssl connector filter factory
+pub async fn connect<F: Filter>(
+    io: Io<F>,
     ssl: ssl::Ssl,
-}
+) -> Result<Io<Layer<SslFilter, F>>, io::Error> {
+    let inner = IoInner {
+        source: None,
+        destination: None,
+    };
+    let filter = SslFilter {
+        inner: RefCell::new(ssl::SslStream::new(ssl, inner)?),
+    };
+    let io = io.add_filter(filter);
 
-impl SslConnector {
-    /// Create openssl connector filter factory
-    pub fn new(ssl: ssl::Ssl) -> Self {
-        SslConnector { ssl }
+    loop {
+        let result = io.with_buf(|buf| {
+            let filter = io.filter();
+            filter.with_buffers(buf, || filter.inner.borrow_mut().connect())
+        })?;
+        if handle_result(&io, result).await?.is_some() {
+            break;
+        }
     }
+
+    Ok(io)
 }
 
-impl<F: Filter> FilterFactory<F> for SslConnector {
-    type Filter = SslFilter;
-
-    type Error = Box<dyn Error>;
-    type Future = BoxFuture<'static, Result<Io<Layer<Self::Filter, F>>, Self::Error>>;
-
-    fn create(self, io: Io<F>) -> Self::Future {
-        Box::pin(async move {
-            let inner = IoInner {
-                source: None,
-                destination: None,
-            };
-            let filter = SslFilter {
-                handshake: Cell::new(true),
-                inner: RefCell::new(ssl::SslStream::new(self.ssl, inner)?),
-            };
-            let io = io.add_filter(filter);
-
-            poll_fn(|cx| {
-                let result = io
-                    .with_buf(|buf| {
-                        let filter = io.filter();
-                        filter.with_buffers(buf, || filter.inner.borrow_mut().connect())
-                    })
-                    .map_err(|err| {
-                        let err: Box<dyn Error> =
-                            io::Error::new(io::ErrorKind::Other, err).into();
-                        err
-                    })?;
-                handle_result(result, &io, cx)
-            })
-            .await?;
-
-            io.filter().handshake.set(false);
-            Ok(io)
-        })
-    }
-}
-
-fn handle_result<T, F>(
-    result: Result<T, ssl::Error>,
+async fn handle_result<T, F>(
     io: &Io<F>,
-    cx: &mut Context<'_>,
-) -> Poll<Result<T, Box<dyn Error>>> {
+    result: Result<T, ssl::Error>,
+) -> io::Result<Option<T>> {
     match result {
-        Ok(v) => Poll::Ready(Ok(v)),
+        Ok(v) => Ok(Some(v)),
         Err(e) => match e.code() {
             ssl::ErrorCode::WANT_READ => {
-                match ready!(io.poll_read_ready(cx)) {
-                    Ok(None) => Err::<_, Box<dyn Error>>(
-                        io::Error::new(io::ErrorKind::Other, "disconnected").into(),
-                    ),
-                    Err(err) => Err(err.into()),
-                    _ => Ok(()),
-                }?;
-                Poll::Pending
+                let res = io.force_read_ready().await;
+                match res? {
+                    None => Err(io::Error::new(io::ErrorKind::Other, "disconnected")),
+                    _ => Ok(None),
+                }
             }
-            ssl::ErrorCode::WANT_WRITE => {
-                let _ = io.poll_flush(cx, true)?;
-                Poll::Pending
-            }
-            _ => Poll::Ready(Err(Box::new(e))),
+            ssl::ErrorCode::WANT_WRITE => Ok(None),
+            _ => Err(io::Error::new(io::ErrorKind::Other, e)),
         },
     }
 }
